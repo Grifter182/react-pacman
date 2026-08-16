@@ -135,7 +135,9 @@ async function main() {
     await page.waitForTimeout(shot.fire ? 220 : 520);
 
     const file = path.join(OUT, `${shot.name}.png`);
-    await page.screenshot({ path: file, type: 'png' });
+    // Under SwiftShader a single composited frame can take well over Playwright's
+    // 30s screenshot default, which aborts the whole run mid-capture.
+    await page.screenshot({ path: file, type: 'png', timeout: 180000 });
     manifest.push({ name: shot.name, file, ...shot });
 
     if (shot.fire) await page.evaluate(() => { const w = window.__engine?.get('weapons'); if (w) w.firing = false; });

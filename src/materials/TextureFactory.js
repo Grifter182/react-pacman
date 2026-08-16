@@ -1,238 +1,412 @@
 import * as THREE from 'three';
+import { Config, QualityTier } from '../core/Config.js';
+import { RECIPES, ALIASES, resolveRecipe } from './Recipes.js';
+import {
+  bakeScheduler, deriveCurvatureAO, encodeNormals, linearToSrgb8,
+  makeDataTexture, normaliseRobust,
+} from './SurfaceBake.js';
+import { applySurfaceShader, disposeSharedMaps } from './SurfaceShader.js';
+import { mulberry32, fbm, clamp, clamp01, smoothstep } from './Noise.js';
 
 /**
  * OWNER: materials / texturing agent.
  *
- * All surface detail is generated procedurally at runtime — there are no
- * external image assets, so the build stays self-contained and every material
- * ships a full PBR set (albedo / normal / roughness / AO / height).
+ * Single entry point for every surface in the game. `makeMaterial(preset, opts)`
+ * returns a ready-to-use material immediately; the full-resolution bake lands a
+ * few frames later without ever blocking a frame (see SurfaceBake.js).
  *
- * Extend this file with real multi-octave noise, worley cells, edge wear,
- * grunge overlays and per-material dirt masks. `makeMaterial()` is the single
- * entry point every other module should use.
+ *   LevelModule  -> 'concrete' | 'plaster' | 'sand' | 'metal' | ...
+ *   WeaponModule -> 'gunmetal' | 'polymer' | 'rubber' | 'metal'
+ *   AiModule     -> 'canvas' | 'rubber' | 'metal'
+ *
+ * Call `getMaterialCatalog()` to discover what exists rather than guessing.
+ *
+ * Colour management, stated once because every map depends on it:
+ *   map        sRGB encoded bytes, tagged SRGBColorSpace  (hardware decoded)
+ *   normalMap  linear bytes, NoColorSpace
+ *   armMap     linear bytes, NoColorSpace — R = AO, G = roughness, B = metalness
+ * Recipes author albedo in *linear reflectance*; the OETF is applied on the way
+ * into the texture, so the numbers in Recipes.js are physically comparable.
  */
 
-const _cache = new Map();
+const _materialCache = new Map();
+const _surfaceCache = new Map();
 
-/* ------------------------------------------------------------------ noise */
+/** How much coarser the instant preview pass is than the final bake. */
+const COARSE_DIVISOR = 16;
 
-function mulberry32(seed) {
-  let a = seed >>> 0;
-  return function () {
-    a |= 0; a = (a + 0x6D2B79F5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
+/* ------------------------------------------------------------------ tiers */
+
+function tierAllowsShaderDetail() {
+  return Config.quality !== QualityTier.LOW;
 }
-
-/** Tiling value noise with smooth interpolation. */
-function valueNoise2D(rand, size) {
-  const grid = new Float32Array(size * size);
-  for (let i = 0; i < grid.length; i++) grid[i] = rand();
-  return (x, y) => {
-    const xi = Math.floor(x), yi = Math.floor(y);
-    const xf = x - xi, yf = y - yi;
-    const u = xf * xf * (3 - 2 * xf);
-    const v = yf * yf * (3 - 2 * yf);
-    const g = (ix, iy) => grid[((iy % size) + size) % size * size + (((ix % size) + size) % size)];
-    const a = g(xi, yi), b = g(xi + 1, yi), c = g(xi, yi + 1), d = g(xi + 1, yi + 1);
-    return (a * (1 - u) + b * u) * (1 - v) + (c * (1 - u) + d * u) * v;
-  };
-}
-
-/** Fractal brownian motion over tiling value noise. */
-export function fbm(rand, baseSize = 8, octaves = 6, lacunarity = 2, gain = 0.5) {
-  const layers = [];
-  let size = baseSize;
-  for (let o = 0; o < octaves; o++) {
-    layers.push({ n: valueNoise2D(rand, Math.max(2, Math.round(size))), size });
-    size *= lacunarity;
-  }
-  return (u, v) => {
-    let sum = 0, amp = 1, norm = 0;
-    for (const { n, size: s } of layers) {
-      sum += n(u * s, v * s) * amp;
-      norm += amp;
-      amp *= gain;
-    }
-    return sum / norm;
-  };
-}
-
-/* -------------------------------------------------------------- generators */
 
 /**
- * Build a height field and derive albedo/normal/roughness/AO from it.
- * `shade(u, v, h, out)` writes rgb 0..1 into `out` and may return roughness.
+ * Resolution policy. A caller's `size` is a request, not a command: it is
+ * raised to the recipe's minimum (a 256px bake of gun metal is visibly mush at
+ * ADS range) and then capped by the quality tier's texture budget.
  */
-export function generateSurface({
-  size = 1024,
-  seed = 1,
-  height,             // (u, v) => 0..1
-  shade,              // (u, v, h) => [r, g, b, roughness, metalness]
-  normalStrength = 2.0,
-  aoStrength = 0.9,
-  repeat = 1,
-  anisotropy = 16,
-} = {}) {
-  const rand = mulberry32(seed);
-  const N = size;
-  const H = new Float32Array(N * N);
-  for (let y = 0; y < N; y++) {
-    for (let x = 0; x < N; x++) {
-      H[y * N + x] = height(x / N, y / N, rand);
+function resolveSize(requested, recipe) {
+  const budget = Config.gfx.textureSize;
+  const want = Math.max(requested ?? budget, recipe.minSize ?? 256);
+  const size = Math.min(want, budget);
+  // Keep it a power of two so mip chains and the coarse divisor stay exact.
+  return 1 << Math.round(Math.log2(Math.max(64, size)));
+}
+
+/* ------------------------------------------------------------- bake passes */
+
+/**
+ * Nearest-neighbour upscale of an RGBA byte image, M -> N (N a multiple of M).
+ * Treated as 32-bit copies and done a row at a time: one expanded row is reused
+ * for all N/M destination rows, which turns the inner loop into a memcpy.
+ */
+const _splatRow = { u32: null };
+function splat(src, dst, M, N) {
+  const s32 = new Uint32Array(src.buffer, src.byteOffset, M * M);
+  const d32 = new Uint32Array(dst.buffer, dst.byteOffset, N * N);
+  const f = N / M;
+  const shift = Math.round(Math.log2(f));
+  if (!_splatRow.u32 || _splatRow.u32.length < N) _splatRow.u32 = new Uint32Array(N);
+  const row = _splatRow.u32.subarray(0, N);
+  for (let sy = 0; sy < M; sy++) {
+    const sRow = sy * M;
+    for (let x = 0; x < N; x++) row[x] = s32[sRow + (x >> shift)];
+    for (let k = 0; k < f; k++) d32.set(row, ((sy << shift) + k) * N);
+  }
+}
+
+/**
+ * Run one recipe at working resolution M into the N-resolution byte buffers.
+ * Written as a generator so the scheduler can slice it; pass `sliced = false`
+ * to run it straight through (the coarse pass does exactly that).
+ *
+ * Order matters: height and masks first, then the curvature/AO derivation over
+ * the finished field, then shading — the shading pass needs to know whether a
+ * texel is on an edge or in a cavity, which is not knowable one texel at a time.
+ */
+function* bakePass(impl, recipe, N, M, dstAlbedo, dstNormal, dstArm, sliced) {
+  // Target roughly a millisecond per slice at the sampling cost these recipes
+  // actually run at, independent of which stage's resolution we are on.
+  const chunkRows = sliced ? Math.max(1, Math.round(384 / M)) : 0;
+  const direct = M === N;
+  const A = direct ? dstAlbedo : new Uint8Array(M * M * 4);
+  const Nb = direct ? dstNormal : new Uint8Array(M * M * 4);
+  const R = direct ? dstArm : new Uint8Array(M * M * 4);
+
+  const masks = recipe.masks ?? 0;
+  const H = new Float32Array(M * M);
+  const MK = masks ? new Float32Array(M * M * masks) : null;
+  const out = new Float32Array(8);
+
+  for (let y = 0; y < M; y++) {
+    const v = (y + 0.5) / M;
+    for (let x = 0; x < M; x++) {
+      impl.sample((x + 0.5) / M, v, out);
+      const i = y * M + x;
+      H[i] = out[0];
+      for (let k = 0; k < masks; k++) MK[i * masks + k] = out[1 + k];
     }
+    if (chunkRows && (y % chunkRows) === chunkRows - 1) yield;
   }
 
+  normaliseRobust(H, 3);
+  if (chunkRows) yield;
+
+  const derived = deriveCurvatureAO(H, M, {}, {
+    aoStrength: recipe.aoStrength ?? 1,
+    curvGain: recipe.curvGain ?? 1,
+  });
+  if (chunkRows) yield;
+
+  encodeNormals(H, M, Nb, recipe.relief ?? 0.02);
+  if (chunkRows) yield;
+
+  const curv = derived.curv, ao = derived.ao;
+  const ctx = { h: 0, curv: 0, edge: 0, cavity: 0, ao: 1 };
+  const mv = new Float32Array(4);
+  const sh = new Float32Array(6);
+
+  for (let y = 0; y < M; y++) {
+    const v = (y + 0.5) / M;
+    for (let x = 0; x < M; x++) {
+      const i = y * M + x;
+      const cv = curv[i];
+      ctx.h = H[i];
+      ctx.curv = cv;
+      // Curvature is in RMS units, so these thresholds mean "half a sigma of
+      // convexity begins to wear, two sigma is fully worn" for every preset.
+      ctx.edge = smoothstep(0.55, 2.0, cv);
+      ctx.cavity = smoothstep(0.55, 2.0, -cv);
+      ctx.ao = ao[i];
+      for (let k = 0; k < masks; k++) mv[k] = MK[i * masks + k];
+
+      sh[0] = 0.18; sh[1] = 0.18; sh[2] = 0.18;
+      sh[3] = 0.85; sh[4] = 0; sh[5] = 1;
+      impl.shade((x + 0.5) / M, v, ctx, mv, sh);
+
+      const j = i * 4;
+      // Reflectance bounds: nothing below fresh asphalt, nothing above fresh
+      // lime plaster. Pure black and pure white do not exist as surfaces and
+      // both wreck the grade's tonal range.
+      A[j] = linearToSrgb8(clamp(sh[0], 0.012, 0.85));
+      A[j + 1] = linearToSrgb8(clamp(sh[1], 0.012, 0.85));
+      A[j + 2] = linearToSrgb8(clamp(sh[2], 0.012, 0.85));
+      A[j + 3] = 255;
+
+      R[j] = (clamp01(ctx.ao * sh[5]) * 255 + 0.5) | 0;
+      R[j + 1] = (clamp(sh[3], 0.03, 1) * 255 + 0.5) | 0;
+      R[j + 2] = (clamp01(sh[4]) * 255 + 0.5) | 0;
+      R[j + 3] = 255;
+    }
+    if (chunkRows && (y % chunkRows) === chunkRows - 1) yield;
+  }
+
+  if (!direct) {
+    splat(A, dstAlbedo, M, N);
+    splat(Nb, dstNormal, M, N);
+    splat(R, dstArm, M, N);
+  }
+}
+
+function runToCompletion(gen) { let r = gen.next(); while (!r.done) r = gen.next(); }
+
+/**
+ * Build (or fetch) the PBR texture set for a recipe at a given size and seed.
+ * The set is cached independently of the material, so two materials that differ
+ * only by tiling share one GPU upload.
+ */
+function getSurfaceSet(id, recipe, size, seed, recipeOpts) {
+  const key = `${id}|${size}|${seed}|${recipeOpts ? JSON.stringify(recipeOpts) : ''}`;
+  const hit = _surfaceCache.get(key);
+  if (hit) return hit;
+
+  const N = size;
+  const aniso = Config.gfx.anisotropy;
   const albedo = new Uint8Array(N * N * 4);
   const normal = new Uint8Array(N * N * 4);
-  const arm = new Uint8Array(N * N * 4); // r=AO g=roughness b=metalness
+  const arm = new Uint8Array(N * N * 4);
 
-  const at = (x, y) => H[(((y % N) + N) % N) * N + (((x % N) + N) % N)];
+  const impl = recipe.build(seed, recipeOpts || {});
 
-  for (let y = 0; y < N; y++) {
-    for (let x = 0; x < N; x++) {
-      const i = (y * N + x) * 4;
-      const h = H[y * N + x];
+  // Instant pass: 1/256 of the work, splatted into the full-size buffers so
+  // the texture never changes dimensions and nothing has to be re-linked.
+  const coarse = Math.max(32, N / COARSE_DIVISOR);
+  runToCompletion(bakePass(impl, recipe, N, coarse, albedo, normal, arm, false));
 
-      // Sobel gradient -> tangent-space normal
-      const dx = (at(x + 1, y) - at(x - 1, y)) * normalStrength * N / 512;
-      const dy = (at(x, y + 1) - at(x, y - 1)) * normalStrength * N / 512;
-      let nx = -dx, ny = -dy, nz = 1;
-      const len = Math.hypot(nx, ny, nz);
-      nx /= len; ny /= len; nz /= len;
-      normal[i] = (nx * 0.5 + 0.5) * 255;
-      normal[i + 1] = (ny * 0.5 + 0.5) * 255;
-      normal[i + 2] = (nz * 0.5 + 0.5) * 255;
-      normal[i + 3] = 255;
-
-      // cheap cavity AO from local height difference
-      let acc = 0;
-      for (let o = 1; o <= 3; o++) {
-        acc += (at(x + o, y) + at(x - o, y) + at(x, y + o) + at(x, y - o)) * 0.25 - h;
-      }
-      const ao = 1 - Math.min(1, Math.max(0, acc / 3) * 3 * aoStrength);
-
-      const s = shade(x / N, y / N, h, rand);
-      albedo[i] = Math.min(255, s[0] * 255);
-      albedo[i + 1] = Math.min(255, s[1] * 255);
-      albedo[i + 2] = Math.min(255, s[2] * 255);
-      albedo[i + 3] = 255;
-
-      arm[i] = ao * 255;
-      arm[i + 1] = Math.min(255, (s[3] ?? 0.8) * 255);
-      arm[i + 2] = Math.min(255, (s[4] ?? 0.0) * 255);
-      arm[i + 3] = 255;
-    }
-  }
-
-  const mk = (data, srgb) => {
-    const t = new THREE.DataTexture(data, N, N, THREE.RGBAFormat);
-    t.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
-    t.wrapS = t.wrapT = THREE.RepeatWrapping;
-    t.repeat.set(repeat, repeat);
-    t.anisotropy = anisotropy;
-    t.magFilter = THREE.LinearFilter;
-    t.minFilter = THREE.LinearMipmapLinearFilter;
-    t.generateMipmaps = true;
-    t.needsUpdate = true;
-    return t;
+  const set = {
+    map: makeDataTexture(albedo, N, true, aniso),
+    normalMap: makeDataTexture(normal, N, false, aniso),
+    armMap: makeDataTexture(arm, N, false, aniso),
+    resolution: coarse,
+    ready: false,
   };
+  _surfaceCache.set(key, set);
 
-  return { map: mk(albedo, true), normalMap: mk(normal, false), armMap: mk(arm, false) };
+  // Refine in slices, half resolution first. The half pass costs a quarter of
+  // the full one, so the surface reaches "sharp enough to stop noticing" about
+  // four times sooner, for a 25% increase in total work.
+  const stages = N >= 256 ? [N >> 1, N] : [N];
+  const refine = (function* () {
+    for (const M of stages) {
+      yield* bakePass(impl, recipe, N, M, albedo, normal, arm, true);
+      // Bumping the Source is enough: every clone that shares it re-uploads,
+      // and no material or program is touched.
+      set.map.source.needsUpdate = true;
+      set.normalMap.source.needsUpdate = true;
+      set.armMap.source.needsUpdate = true;
+      set.resolution = M;
+      yield;
+    }
+    set.ready = true;
+  })();
+  bakeScheduler.add(refine, key);
+
+  return set;
 }
 
+function tiled(tex, repeat) {
+  if (repeat === 1) return tex;
+  const t = tex.clone();
+  t.repeat.set(repeat, repeat);
+  return t;
+}
+
+/* --------------------------------------------------------------- material */
+
 /**
- * Single entry point. `preset` names a surface recipe; results are cached.
- * Add new presets here rather than building materials inline elsewhere.
+ * Single entry point. `preset` names a surface recipe; results are cached by
+ * preset + options, so calling this repeatedly is free.
+ *
+ * opts:
+ *   size        requested texture size (raised to the recipe minimum, capped
+ *               by the quality tier)
+ *   seed        deterministic variation
+ *   repeat      UV tiling (ignored when the material is triplanar)
+ *   triplanar   force world-space projection on/off (default: recipe's choice)
+ *   worldScale  metres per texture tile for the triplanar path
+ *   detail      override the detail-normal family, or `false` to disable
+ *   macro       override macro-breakup strength, 0 disables
+ *   envMapIntensity
+ *   material    raw property overrides applied last
+ *   recipe      recipe-specific parameters (e.g. asphalt_line's lineWidth)
  */
 export function makeMaterial(preset, opts = {}) {
-  const key = `${preset}:${JSON.stringify(opts)}`;
-  if (_cache.has(key)) return _cache.get(key);
+  const key = `${preset}:${JSON.stringify(opts)}:${Config.quality}`;
+  const cached = _materialCache.get(key);
+  if (cached) return cached;
 
-  const size = opts.size ?? 512;
-  const repeat = opts.repeat ?? 1;
+  const { id, recipe } = resolveRecipe(preset);
+  const size = resolveSize(opts.size, recipe);
   const seed = opts.seed ?? 1337;
-  const rand = mulberry32(seed);
-  const n = fbm(rand, 6, 6);
-  const fine = fbm(mulberry32(seed + 77), 24, 4);
+  const repeat = opts.repeat ?? 1;
 
-  let surface;
-  switch (preset) {
-    case 'concrete': {
-      surface = generateSurface({
-        size, seed, repeat, normalStrength: 1.4,
-        height: (u, v) => n(u, v) * 0.6 + fine(u, v) * 0.4,
-        shade: (u, v, h) => {
-          const g = 0.36 + h * 0.22;
-          const stain = Math.max(0, fine(u * 0.5, v * 0.5) - 0.55) * 0.6;
-          return [g - stain * 0.4, g - stain * 0.38, g * 0.98 - stain * 0.32, 0.86 - h * 0.12, 0.0];
-        },
-      });
-      break;
-    }
-    case 'metal': {
-      surface = generateSurface({
-        size, seed, repeat, normalStrength: 0.8,
-        height: (u, v) => fine(u, v * 0.15) * 0.7 + n(u, v) * 0.3,
-        shade: (u, v, h) => {
-          const g = 0.42 + h * 0.18;
-          const rust = Math.max(0, n(u * 1.3, v * 1.3) - 0.62) * 2.2;
-          return [
-            g + rust * 0.30, g * 0.94 + rust * 0.10, g * 0.9 + rust * 0.02,
-            0.34 + h * 0.2 + rust * 0.4, 1.0 - rust * 0.85,
-          ];
-        },
-      });
-      break;
-    }
-    case 'sand': {
-      surface = generateSurface({
-        size, seed, repeat, normalStrength: 1.1,
-        height: (u, v) => n(u, v) * 0.35 + fine(u, v) * 0.65,
-        shade: (u, v, h) => {
-          const g = 0.56 + h * 0.16;
-          return [g * 1.06, g * 0.94, g * 0.72, 0.94 - h * 0.06, 0.0];
-        },
-      });
-      break;
-    }
-    case 'plaster':
-    default: {
-      surface = generateSurface({
-        size, seed, repeat, normalStrength: 1.0,
-        height: (u, v) => n(u, v) * 0.7 + fine(u, v) * 0.3,
-        shade: (u, v, h) => {
-          const g = 0.62 + h * 0.16;
-          return [g * 1.02, g * 0.99, g * 0.93, 0.8 - h * 0.1, 0.0];
-        },
-      });
-    }
-  }
+  const set = getSurfaceSet(id, recipe, size, seed, opts.recipe);
 
-  const mat = new THREE.MeshStandardMaterial({
-    map: surface.map,
-    normalMap: surface.normalMap,
-    aoMap: surface.armMap,
-    roughnessMap: surface.armMap,
-    metalnessMap: surface.armMap,
+  const shaderOk = tierAllowsShaderDetail();
+  const triplanar = shaderOk && (opts.triplanar ?? recipe.triplanar ?? false);
+  const worldScale = opts.worldScale ?? recipe.worldScale ?? 2;
+
+  const props = {
+    map: tiled(set.map, repeat),
+    normalMap: tiled(set.normalMap, repeat),
+    aoMap: tiled(set.armMap, repeat),
+    roughnessMap: null,
+    metalnessMap: null,
+    // The armMap carries roughness in G and metalness in B; three samples the
+    // same texture through both slots, so share one clone rather than three.
     roughness: 1.0,
     metalness: 1.0,
     normalScale: new THREE.Vector2(1, 1),
     envMapIntensity: opts.envMapIntensity ?? 1.0,
-    ...(opts.material || {}),
-  });
-  mat.userData.preset = preset;
-  _cache.set(key, mat);
+    dithering: true,
+  };
+  props.roughnessMap = props.aoMap;
+  props.metalnessMap = props.aoMap;
+
+  const Klass = recipe.klass === 'physical' ? THREE.MeshPhysicalMaterial : THREE.MeshStandardMaterial;
+  const mat = new Klass(Object.assign(props, recipe.props || {}, opts.material || {}));
+
+  if (shaderOk) {
+    const detail = opts.detail === false ? null : (opts.detail ?? recipe.detail);
+    applySurfaceShader(mat, {
+      detail,
+      detailScale: opts.detailScale ?? recipe.detailScale ?? 6,
+      detailStrength: opts.detailStrength ?? recipe.detailStrength ?? 0.5,
+      detailFade: opts.detailFade || [8, 26],
+      macro: opts.macro ?? recipe.macro ?? 0,
+      macroPeriod: opts.macroPeriod ?? 26,
+      triplanar,
+      worldScale,
+      triSharp: opts.triSharp ?? 6,
+      anisotropy: Config.gfx.anisotropy,
+    });
+  }
+
+  mat.userData.preset = id;
+  mat.userData.surface = set;
+  mat.userData.triplanar = triplanar;
+  mat.userData.worldScale = worldScale;
+  _materialCache.set(key, mat);
   return mat;
 }
 
-export function clearMaterialCache() {
-  for (const m of _cache.values()) {
-    m.map?.dispose(); m.normalMap?.dispose(); m.aoMap?.dispose(); m.dispose();
+/* ---------------------------------------------------------------- catalog */
+
+/**
+ * Everything `makeMaterial` understands. Other modules should read this rather
+ * than hard-coding preset names — `triplanar: true` entries in particular
+ * ignore `repeat` and take their scale from `worldScale` instead.
+ */
+export function getMaterialCatalog() {
+  const out = [];
+  for (const [id, r] of Object.entries(RECIPES)) {
+    out.push({
+      id,
+      label: r.label,
+      description: r.description,
+      tags: r.tags ? r.tags.slice() : [],
+      triplanar: !!r.triplanar,
+      worldScale: r.worldScale ?? 2,
+      minSize: r.minSize ?? 256,
+      transparent: r.klass === 'physical',
+      aliases: Object.keys(ALIASES).filter((a) => ALIASES[a] === id),
+    });
   }
-  _cache.clear();
+  return out;
 }
 
-export { mulberry32 };
+/** Resolves once every queued bake has reached full resolution. */
+export function materialsReady() { return bakeScheduler.whenIdle(); }
+
+/** Force all pending bakes to finish now. Only for offline/headless capture. */
+export function flushMaterialBakes() { bakeScheduler.flush(); }
+
+export function clearMaterialCache() {
+  for (const set of _surfaceCache.values()) {
+    set.map.dispose(); set.normalMap.dispose(); set.armMap.dispose();
+  }
+  _surfaceCache.clear();
+  for (const m of _materialCache.values()) {
+    m.map?.dispose(); m.normalMap?.dispose(); m.aoMap?.dispose();
+    m.dispose();
+  }
+  _materialCache.clear();
+  disposeSharedMaps();
+}
+
+/* ------------------------------------------------------- legacy interface */
+
+/**
+ * Compatibility shim for the original height/shade surface builder. New code
+ * should add a recipe in Recipes.js instead — that path gets curvature-driven
+ * wear, chunked baking and the detail/macro shader for free.
+ */
+export function generateSurface({
+  size = 512, seed = 1, height, shade,
+  normalStrength = 2.0, aoStrength = 0.9, repeat = 1,
+  anisotropy = Config.gfx.anisotropy,
+} = {}) {
+  const N = size;
+  const rand = mulberry32(seed);
+  const albedo = new Uint8Array(N * N * 4);
+  const normal = new Uint8Array(N * N * 4);
+  const arm = new Uint8Array(N * N * 4);
+  const H = new Float32Array(N * N);
+
+  for (let y = 0; y < N; y++) {
+    for (let x = 0; x < N; x++) H[y * N + x] = height((x + 0.5) / N, (y + 0.5) / N, rand);
+  }
+  normaliseRobust(H, 3);
+  const d = deriveCurvatureAO(H, N, {}, { aoStrength, curvGain: 1 });
+  encodeNormals(H, N, normal, normalStrength * 0.01);
+
+  for (let y = 0; y < N; y++) {
+    for (let x = 0; x < N; x++) {
+      const i = y * N + x, j = i * 4;
+      const s = shade((x + 0.5) / N, (y + 0.5) / N, H[i], rand) || [];
+      albedo[j] = linearToSrgb8(clamp(s[0] ?? 0.2, 0.012, 0.85));
+      albedo[j + 1] = linearToSrgb8(clamp(s[1] ?? 0.2, 0.012, 0.85));
+      albedo[j + 2] = linearToSrgb8(clamp(s[2] ?? 0.2, 0.012, 0.85));
+      albedo[j + 3] = 255;
+      arm[j] = (clamp01(d.ao[i]) * 255) | 0;
+      arm[j + 1] = (clamp(s[3] ?? 0.8, 0.03, 1) * 255) | 0;
+      arm[j + 2] = (clamp01(s[4] ?? 0) * 255) | 0;
+      arm[j + 3] = 255;
+    }
+  }
+
+  const mk = (data, srgb) => {
+    const t = makeDataTexture(data, N, srgb, anisotropy);
+    t.repeat.set(repeat, repeat);
+    return t;
+  };
+  return { map: mk(albedo, true), normalMap: mk(normal, false), armMap: mk(arm, false) };
+}
+
+export { mulberry32, fbm, RECIPES };
+
+// Automated capture (the screenshot harness) renders a handful of frames and
+// exits, so the default trickle would photograph the coarse pass. Widen the
+// slice budget when a WebDriver is attached; interactive play is untouched.
+if (typeof navigator !== 'undefined' && navigator.webdriver) bakeScheduler.budgetMs = 24;

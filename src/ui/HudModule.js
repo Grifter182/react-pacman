@@ -1,180 +1,384 @@
+import { installStyles } from './UiStyles.js';
+import { el, clamp, damp } from './Dom.js';
+import { Crosshair, DamageIndicators } from './Crosshair.js';
+import { Minimap } from './Minimap.js';
+import { Compass } from './Compass.js';
+import { Killfeed } from './Killfeed.js';
+import { VitalsPanel, AmmoPanel, MatchBar, Callouts, ObjectiveStrip, RespawnOverlay } from './StatusPanels.js';
+import { Scoreboard } from './Scoreboard.js';
+import { Menus } from './Menus.js';
+import { LoadingScreen } from './LoadingScreen.js';
+import { Config } from '../core/Config.js';
+
 /**
  * OWNER: UI/UX agent.
  *
- * DOM-based HUD layered over the canvas: crosshair with dynamic spread,
- * hitmarkers, health/shield, ammo, compass, minimap, killfeed, damage
- * indicators, scoreboard, and the front-end menus.
+ * The whole presentation layer: gameplay HUD, front end, and the boot screen.
  *
- * Everything is driven from bus events — the HUD never reaches into
- * simulation state except through `engine.get(...)` reads in `update`.
+ * ARCHITECTURE
+ *   - Everything is DOM + CSS inside `#ui`. Nothing is created per frame; every
+ *     repeating element (killfeed rows, damage arcs, callouts, scoreboard rows)
+ *     is pooled at construction. The only canvas is the minimap, which is the
+ *     right tool for a rotating raster.
+ *   - Simulation state is read, never written. The HUD subscribes to the bus for
+ *     events and samples `engine.get(...)` for continuous values (health,
+ *     ammunition, spread), exactly as the module contract allows.
+ *   - The front end is a five-state machine — loading, title, live, pause,
+ *     summary — driven by pointer-lock changes and match events, so ESC always
+ *     means the same thing.
+ *
+ * HEADLESS. The visual-capture harness drives the camera with no user gesture,
+ * so a title screen would sit over every screenshot every other agent relies on.
+ * When `navigator.webdriver` is set (or `?nofrontend=1` is passed) the front end
+ * is skipped entirely and the HUD boots straight into its live layout.
+ *
+ * EVENTS IN
+ *   ui:pointerlock ui:vitals ui:damage ui:notify ui:settings
+ *   hit:actor actor:killed weapon:reload weapon:switch weapon:fire
+ *   ai:fire fx:explosion player:died player:spawn
+ *   match:state match:killfeed match:callout match:objective match:end
+ *   match:uav match:respawn
+ * EVENTS OUT
+ *   ui:deploy { weapon }   ui:restart   ui:pause { paused }
  */
+
+const State = { LOADING: 'loading', TITLE: 'title', LIVE: 'live', PAUSE: 'pause', SUMMARY: 'summary' };
+
 export class HudModule {
   constructor() {
-    this.root = null;
-    this._hitmarkerTimer = 0;
-    this._damageTimer = 0;
-    this._killfeed = [];
+    installStyles();
+
+    // The HUD is constructed at registration time, before any init() runs, so
+    // it can put the loading screen up before the generators start. If the host
+    // page ever ships without #ui, make one rather than taking the boot down.
+    let host = document.getElementById('ui');
+    if (!host) {
+      host = document.createElement('div');
+      host.id = 'ui';
+      host.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:10';
+      document.body.appendChild(host);
+    }
+    this.host = host;
+    this.root = el('div.bl-root');
+    host.appendChild(this.root);
+
+    this.loading = new LoadingScreen(this.root);
+    this.state = State.LOADING;
+
+    // `?frontend=1` forces the menus on under automation, which is the only way
+    // to inspect the front end from the capture harness.
+    const params = new URLSearchParams(location.search);
+    this.headless = (!!navigator.webdriver || params.has('nofrontend')) && !params.has('frontend');
+
+    this._flash = 0;
+    this._low = 0;
+    this._suppress = 0;
+    this._lastKiller = null;
+    this._matchView = null;
+
+    // `Engine.register()` assigns `module.engine` synchronously, before any
+    // module's init() has run. That assignment is the only hook early enough to
+    // report real boot progress, so it is intercepted here.
+    let _engine = null;
+    Object.defineProperty(this, 'engine', {
+      configurable: true,
+      get: () => _engine,
+      set: (e) => { _engine = e; if (e) this.loading.attach(e); },
+    });
   }
+
+  /* ------------------------------------------------------------------ init */
 
   async init(engine) {
-    this.root = document.getElementById('ui');
-    this.root.innerHTML = '';
-    this._injectStyles();
+    this.hud = el('div.bl-hud');
+    this.root.appendChild(this.hud);
 
-    this.root.insertAdjacentHTML('beforeend', `
-      <div class="hud">
-        <div class="crosshair" id="xh">
-          <i class="t"></i><i class="b"></i><i class="l"></i><i class="r"></i>
-          <em class="dot"></em>
-        </div>
-        <div class="hitmarker" id="hm"><i></i><i></i><i></i><i></i></div>
-        <div class="dmg" id="dmg"></div>
+    /* --- gameplay layer ---------------------------------------------------- */
+    this.crosshair = new Crosshair(this.hud);
+    this.damage = new DamageIndicators(this.hud);
+    this.$flash = el('div.bl-flash'); this.hud.appendChild(this.$flash);
+    this.$low = el('div.bl-lowhp'); this.hud.appendChild(this.$low);
+    this.$suppress = el('div.bl-suppress'); this.hud.appendChild(this.$suppress);
 
-        <div class="bottom-left">
-          <div class="health"><div class="bar" id="hpbar"></div></div>
-          <div class="label">HEALTH</div>
-        </div>
+    this.map = new Minimap(this.hud);
+    this.compass = new Compass(this.hud);
+    this.matchBar = new MatchBar(this.hud);
+    this.vitals = new VitalsPanel(this.hud);
+    this.ammo = new AmmoPanel(this.hud);
+    this.killfeed = new Killfeed(this.hud);
+    this.callouts = new Callouts(this.hud);
+    this.objective = new ObjectiveStrip(this.hud);
+    this.respawn = new RespawnOverlay(this.hud);
+    this.$perf = el('div.bl-perf'); this.hud.appendChild(this.$perf);
 
-        <div class="bottom-right">
-          <div class="ammo"><span id="mag">30</span><small id="res">/ 210</small></div>
-          <div class="label" id="wname">M4A1</div>
-        </div>
-
-        <div class="killfeed" id="kf"></div>
-        <div class="compass"><div class="strip" id="cmp"></div><i class="tick"></i></div>
-        <div class="perf" id="perf"></div>
-      </div>
-      <div class="prompt" id="prompt"><b>CLICK TO DEPLOY</b><span>WASD move · SHIFT sprint · CTRL crouch · R reload · RMB aim</span></div>
-    `);
-
-    this.$xh = document.getElementById('xh');
-    this.$hm = document.getElementById('hm');
-    this.$dmg = document.getElementById('dmg');
-    this.$hp = document.getElementById('hpbar');
-    this.$mag = document.getElementById('mag');
-    this.$res = document.getElementById('res');
-    this.$kf = document.getElementById('kf');
-    this.$cmp = document.getElementById('cmp');
-    this.$perf = document.getElementById('perf');
-    this.$prompt = document.getElementById('prompt');
-
-    engine.bus.on('ui:pointerlock', ({ locked }) => {
-      this.$prompt.classList.toggle('hidden', locked);
+    /* --- overlays ---------------------------------------------------------- */
+    this.scoreboard = new Scoreboard(this.root);
+    // A thunk, so the snapshot is only built on the frames the board repaints.
+    this._boardThunk = () => engine.get('match')?.scoreboard?.();
+    this.menus = new Menus(this.root, {
+      onDeploy: () => this.deploy(),
+      onResume: () => this.resume(),
+      onRestart: () => { engine.bus.emit('ui:restart', {}); this.deploy(); },
+      onWeapon: (id) => engine.get('weapons')?.switchTo(id),
+      onSetting: (k, v) => engine.get('player')?.setSetting(k, v) ?? v,
+      onQuality: (q) => this._setQuality(q, engine),
+      onVolume: (bus, v) => engine.get('audio')?.setVolume?.(bus, v),
+      getSettings: () => engine.get('player')?.settings || {},
+      getVolumes: () => engine.get('audio')?.volumes?.() || {},
     });
-    engine.bus.on('hit:actor', () => { this._hitmarkerTimer = 0.16; });
-    engine.bus.on('actor:killed', ({ headshot }) => {
-      this._hitmarkerTimer = 0.3;
-      this._pushKill(headshot ? 'HEADSHOT' : 'ELIMINATED');
-    });
-    engine.bus.on('player:damaged', () => { this._damageTimer = 0.55; });
+
+    const weapons = engine.get('weapons');
+    const table = weapons?.constructor?.WEAPONS;
+    if (table) this.menus.setWeapons(table, weapons.current);
+
+    /* --- minimap floorplan ------------------------------------------------- */
+    const level = engine.get('level');
+    const collision = engine.get('collision');
+    this.map.build(collision?.collider || level?.collider, level?.bounds);
+
+    this._bind(engine);
+
+    // The harness gets the live HUD with no overlay; a human gets the title.
+    if (this.headless) { this.state = State.LIVE; this.menus.hide(); }
+    else engine.bus.once('engine:ready', () => this.showTitle());
+
+    engine.hud = this;
   }
 
-  _pushKill(text) {
-    const el = document.createElement('div');
-    el.className = 'kfrow';
-    el.innerHTML = `<b>YOU</b><i></i><span>${text}</span>`;
-    this.$kf.prepend(el);
-    setTimeout(() => el.classList.add('out'), 3200);
-    setTimeout(() => el.remove(), 3800);
-    while (this.$kf.children.length > 5) this.$kf.lastChild.remove();
+  /* ------------------------------------------------------------------ bind */
+
+  _bind(engine) {
+    const bus = engine.bus;
+
+    bus.on('ui:pointerlock', ({ locked }) => {
+      if (locked) {
+        if (this.state === State.PAUSE || this.state === State.TITLE) this._enterLive();
+      } else if (this.state === State.LIVE) {
+        this.showPause();
+      }
+    });
+
+    /* --- combat feedback --------------------------------------------------- */
+    bus.on('hit:actor', ({ headshot }) => this.crosshair.hit(headshot ? 'head' : 'body'));
+    bus.on('actor:killed', ({ by }) => { if (by === 'player') this.crosshair.hit('kill'); });
+
+    bus.on('ui:damage', ({ angle, amount }) => {
+      const s = engine.get('player')?.state;
+      this.damage.add(angle, s ? s.yaw : 0, amount);
+      this._flash = Math.min(1, this._flash + clamp(amount / 42, 0.22, 0.85));
+    });
+
+    bus.on('ui:vitals', (v) => { this._vitalsState = v; });
+
+    /* --- contacts on the map ----------------------------------------------- */
+    bus.on('ai:fire', ({ origin }) => { if (origin) this.map.ping(origin.x, origin.z, 'contact', 2.8); });
+    bus.on('fx:explosion', ({ position }) => { if (position) this.map.ping(position.x, position.z, 'explosion', 3.4); });
+
+    /* --- weapon ------------------------------------------------------------ */
+    bus.on('weapon:switch', ({ to }) => this.menus.selectWeapon(to));
+    bus.on('ui:notify', ({ kind, text }) => {
+      if (!text) return;
+      this.callouts.push(text, '', kind === 'streak' ? 'streak' : '', 1.9);
+    });
+
+    /* --- match ------------------------------------------------------------- */
+    bus.on('match:killfeed', (e) => this.killfeed.push(e));
+    bus.on('match:callout', ({ title, sub, kind, dwell }) => this.callouts.push(title, sub, kind, dwell ?? 2.6));
+    bus.on('match:objective', ({ text, sub }) => this.objective.set(text, sub));
+    bus.on('match:uav', ({ active }) => this.map.setUav(active));
+    bus.on('match:end', (summary) => this.showSummary(summary));
+    bus.on('match:state', ({ state }) => {
+      if (state === 'live' && this.state === State.SUMMARY) this._enterLive();
+    });
+    bus.on('player:died', ({ by }) => { this._lastKiller = labelFor(by); });
+
+    /* --- keyboard ---------------------------------------------------------- */
+    this._onKeyDown = (e) => {
+      if (e.code === 'Tab') {
+        e.preventDefault();
+        if (this.state === State.LIVE) this.scoreboard.show(true);
+      } else if (e.code === 'Escape') {
+        // Pointer lock exit already fires 'ui:pointerlock'; this only covers the
+        // path back out of a menu that is open without lock ever being taken.
+        if (this.state === State.PAUSE) this.resume();
+      } else if (e.code === 'Enter' && this.state === State.TITLE) {
+        this.deploy();
+      }
+    };
+    this._onKeyUp = (e) => { if (e.code === 'Tab') this.scoreboard.show(false); };
+    this._onBlur = () => this.scoreboard.show(false);
+    window.addEventListener('keydown', this._onKeyDown);
+    window.addEventListener('keyup', this._onKeyUp);
+    window.addEventListener('blur', this._onBlur);
   }
+
+  /* --------------------------------------------------------------- screens */
+
+  showTitle() {
+    if (this.headless) return;
+    this.state = State.TITLE;
+    this.hud.classList.add('bl-off');
+    this.scoreboard.show(false);
+    this.menus.showTitle();
+    this.engine?.bus.emit('ui:pause', { paused: true });
+  }
+
+  showPause() {
+    if (this.headless) return;
+    this.state = State.PAUSE;
+    this.hud.classList.add('bl-off');
+    this.scoreboard.show(false);
+    this.menus.showPause();
+    this.engine?.bus.emit('ui:pause', { paused: true });
+  }
+
+  showSummary(summary) {
+    this.state = State.SUMMARY;
+    this._matchView = null;
+    if (this.headless) return;
+    this.hud.classList.add('bl-off');
+    this.scoreboard.show(false);
+    this.menus.showSummary(summary);
+    document.exitPointerLock?.();
+  }
+
+  /** Leave the front end and take pointer lock. */
+  deploy() {
+    this.engine?.bus.emit('ui:deploy', { weapon: this.menus.weapon });
+    this._enterLive();
+    this._requestLock();
+  }
+
+  resume() {
+    this._enterLive();
+    this._requestLock();
+  }
+
+  _enterLive() {
+    this.state = State.LIVE;
+    this.menus.hide();
+    this.hud.classList.remove('bl-off');
+    this.engine?.bus.emit('ui:pause', { paused: false });
+  }
+
+  /**
+   * Pointer lock is rate limited: a request made too soon after the user pressed
+   * ESC is rejected. Swallow that and retry once, rather than leaving the player
+   * in a live HUD with a dead mouse.
+   */
+  _requestLock() {
+    const canvas = this.engine?.canvas;
+    if (!canvas?.requestPointerLock) return;
+    const attempt = () => {
+      try {
+        const p = canvas.requestPointerLock();
+        if (p && typeof p.catch === 'function') p.catch(() => {});
+      } catch { /* rejected — the retry below covers it */ }
+    };
+    attempt();
+    clearTimeout(this._lockRetry);
+    this._lockRetry = setTimeout(() => {
+      if (this.state === State.LIVE && document.pointerLockElement !== canvas) attempt();
+    }, 1250);
+  }
+
+  _setQuality(tier, engine) {
+    if (Config.quality === tier) return;
+    Config.quality = tier;
+    engine.bus.emit('ui:notify', { kind: 'system', text: `QUALITY · ${tier.toUpperCase()}` });
+    // Modules that size render targets from the tier re-read them on resize.
+    // Another agent's resize path throwing must not take the menu down with it.
+    try { engine._onResize?.(); } catch (err) { console.warn('[HUD] quality resize failed', err); }
+  }
+
+  /* --------------------------------------------------------------- perframe */
 
   update(dt, engine) {
     const player = engine.get('player');
     const weapons = engine.get('weapons');
+    const match = engine.get('match');
     if (!player) return;
     const s = player.state;
 
-    // Crosshair spread reacts to movement, fire and stance.
-    const speed = Math.hypot(s.velocity.x, s.velocity.z);
-    const ads = weapons?._adsBlend ?? 0;
-    const spread = (7 + speed * 2.4 + (weapons?._recoil.y ?? 0) * 260) * (1 - ads * 0.85);
-    this.$xh.style.setProperty('--s', `${spread.toFixed(1)}px`);
-    this.$xh.style.opacity = String(1 - ads * 0.9);
+    /* --- reticle ----------------------------------------------------------- */
+    if (weapons?.def) {
+      const hidden = s.sprinting || weapons.reloading || !s.alive || weapons._switching
+        || this.state !== State.LIVE;
+      this.crosshair.update(dt, {
+        spread: weapons.spread,
+        fovY: engine.camera.fov,
+        height: engine.height,
+        ads: weapons._adsBlend,
+        hidden,
+        obstructed: s.sprinting,
+      });
+    }
+    this.damage.update(dt, s.yaw);
 
-    this._hitmarkerTimer = Math.max(0, this._hitmarkerTimer - dt);
-    this.$hm.style.opacity = String(Math.min(1, this._hitmarkerTimer * 7));
-    this.$hm.style.transform = `translate(-50%,-50%) scale(${1 + (1 - Math.min(1, this._hitmarkerTimer * 7)) * 0.35})`;
+    /* --- screen states ----------------------------------------------------- */
+    this._flash = Math.max(0, this._flash - dt * 1.9);
+    setOpacity(this.$flash, this._flash);
 
-    this._damageTimer = Math.max(0, this._damageTimer - dt);
-    this.$dmg.style.opacity = String(this._damageTimer * 1.1);
+    const v = this._vitalsState;
+    this._low = damp(this._low, v ? v.low : 0, 4, dt);
+    // Low-health rim pulses with the same heartbeat Vitals is driving audio from.
+    const beat = 0.82 + 0.18 * Math.sin(engine.elapsed * (5.6 + this._low * 5));
+    setOpacity(this.$low, this._low * beat);
+    this._suppress = damp(this._suppress, v ? v.suppression : 0, 6, dt);
+    setOpacity(this.$suppress, this._suppress * 0.75);
 
-    this.$hp.style.width = `${(s.health / s.maxHealth) * 100}%`;
-    this.$hp.style.background = s.health > 55 ? '#d8e4ee' : s.health > 25 ? '#e8b23c' : '#d8452f';
+    /* --- panels ------------------------------------------------------------ */
+    this.vitals.update(dt, s, v);
+    if (weapons) this.ammo.update(dt, weapons);
+    this.compass.update(s.yaw);
+    this.killfeed.update(dt);
+    this.callouts.update(dt);
 
-    if (weapons) {
-      this.$mag.textContent = String(weapons.ammo);
-      this.$res.textContent = `/ ${weapons.reserve}`;
-      this.$mag.classList.toggle('low', weapons.ammo <= 6);
+    const mv = match?.view?.();
+    if (mv) {
+      this._matchView = mv;
+      this.matchBar.update(mv);
+      this.respawn.update(!s.alive && mv.respawnIn > 0, mv.respawnIn, this._lastKiller);
+      this.map.setUav(!!mv.uavActive);
     }
 
-    // Compass strip scrolls with yaw.
-    const deg = ((-s.yaw * 180 / Math.PI) % 360 + 360) % 360;
-    this.$cmp.style.transform = `translateX(${-deg * 4}px)`;
-
-    if (engine.frame % 15 === 0) {
-      this.$perf.textContent = `${engine.perf.fps.toFixed(0)} FPS`;
-    }
-  }
-
-  _injectStyles() {
-    if (document.getElementById('hud-style')) return;
-    const st = document.createElement('style');
-    st.id = 'hud-style';
-    st.textContent = `
-      .hud { position:absolute; inset:0; font-family:inherit; color:#e8eef5; letter-spacing:.06em; }
-      .crosshair { --s:8px; position:absolute; left:50%; top:50%; width:0; height:0; transition:opacity .12s; }
-      .crosshair i { position:absolute; background:#eaf2fb; box-shadow:0 0 3px rgba(0,0,0,.9); }
-      .crosshair .t { width:2px; height:8px; left:-1px; top:calc(-1 * var(--s) - 8px); }
-      .crosshair .b { width:2px; height:8px; left:-1px; top:var(--s); }
-      .crosshair .l { height:2px; width:8px; top:-1px; left:calc(-1 * var(--s) - 8px); }
-      .crosshair .r { height:2px; width:8px; top:-1px; left:var(--s); }
-      .crosshair .dot { position:absolute; width:2px; height:2px; left:-1px; top:-1px; background:#eaf2fb; opacity:.55; }
-      .hitmarker { position:absolute; left:50%; top:50%; width:26px; height:26px; transform:translate(-50%,-50%); opacity:0; }
-      .hitmarker i { position:absolute; width:9px; height:2px; background:#fff; box-shadow:0 0 4px #000; }
-      .hitmarker i:nth-child(1){ top:3px; left:2px; transform:rotate(45deg); }
-      .hitmarker i:nth-child(2){ top:3px; right:2px; transform:rotate(-45deg); }
-      .hitmarker i:nth-child(3){ bottom:3px; left:2px; transform:rotate(-45deg); }
-      .hitmarker i:nth-child(4){ bottom:3px; right:2px; transform:rotate(45deg); }
-      .dmg { position:absolute; inset:0; opacity:0; background:radial-gradient(ellipse at center, transparent 42%, rgba(150,20,12,.55) 100%); }
-      .bottom-left { position:absolute; left:38px; bottom:34px; }
-      .bottom-right { position:absolute; right:38px; bottom:34px; text-align:right; }
-      .health { width:220px; height:5px; background:rgba(255,255,255,.13); border-radius:1px; overflow:hidden; }
-      .health .bar { height:100%; width:100%; background:#d8e4ee; transition:width .18s ease-out, background .3s; }
-      .label { margin-top:7px; font-size:11px; opacity:.5; font-weight:600; }
-      .ammo { font-size:44px; font-weight:700; line-height:1; text-shadow:0 2px 10px rgba(0,0,0,.8); }
-      .ammo small { font-size:17px; opacity:.5; margin-left:5px; font-weight:600; }
-      .ammo #mag.low { color:#e2503a; }
-      .killfeed { position:absolute; right:38px; top:88px; display:flex; flex-direction:column; gap:5px; align-items:flex-end; }
-      .kfrow { display:flex; align-items:center; gap:9px; font-size:12px; padding:5px 11px; background:rgba(8,11,16,.62); border-left:2px solid #d8452f; transition:opacity .5s; }
-      .kfrow.out { opacity:0; }
-      .kfrow b { color:#7fd0ff; }
-      .kfrow i { width:12px; height:1px; background:rgba(255,255,255,.35); }
-      .compass { position:absolute; left:50%; top:26px; transform:translateX(-50%); width:340px; height:26px; overflow:hidden;
-                 mask-image:linear-gradient(90deg,transparent,#000 22%,#000 78%,transparent); }
-      .compass .strip { position:absolute; left:50%; white-space:nowrap; font-size:12px; opacity:.65; font-weight:600; }
-      .compass .tick { position:absolute; left:50%; top:0; width:1px; height:9px; background:#fff; opacity:.8; }
-      .perf { position:absolute; left:14px; top:12px; font-size:11px; opacity:.35; font-variant-numeric:tabular-nums; }
-      .prompt { position:absolute; inset:0; display:flex; flex-direction:column; gap:12px; align-items:center; justify-content:center;
-                background:rgba(4,6,10,.55); backdrop-filter:blur(3px); transition:opacity .28s; color:#e8eef5; }
-      .prompt.hidden { opacity:0; pointer-events:none; }
-      .prompt b { font-size:26px; letter-spacing:.28em; font-weight:700; }
-      .prompt span { font-size:12px; opacity:.55; letter-spacing:.12em; }
-    `;
-    document.head.appendChild(st);
-
-    // Build the compass strip once.
-    requestAnimationFrame(() => {
-      const cmp = document.getElementById('cmp');
-      if (!cmp) return;
-      const marks = [];
-      for (let d = 0; d < 720; d += 15) {
-        const label = { 0: 'N', 45: 'NE', 90: 'E', 135: 'SE', 180: 'S', 225: 'SW', 270: 'W', 315: 'NW' }[d % 360];
-        marks.push(`<span style="display:inline-block;width:60px;text-align:center">${label || '·'}</span>`);
-      }
-      cmp.innerHTML = marks.join('');
+    this.map.update(dt, {
+      position: s.position,
+      yaw: s.yaw,
+      alive: s.alive,
+      actors: engine.get('ai')?.actors,
+      allies: mv?.allyPositions,
+      uavActive: !!mv?.uavActive,
     });
+
+    this.scoreboard.update(dt, this._boardThunk);
+
+    if (engine.frame % 20 === 0) {
+      this.$perf.textContent = `${engine.perf.fps.toFixed(0)} FPS · ${engine.perf.smoothMs.toFixed(1)} MS`;
+    }
   }
 
-  dispose() { if (this.root) this.root.innerHTML = ''; }
+  resize() { this.map?._resize(); }
+
+  dispose() {
+    window.removeEventListener('keydown', this._onKeyDown);
+    window.removeEventListener('keyup', this._onKeyUp);
+    window.removeEventListener('blur', this._onBlur);
+    clearTimeout(this._lockRetry);
+    this.map?.dispose();
+    this.root?.remove();
+  }
+}
+
+function setOpacity(node, value) {
+  const v = value < 0.004 ? 0 : Math.min(1, value);
+  const s = v.toFixed(3);
+  if (node.style.opacity !== s) node.style.opacity = s;
+}
+
+function labelFor(by) {
+  if (!by) return null;
+  if (typeof by === 'string' && by.startsWith('bot')) return `HOSTILE ${by.slice(3).padStart(2, '0')}`;
+  if (by === 'fall') return 'THE FALL';
+  return String(by).toUpperCase();
 }

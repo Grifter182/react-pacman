@@ -33,7 +33,7 @@ export class CollisionModule {
    */
   build(mergedMesh) {
     this.collider = mergedMesh;
-    mergedMesh.geometry.computeBoundsTree({ maxLeafTris: 8 });
+    mergedMesh.geometry.computeBoundsTree({ targetLeafSize: 8 });
     this.bvh = mergedMesh.geometry.boundsTree;
   }
 

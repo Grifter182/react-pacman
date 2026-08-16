@@ -1,16 +1,42 @@
 import * as THREE from 'three';
 import { Config } from '../core/Config.js';
+import { InputMap } from './InputMap.js';
+import { Controller, Stance } from './Controller.js';
+import { CameraRig } from './CameraRig.js';
+import { Vitals } from './Vitals.js';
 
 /**
  * OWNER: player-feel agent.
  *
- * Input, camera, and the capsule character controller. Everything that makes
- * movement *feel* right lives here: acceleration curves, air control, step-up,
- * crouch/slide, mantling, view bob, landing dip, camera shake, FOV kick.
+ * Everything the player *is*: intent (InputMap), body (Controller), view
+ * (CameraRig + Trauma) and condition (Vitals). This file only wires those
+ * together and owns the public surface other modules read.
  *
- * Publishes on the bus: 'player:spawn', 'player:died', 'player:damaged'.
- * Exposes `this.state` which WeaponModule and HudModule read:
- *   { position, velocity, yaw, pitch, grounded, sprinting, crouching, ads, health }
+ *   InputMap.js    keyboard / mouse / gamepad, sensitivity + FOV settings
+ *   Controller.js  capsule movement, stances, slide, step-up, mantle
+ *   CameraRig.js   spring camera, layered bob, roll, breathing, FOV
+ *   Trauma.js      trauma-model camera shake on Perlin noise
+ *   Vitals.js      health, directional damage, low-health response
+ *
+ * PUBLIC SURFACE — do not rename, other modules read these:
+ *   `this.state`   { position, velocity, yaw, pitch, grounded, sprinting,
+ *                    crouching, ads, health, maxHealth, alive, mantling,
+ *                    prone, sliding, stance }
+ *   `addShake(i)`  legacy shake entry point (FX + weapons call it)
+ *   `damage(...)`  apply damage to the player
+ *
+ * EVENTS OUT
+ *   'player:spawn'     { position, yaw }
+ *   'player:damaged'   { amount, from, direction, angle, health }
+ *   'player:died'      { by, position }
+ *   'player:land'      { impact, position, hard }
+ *   'player:jump'      { position }
+ *   'player:footstep'  { position, speed, foot, stance }
+ *   'player:mantle'    { phase, height }
+ *   'player:slide'     { phase, speed }
+ *   'ui:damage'        { id, angle, amount, from, headshot, life }
+ *   'ui:vitals'        { health, ratio, low, suppression, regenerating }
+ *   'ui:pointerlock'   { locked }
  */
 export class PlayerModule {
   constructor() {
@@ -22,196 +48,178 @@ export class PlayerModule {
       grounded: false,
       sprinting: false,
       crouching: false,
+      prone: false,
+      sliding: false,
+      mantling: false,
+      stance: Stance.STAND,
       ads: false,
       health: 100,
       maxHealth: 100,
       alive: true,
+      team: 0,
     };
-    this.keys = new Set();
-    this._pointerLocked = false;
-    this._bobPhase = 0;
-    this._bobAmount = 0;
-    this._landDip = 0;
-    this._shake = new THREE.Vector3();
-    this._fov = Config.camera.fovBase;
-    this._eyeHeight = Config.player.eyeHeight;
-    this._coyote = 0;
-    this._jumpBuffer = 0;
+
+    this.input = new InputMap();
+    this.controller = new Controller(this.state, this.input);
+    this.rig = new CameraRig(this.state, this.controller, this.input);
+    this.vitals = new Vitals(this.state);
+
+    // Kept for source compatibility with the previous implementation.
+    this.keys = this.input.keys;
+    this._adsBlend = 0;
   }
 
   async init(engine) {
+    this.engine = engine;
     this.collision = engine.get('collision');
+    this.controller.attach(this.collision, engine.bus);
+
     const level = engine.get('level');
     if (level) {
       const s = level.pickSpawn(0);
-      this.state.position.copy(s.position).setY(Config.player.height * 0.5 + 0.05);
+      this.state.position.copy(s.position).setY(s.position.y + Config.player.height * 0.5 + 0.02);
       this.state.yaw = s.yaw;
     }
-    this._bindInput(engine);
+
+    this.input.bind(engine);
+    engine.bus.on('input:ads', ({ down }) => { this.state.ads = down; });
+
+    engine.bus.on('player:land', ({ impact }) => {
+      this.rig.onLand(impact);
+      this.input.rumble(Math.min(0.5, impact * 0.03), 0.1, 90);
+    });
+    engine.bus.on('player:falldamage', ({ amount }) => {
+      this.vitals.damage(amount, 'fall', null, engine, { fall: true });
+      this.rig.trauma.add(0.5);
+    });
+    // MatchModule teleports the body on respawn; re-seat the camera so it does
+    // not spring across the map.
+    engine.bus.on('player:spawn', () => {
+      this.controller.reset(null);
+      this.vitals.reset();
+      this.rig.reset(this._eyeTarget());
+    });
+
+    this.controller.reset(this.state.position.clone());
+    this.rig.reset(this._eyeTarget());
+
     engine.player = this;
     engine.bus.emit('player:spawn', { position: this.state.position, yaw: this.state.yaw });
+    engine.bus.emit('ui:settings', { settings: this.input.settings });
   }
 
-  _bindInput(engine) {
-    const canvas = engine.canvas;
-    const onKey = (e, down) => {
-      const k = e.code;
-      if (down) this.keys.add(k); else this.keys.delete(k);
-      if (down && (k === 'Space' || k.startsWith('Arrow'))) e.preventDefault();
-      if (down && k === 'Space') this._jumpBuffer = 0.14;
-    };
-    window.addEventListener('keydown', (e) => onKey(e, true));
-    window.addEventListener('keyup', (e) => onKey(e, false));
-
-    canvas.addEventListener('click', () => {
-      if (!this._pointerLocked) canvas.requestPointerLock?.();
-    });
-    document.addEventListener('pointerlockchange', () => {
-      this._pointerLocked = document.pointerLockElement === canvas;
-      engine.bus.emit('ui:pointerlock', { locked: this._pointerLocked });
-    });
-    window.addEventListener('mousemove', (e) => {
-      if (!this._pointerLocked) return;
-      const sens = Config.input.sensitivity * (this.state.ads ? Config.input.adsSensScale : 1);
-      this.state.yaw -= e.movementX * sens;
-      this.state.pitch -= e.movementY * sens * (Config.input.invertY ? -1 : 1);
-      const lim = Math.PI / 2 - 0.008;
-      this.state.pitch = Math.max(-lim, Math.min(lim, this.state.pitch));
-    });
-    window.addEventListener('mousedown', (e) => {
-      if (!this._pointerLocked) return;
-      if (e.button === 0) engine.bus.emit('input:fire', { down: true });
-      if (e.button === 2) { this.state.ads = true; engine.bus.emit('input:ads', { down: true }); }
-    });
-    window.addEventListener('mouseup', (e) => {
-      if (e.button === 0) engine.bus.emit('input:fire', { down: false });
-      if (e.button === 2) { this.state.ads = false; engine.bus.emit('input:ads', { down: false }); }
-    });
-    window.addEventListener('contextmenu', (e) => e.preventDefault());
+  _eyeTarget() {
+    return new THREE.Vector3(
+      this.state.position.x,
+      this.state.position.y - this.controller.halfHeight + this.controller.eyeHeight,
+      this.state.position.z,
+    );
   }
+
+  /* ------------------------------------------------------------------ loop */
 
   fixedUpdate(dt, engine) {
-    const s = this.state;
-    const P = Config.player;
-    if (!s.alive) return;
-
-    const fwd = (this.keys.has('KeyW') ? 1 : 0) - (this.keys.has('KeyS') ? 1 : 0);
-    const strafe = (this.keys.has('KeyD') ? 1 : 0) - (this.keys.has('KeyA') ? 1 : 0);
-    s.crouching = this.keys.has('ControlLeft') || this.keys.has('KeyC');
-    s.sprinting = this.keys.has('ShiftLeft') && fwd > 0 && !s.crouching && !s.ads;
-
-    // Desired horizontal velocity in world space
-    const sin = Math.sin(s.yaw), cos = Math.cos(s.yaw);
-    let wishX = strafe * cos - fwd * sin;
-    let wishZ = -strafe * sin - fwd * cos;
-    const wishLen = Math.hypot(wishX, wishZ);
-    if (wishLen > 1e-4) { wishX /= wishLen; wishZ /= wishLen; }
-
-    let speed = P.walkSpeed;
-    if (s.sprinting) speed = P.sprintSpeed;
-    else if (s.crouching) speed = P.crouchSpeed;
-    if (s.ads) speed *= P.adsSpeedScale;
-
-    const accel = s.grounded ? P.accelGround : P.accelAir;
-    const targetX = wishX * speed, targetZ = wishZ * speed;
-    s.velocity.x += (targetX - s.velocity.x) * Math.min(1, accel * dt / Math.max(speed, 1));
-    s.velocity.z += (targetZ - s.velocity.z) * Math.min(1, accel * dt / Math.max(speed, 1));
-
-    if (s.grounded && wishLen < 1e-4) {
-      const f = Math.max(0, 1 - P.friction * dt);
-      s.velocity.x *= f; s.velocity.z *= f;
-    }
-
-    // Gravity + jump with coyote time and input buffering
-    s.velocity.y -= P.gravity * dt;
-    this._coyote = s.grounded ? 0.12 : Math.max(0, this._coyote - dt);
-    this._jumpBuffer = Math.max(0, this._jumpBuffer - dt);
-    if (this._jumpBuffer > 0 && this._coyote > 0) {
-      s.velocity.y = P.jumpVelocity;
-      this._jumpBuffer = 0; this._coyote = 0; s.grounded = false;
-    }
-
-    const wasGrounded = s.grounded;
-    const prevVy = s.velocity.y;
-
-    s.position.addScaledVector(s.velocity, dt);
-
-    const halfHeight = P.height * 0.5;
-    const res = this.collision?.capsuleResolve(s.position, P.radius, halfHeight) || { grounded: false };
-    s.grounded = res.grounded;
-    if (res.grounded && s.velocity.y < 0) s.velocity.y = 0;
-
-    if (!wasGrounded && s.grounded && prevVy < -4) {
-      this._landDip = Math.min(0.16, -prevVy * 0.012);
-      engine.bus.emit('player:land', { impact: -prevVy });
-    }
-
-    // Floor guard so a physics hiccup can never drop the player out of the map.
-    if (s.position.y < -20) {
-      s.position.set(0, 2, 34); s.velocity.set(0, 0, 0);
-    }
+    this.input.syncAxes();
+    this.controller.fixedUpdate(dt);
+    this.state.stance = this.controller.stance;
+    if (this.controller.stepOffset !== 0) this.rig.onStep(this.controller.stepOffset);
+    void engine;
   }
 
   update(dt, engine) {
-    const s = this.state;
-    const P = Config.player, C = Config.camera;
+    this.input.beginFrame(dt);
 
-    // Eye height with smooth crouch
-    const targetEye = s.crouching ? P.crouchEyeHeight : P.eyeHeight;
-    this._eyeHeight += (targetEye - this._eyeHeight) * Math.min(1, dt * 12);
+    // The weapon module publishes the authoritative aim blend; the camera and
+    // the mouse sensitivity both key off it so the two never disagree.
+    const weapons = engine.get('weapons');
+    this._adsBlend = weapons?._adsBlend ?? (this.state.ads ? 1 : 0);
+    const zoom = weapons?.def?.optic === 'scope'
+      ? THREE.MathUtils.lerp(1, 0.45, this._adsBlend) : 1;
 
-    // View bob driven by actual horizontal speed
-    const hSpeed = Math.hypot(s.velocity.x, s.velocity.z);
-    const bobTarget = s.grounded ? Math.min(1, hSpeed / P.sprintSpeed) : 0;
-    this._bobAmount += (bobTarget - this._bobAmount) * Math.min(1, dt * 8);
-    this._bobPhase += dt * (6.0 + hSpeed * 1.15);
-    const bobY = Math.sin(this._bobPhase * 2) * 0.022 * this._bobAmount * (s.ads ? 0.25 : 1);
-    const bobX = Math.cos(this._bobPhase) * 0.028 * this._bobAmount * (s.ads ? 0.2 : 1);
-    const bobRoll = Math.cos(this._bobPhase) * 0.008 * this._bobAmount;
-
-    this._landDip *= Math.max(0, 1 - dt * 9);
-    this._shake.multiplyScalar(Math.max(0, 1 - dt * 11));
-
-    // FOV: sprint widens, ADS narrows
-    let targetFov = C.fovBase;
-    if (s.sprinting) targetFov += C.fovSprintAdd * this._bobAmount;
-    if (s.ads) targetFov = C.fovBase * C.fovAdsScale;
-    this._fov += (targetFov - this._fov) * Math.min(1, dt * 11);
-
-    const cam = engine.camera;
-    cam.position.set(
-      s.position.x + bobX + this._shake.x,
-      s.position.y - P.height * 0.5 + this._eyeHeight + bobY - this._landDip + this._shake.y,
-      s.position.z + this._shake.z
-    );
-    cam.rotation.set(s.pitch, s.yaw, bobRoll + this._shake.z * 0.4, 'YXZ');
-    if (Math.abs(cam.fov - this._fov) > 0.01) {
-      cam.fov = this._fov;
-      cam.updateProjectionMatrix();
+    const look = this.input.drainLook(this._adsBlend, zoom);
+    if (this.state.alive) {
+      this.state.yaw += look.yaw;
+      this.state.pitch += look.pitch;
+      const lim = Math.PI / 2 - 0.008;
+      this.state.pitch = Math.max(-lim, Math.min(lim, this.state.pitch));
+      // Keep yaw bounded so long sessions cannot lose float precision on it.
+      if (this.state.yaw > Math.PI * 4 || this.state.yaw < -Math.PI * 4) {
+        this.state.yaw = ((this.state.yaw + Math.PI) % (Math.PI * 2)) - Math.PI;
+      }
     }
 
-    engine.viewmodelCamera.position.copy(cam.position);
-    engine.viewmodelCamera.quaternion.copy(cam.quaternion);
+    if (this.controller.landImpact > 0) this.controller.landImpact = 0;
+
+    this.vitals.update(dt, engine, this.rig.trauma);
+    this.rig.update(dt, engine, {
+      adsBlend: this._adsBlend,
+      health: this.state.health,
+      maxHealth: this.state.maxHealth,
+      suppression: this.vitals.suppression,
+    });
+
+    // Death: the view slumps rather than freezing.
+    if (!this.state.alive) {
+      const cam = engine.camera;
+      cam.position.y -= Math.min(0.9, (this._deathT = (this._deathT || 0) + dt) * 0.75);
+      cam.rotateZ(Math.min(0.55, this._deathT * 0.55));
+    } else {
+      this._deathT = 0;
+    }
+
+    this.input.endFrame();
   }
 
+  /* ---------------------------------------------------------------- public */
+
+  /** Legacy shake entry point: an amplitude in metres becomes trauma. */
   addShake(intensity) {
-    this._shake.set(
-      (Math.random() - 0.5) * intensity,
-      (Math.random() - 0.5) * intensity,
-      (Math.random() - 0.5) * intensity * 0.6
-    );
+    this.rig.trauma.add(Math.min(0.85, Math.sqrt(Math.max(0, intensity)) * 1.35));
   }
 
-  damage(amount, from, engine) {
+  /** Directional trauma, for explosions and impacts with a known origin. */
+  shakeFrom(intensity, worldPos) {
     const s = this.state;
-    if (!s.alive) return;
-    s.health = Math.max(0, s.health - amount);
-    this.engine?.bus.emit('player:damaged', { amount, from });
-    if (s.health <= 0) {
-      s.alive = false;
-      this.engine?.bus.emit('player:died', { by: from, position: s.position.clone() });
-    }
+    const dx = s.position.x - worldPos.x, dz = s.position.z - worldPos.z;
+    const l = Math.hypot(dx, dz) || 1;
+    this.rig.trauma.impulse(Math.min(0.9, intensity), dx / l, 0.35, dz / l);
   }
 
-  dispose() {}
+  /**
+   * @param amount  damage
+   * @param from    attacker label forwarded on the bus
+   * @param arg     engine (legacy 3rd argument) or an options object
+   *                `{ origin, headshot, engine }`
+   */
+  damage(amount, from, arg) {
+    const engine = this.engine || (arg && arg.bus ? arg : null);
+    if (!engine) return 0;
+    const opts = arg && !arg.bus ? arg : {};
+    const applied = this.vitals.damage(amount, from, opts.origin || null, engine, opts);
+    if (applied > 0) {
+      const w = Math.min(1, amount / 45);
+      if (opts.origin) this.shakeFrom(0.14 + w * 0.34, opts.origin);
+      else this.rig.trauma.add(0.14 + w * 0.34);
+      this.input.rumble(0.35 + w * 0.5, 0.25, 140);
+    }
+    return applied;
+  }
+
+  /** Near-miss: pins the player without hurting them. */
+  suppress(amount = 0.25) {
+    this.vitals.suppress(amount);
+    this.rig.trauma.add(amount * 0.20);
+  }
+
+  /** Runtime settings hook for the UI agent: `player.setSetting('fov', 95)`. */
+  setSetting(key, value) {
+    const v = this.input.set(key, value);
+    this.engine?.bus.emit('ui:settings', { settings: this.input.settings, changed: key });
+    return v;
+  }
+
+  get settings() { return this.input.settings; }
+  get eyeHeight() { return this.controller.eyeHeight; }
+
+  dispose() { this.input.dispose(); }
 }
