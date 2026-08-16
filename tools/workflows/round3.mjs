@@ -24,6 +24,13 @@ cast shadows, full tonal range, visible muzzle flash, minimap with real
 building footprints, clean HUD hierarchy, correct ADS centring, sane motion
 blur and TAA.
 
+IMPORTANT — A PREVIOUS ATTEMPT AT THIS ROUND WAS INTERRUPTED PART-WAY.
+Some of the work below may ALREADY BE DONE, committed as "WIP: round-3 weapon
+and level work in progress". Before you change anything, read the current state
+of your owned files and establish what is already fixed. Do not redo completed
+work, and do not assume a finding is still open just because it is listed here.
+Report explicitly which items you found already addressed.
+
 HARD RULES
 - Edit ONLY your owned files. Other agents are editing this same tree now.
 - Do NOT edit src/main.js, src/core/Engine.js, src/core/Config.js or
