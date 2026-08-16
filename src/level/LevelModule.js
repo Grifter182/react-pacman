@@ -190,15 +190,23 @@ export class LevelModule {
    * Upgrade selected surfaces from procedural bakes to authored photographic
    * texture sets.
    *
-   * The material OBJECTS are mutated in place rather than replaced, because
-   * every mesh, batch and instance built later holds a reference to them —
-   * swapping the reference here would upgrade the catalogue and leave the
-   * world still pointing at the old materials.
+   * REPLACES the material rather than mutating it, and that is load-bearing.
+   * The procedural materials carry an onBeforeCompile injection (SF_SURFACE /
+   * SF_DETAIL / SF_MACRO / SF_WORLD) that computes the surface response from
+   * the recipe's own packed uniforms. Assigning `roughnessMap`/`metalnessMap`
+   * onto one of those does nothing — the injected code never reads them —
+   * while the `roughness`/`metalness` SCALARS that must be 1.0 for a packed
+   * map to survive are taken at face value. The ground became a mirror
+   * reflecting the sky probe, which reads as a hole in the world.
    *
-   * Tiling is inherited from the procedural map it replaces. Those repeats
-   * were chosen against each surface's real size in metres, so reusing them
-   * keeps texel density correct instead of re-deriving it and getting a
-   * different answer.
+   * An authored photographic set does not want that injection anyway: the
+   * detail, macro-variation and triplanar passes exist to rescue a small
+   * procedural bake from looking repetitive, and a measured 1K set with real
+   * grain has none of those problems.
+   *
+   * Replacing is safe here specifically because this runs before the Batcher
+   * is constructed and before any geometry is built, so the catalogue is the
+   * only thing holding these references. It would NOT be safe later.
    *
    * Failure is non-fatal: without the files the procedural bake stands, which
    * is a complete implementation in its own right.
@@ -220,10 +228,13 @@ export class LevelModule {
       await Promise.all(swaps.map(async ({ set, targets, normalScale }) => {
         const src = await loadTextureSet(set, { anisotropy: aniso });
         for (const key of targets) {
-          const mat = M[key];
-          if (!mat) continue;
-          // Inherit the repeat the procedural map was using.
-          const rep = mat.map?.repeat?.clone() ?? new THREE.Vector2(1, 1);
+          const old = M[key];
+          if (!old) continue;
+
+          // Inherit the repeat the procedural map was using: those were chosen
+          // against each surface's real size in metres, so reusing them keeps
+          // texel density as authored rather than re-deriving it.
+          const rep = old.map?.repeat?.clone() ?? new THREE.Vector2(1, 1);
           const map = src.map.clone();
           const normalMap = src.normalMap.clone();
           const ormMap = src.ormMap.clone();
@@ -231,23 +242,32 @@ export class LevelModule {
             t.repeat.copy(rep);
             t.needsUpdate = true;
           }
-          // DO NOT dispose the outgoing textures. The catalogue deliberately
-          // shares one baked set between tinted variants of the same recipe,
-          // so freeing them here pulls the texture out from under every other
-          // material still using it — which renders those surfaces as nothing
-          // at all. The procedural set is freed with the rest of the level.
-          mat.map = map;
-          mat.normalMap = normalMap;
-          mat.aoMap = ormMap;
-          mat.roughnessMap = ormMap;
-          mat.metalnessMap = ormMap;
-          // The scalars multiply the maps, so they must be 1 for the packed
-          // channels to survive. Any tint the recipe applied stays on .color.
-          mat.roughness = 1.0;
-          mat.metalness = 1.0;
-          mat.normalScale.set(normalScale, normalScale);
-          mat.userData.authored = set;
-          mat.needsUpdate = true;
+
+          const next = new THREE.MeshStandardMaterial({
+            name: `${key}:${set}`,
+            map,
+            normalMap,
+            aoMap: ormMap,
+            roughnessMap: ormMap,
+            metalnessMap: ormMap,
+            // Scalars multiply the maps, so both must be 1 for the packed
+            // channels to reach the shader unmodified.
+            roughness: 1.0,
+            metalness: 1.0,
+            normalScale: new THREE.Vector2(normalScale, normalScale),
+            envMapIntensity: old.envMapIntensity ?? 1.0,
+            side: old.side,
+            dithering: true,
+          });
+          // Keep whatever tint the recipe chose; it is what separates the
+          // variants of one surface from each other.
+          if (old.color) next.color.copy(old.color);
+          next.userData.authored = set;
+
+          // The outgoing textures are NOT disposed: the catalogue shares one
+          // baked set between tinted variants, so freeing them here pulls the
+          // texture out from under variants that were not swapped.
+          M[key] = next;
         }
       }));
     } catch (err) {
