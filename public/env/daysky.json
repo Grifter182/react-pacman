@@ -6,7 +6,12 @@
   ],
   "elevationDeg": 54.67,
   "peakLuminance": 59608.4,
-  "meanLuminance": 988.6699,
+  "meanLuminance": 0.4827,
+  "irradianceUp": [
+    3.2363,
+    3.4505,
+    3.3138
+  ],
   "sunPixels": 10,
   "width": 2048,
   "height": 1024

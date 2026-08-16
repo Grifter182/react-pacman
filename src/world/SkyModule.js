@@ -136,6 +136,35 @@ export class SkyModule {
     this.skyIrradianceUp = new THREE.Vector3(up[0], up[1], up[2]);
     engine.skyIrradianceUp = this.skyIrradianceUp;
 
+    // MATCH THE PROBE'S AMBIENT ENERGY TO THE ANALYTIC MODEL'S.
+    //
+    // An HDRI carries absolute radiometric values; the lighting rig is tuned
+    // in the renderer's own arbitrary units. Substituting one for the other
+    // unscaled multiplies the ambient term by whatever the ratio happens to
+    // be, and the failure is deceptive: surfaces facing straight up take the
+    // full hit and wash out to sky colour, while vertical faces — dominated by
+    // the directional sun — still look correct. The result reads as a broken
+    // material rather than a broken exposure, which is exactly how it was
+    // first misdiagnosed here.
+    //
+    // Both irradiances are cosine-weighted over the upper hemisphere, so their
+    // ratio is the scale that makes the photograph deliver the same ambient
+    // energy the rest of the rig already expects.
+    if (this.probe) {
+      const m = this.probe.meta?.irradianceUp;
+      if (Array.isArray(m) && m.length === 3) {
+        const probeE = (m[0] + m[1] + m[2]) / 3;
+        const modelE = (up[0] + up[1] + up[2]) / 3;
+        if (probeE > 1e-6 && modelE > 1e-6) {
+          const scale = (modelE / probeE) * (Config.assets?.environmentIntensity ?? 1.0);
+          engine.scene.environmentIntensity = scale;
+          engine.scene.backgroundIntensity = scale;
+          engine.viewmodelScene.environmentIntensity = scale;
+          this.probeScale = scale;
+        }
+      }
+    }
+
     for (const d of this._transient) d.dispose();
     this._transient.length = 0;
   }

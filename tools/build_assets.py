@@ -255,13 +255,37 @@ def analyse_sun(img):
     d = (dirs * wts[:, None]).sum(axis=0) / wts.sum()
     d /= np.linalg.norm(d)
 
-    total = float((lum * solid).sum() / solid.sum())
+    # Solid-angle weighted mean radiance. `solid` is one column, so it must be
+    # broadcast across the full width before normalising or the divisor is short
+    # by a factor of the image width.
+    total = float((lum * solid).sum() / (solid.sum() * lum.shape[1]))
     peak = float(lum.max())
+
+    # Cosine-weighted irradiance on an up-facing surface, per channel.
+    #
+    # This is the number that makes a photographic probe usable as a drop-in
+    # for an analytic sky. An HDRI carries absolute radiometric values, and a
+    # renderer's lighting rig is tuned in its own arbitrary units; dropping one
+    # into the other unscaled changes the ambient term by whatever the ratio
+    # happens to be. Surfaces facing straight up take the full hit and blow out
+    # to sky colour, while vertical faces — dominated by the directional sun —
+    # still look correct, so the frame fails in a way that looks like a
+    # material bug rather than an exposure one.
+    #
+    # E = integral over the upper hemisphere of L * cos(theta) * dOmega
+    cos_t = np.cos(theta)[:, None]
+    upper = theta[:, None] < (np.pi / 2)
+    w = (solid * cos_t * upper)
+    # dOmega = sin(theta) dtheta dphi, with dtheta = pi/h and dphi = 2pi/width.
+    dw = (np.pi / h) * (2.0 * np.pi / lum.shape[1])
+    irr = [float((img[:, :, c] * w).sum() * dw) for c in range(3)]
+
     return {
         'direction': [round(float(x), 5) for x in d],
         'elevationDeg': round(float(np.degrees(np.arcsin(d[1]))), 2),
         'peakLuminance': round(peak, 1),
         'meanLuminance': round(total, 4),
+        'irradianceUp': [round(v, 4) for v in irr],
         'sunPixels': int(mask.sum()),
     }
 
