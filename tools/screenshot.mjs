@@ -95,7 +95,7 @@ async function main() {
   // probe demotes to MEDIUM — correct for a real player on software GL, but it
   // would mean every visual review judged an image with the top-tier effects
   // switched off. Reviews must see what the game is actually trying to render.
-  const quality = arg('quality', 'ultra');
+  const quality = arg('quality', 'high');
   const target = `${server.url}${server.url.includes('?') ? '&' : '?'}quality=${quality}`;
   await page.goto(target, { waitUntil: 'load', timeout: 60000 });
 
