@@ -445,16 +445,32 @@ export class Foliage {
     // the bark texture by the same factor; ±15% is invisible.
     const H = this.nominalHeight = 7.5;
     const tb = new GeoBuilder({ uvScale: 1.4, weather: null });
-    const rings = 22;
+    // BUDGET, round 3. This was 22 stacked drums, each a *chamfered* 9-sided
+    // cylinder — and a chamfered cyl emits three bands, so every drum cost 54
+    // triangles plus 27 more for its scar ring. 1,789 triangles per trunk,
+    // 39k across 22 palms, second only to the sandbags on the whole map, for a
+    // shape whose entire read is one leaning taper with a few scars on it.
+    //
+    // The lean is a sine, so it is sampled where the *curvature* is, not at a
+    // uniform 340 mm: 7 drums resolve it to under 20 mm of chord error, which
+    // is a tenth of the trunk's own radius. Chamfers are dropped, which makes
+    // `cyl` emit one band instead of three, and the scar rings — which are the
+    // only thing that breaks the taper's outline — are kept on every drum
+    // rather than every other one. 1,789 -> 268, and the silhouette gains a
+    // scar ring rather than losing one.
+    const rings = 7;
     const seg = H / rings;
     for (let i = 0; i < rings; i++) {
       const t = i / rings;
       const rr = lerp(0.21, 0.135, t);
       const lean = Math.sin(t * 1.6) * 0.34;
-      tb.at(lean, t * H + seg / 2, 0).cyl(rr * 1.05, rr * 0.99, seg * 1.04, 9, 0.014, false, i === 0);
-      if (i % 2 === 0) {
-        tb.at(lean, t * H + seg * 0.34, 0).cyl(rr * 1.17, rr * 1.17, 0.05, 9, 0.012, false, false);
-      }
+      const leanNext = Math.sin(((i + 1) / rings) * 1.6) * 0.34;
+      // Each drum leans toward the next so the stack reads as one bent shaft
+      // rather than as a staircase of offset cylinders.
+      const tilt = Math.atan2(leanNext - lean, seg);
+      tb.at(lean, t * H + seg / 2, 0, 0, 0, -tilt)
+        .cyl(rr * 1.05, lerp(0.21, 0.135, (i + 1) / rings) * 0.99, seg * 1.06, 8, 0, false, i === 0);
+      tb.at(lean, t * H + seg * 0.28, 0).cyl(rr * 1.19, rr * 1.19, 0.06, 8, 0, false, false);
     }
     const trunkGeo = tb.toGeometry(false);
 

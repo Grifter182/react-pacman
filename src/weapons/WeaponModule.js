@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { WEAPONS, WEAPON_ORDER, recoilAtShot } from './WeaponDefs.js';
-import { buildWeapon, weaponMaterials } from './Gunsmith.js';
+import { buildWeapon, weaponMaterials, collimate } from './Gunsmith.js';
 import { buildArms, armMaterials } from './Arms.js';
 import { buildClips, ClipPlayer } from './Clip.js';
 import { ViewmodelAnimator } from './Animator.js';
@@ -534,54 +534,17 @@ export class WeaponModule {
    * slides across the glass; the point it covers in the world does not move.
    */
   lateUpdate(dt, engine) {
-    const cam = engine.viewmodelCamera;
-    cam.updateMatrixWorld(true);
-
-    const b = this.weapon;
-    const sight = b.sight.group;
-    const G = _v3a.setFromMatrixPosition(sight.matrixWorld);
-    cam.worldToLocal(G);
-
-    const camQi = cam.getWorldQuaternion(_q).invert();
-    const A = _v3b.set(0, 0, -1)
-      .applyQuaternion(sight.getWorldQuaternion(_q2))
-      .applyQuaternion(camQi)
-      .normalize();
-
-    const t = G.dot(A);
-    const ret = b.reticle;
-    if (t > 0.01) {
-      const P = _v3c.copy(A).multiplyScalar(t);
-      // Eyebox: the dot vanishes once the axis walks off the lens, which is
-      // what makes losing your cheek weld cost something.
-      const off = P.distanceTo(G);
-      const lim = b.sight.glassR * 0.92;
-      const visible = 1 - THREE.MathUtils.smoothstep(off, lim * 0.55, lim);
-
-      ret.position.copy(P);
-      ret.quaternion.identity();
-      // Constant subtended angle: scale by the distance the maths landed on.
-      const scale = t * (b.sight.reticleAngle || 5.8e-4);
-      ret.scale.setScalar(scale);
-      // Bright at the hip (the dot is the only aiming reference), dimmer when
-      // aimed so it does not wash out the target behind it.
-      const brightness = visible * (0.55 + 0.45 * (1 - this._adsBlend));
-      ret.material.opacity = brightness;
-      ret.visible = brightness > 0.01;
-
-      if (this.scope) {
-        const scoped = this.def.optic === 'scope';
-        const k = b.sight.glassR > 0 ? 1 / b.sight.glassR : 0;
-        this.scope.update(scoped ? Math.pow(this._adsBlend, 1.6) : 0,
-          (P.x - G.x) * k * 0.42, (P.y - G.y) * k * 0.42);
-        // The etched overlay reticle replaces the 3D one once the eye is in.
-        if (scoped) ret.material.opacity *= 1 - Math.pow(this._adsBlend, 3);
-      }
-    } else {
-      ret.visible = false;
-      this.scope?.update(0, 0, 0);
-    }
+    // One implementation, shared with the offline weapon probe
+    // (`src/weapons/probe.js`), so what the probe photographs is what the game
+    // renders. `collimate` returns the numbers a test can assert on — whether
+    // the dot is on, how far off the eyebox axis it sits, what opacity it got —
+    // which is what makes "the reticle does not render" answerable without
+    // driving the full capture harness.
+    this._reticleState = collimate(this.weapon, engine.viewmodelCamera, this._adsBlend, this.scope);
   }
+
+  /** Last frame's reticle diagnostics. Debug/inspection surface. */
+  get reticleState() { return this._reticleState || null; }
 
   resize() { this.scope?.resize(); }
 

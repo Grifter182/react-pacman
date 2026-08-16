@@ -56,7 +56,26 @@ export const SPLASH_HEIGHT = 1.35;
  * vehicle bodies are untouched.
  */
 const MIN_CHAMFER = 0.0145;
-const MIN_HALF_EXTENT = 0.055;
+
+/**
+ * Round 3 re-measurement. The 55 mm figure this used to carry was set by
+ * eyeballing the kit rather than by counting it, and it let through the single
+ * largest class of chamfer on the map: solids that are *long* but hairline in
+ * section. Window jambs stand 110 mm proud (55 mm half-extent, exactly on the
+ * old line and so kept), hood brackets are 110 mm wide, sill corbels 130 mm,
+ * lintel bands and copings 100–150 mm tall. There are ~200 openings and the
+ * surround alone was 1,578 boxes paying 32 triangles each for a bevel band
+ * 20 mm wide — under a pixel past 6 m, on parts that are themselves two pixels
+ * at 30 m. Measured cost of that one class: 50k triangles, a twelfth of the
+ * whole map, for zero change to any silhouette.
+ *
+ * 80 mm is where the line actually belongs. Everything whose smallest
+ * half-extent clears it keeps its full bevel, which is every solid that reads
+ * as a *mass* rather than as a strip: parapet bays and their piers, plinths,
+ * cornices, roof slabs, stair treads, crates, sandbags, jersey barriers, AC
+ * bodies, vehicle panels. Those are the edges that catch the sun.
+ */
+const MIN_HALF_EXTENT = 0.08;
 
 /**
  * Hard ceiling on the subdivisions `quad()` will emit along one axis. The
@@ -66,6 +85,14 @@ const MIN_HALF_EXTENT = 0.055;
  * triangles nobody notices until the frame budget is gone.
  */
 const MAX_SUBDIV = 20;
+
+/* Face selectors for `box(..., gridFaces)`. */
+export const FACE_PX = 1, FACE_NX = 2, FACE_PY = 4, FACE_NY = 8, FACE_PZ = 16, FACE_NZ = 32;
+export const FACE_ALL = 63;
+/** Top face only — roof decks, podium slabs, anything the sun sees one side of. */
+export const FACE_TOP = FACE_PY;
+/** The four uprights: walls, parapets, backdrop masses. Skips top and bottom. */
+export const FACE_SIDES = FACE_PX | FACE_NX | FACE_PZ | FACE_NZ;
 
 /* --------------------------------------------------------------- noise ---- */
 
@@ -318,8 +345,16 @@ export class GeoBuilder {
    * Chamfered box centred on the cursor. `c` is the chamfer width in metres;
    * `grid` tessellates the six main faces so weathering gradients have vertex
    * resolution (0 = one quad per face).
+   *
+   * `gridFaces` is a bitmask over (+X, -X, +Y, -Y, +Z, -Z) selecting which of
+   * those six faces the grid applies to; the rest fall back to one quad. It
+   * exists for the slabs: a 20 x 14 m roof deck asked for a 1.6 m weathering
+   * grid and got it on all six faces, so its *underside* — which is never lit,
+   * never weathered and usually never seen — carried 288 triangles of gradient
+   * resolution, twice over, per roof. Same for the backdrop masses, whose four
+   * hidden sides cost more than their visible two.
    */
-  box(w, h, d, c = 0.02, grid = 0) {
+  box(w, h, d, c = 0.02, grid = 0, gridFaces = FACE_ALL) {
     const hx = w * 0.5, hy = h * 0.5, hz = d * 0.5;
     let cc = Math.min(c, hx * 0.9, hy * 0.9, hz * 0.9);
     // Chamfer LOD — see MIN_CHAMFER. Small parts fall back to a plain solid,
@@ -327,14 +362,15 @@ export class GeoBuilder {
     if (cc < MIN_CHAMFER || Math.min(hx, hy, hz) < MIN_HALF_EXTENT) cc = 0;
     const ax = hx - cc, ay = hy - cc, az = hz - cc;
     const O = [0, 0, 0];
+    const g = (bit) => ((gridFaces & bit) ? grid : 0);
 
     // Six main faces, inset by the chamfer on all four sides.
-    this.quad([hx, -ay, -az], [hx, -ay, az], [hx, ay, az], [hx, ay, -az], grid);
-    this.quad([-hx, -ay, az], [-hx, -ay, -az], [-hx, ay, -az], [-hx, ay, az], grid);
-    this.quad([-ax, hy, az], [ax, hy, az], [ax, hy, -az], [-ax, hy, -az], grid);
-    this.quad([-ax, -hy, -az], [ax, -hy, -az], [ax, -hy, az], [-ax, -hy, az], grid);
-    this.quad([-ax, -ay, hz], [ax, -ay, hz], [ax, ay, hz], [-ax, ay, hz], grid);
-    this.quad([ax, -ay, -hz], [-ax, -ay, -hz], [-ax, ay, -hz], [ax, ay, -hz], grid);
+    this.quad([hx, -ay, -az], [hx, -ay, az], [hx, ay, az], [hx, ay, -az], g(FACE_PX));
+    this.quad([-hx, -ay, az], [-hx, -ay, -az], [-hx, ay, -az], [-hx, ay, az], g(FACE_NX));
+    this.quad([-ax, hy, az], [ax, hy, az], [ax, hy, -az], [-ax, hy, -az], g(FACE_PY));
+    this.quad([-ax, -hy, -az], [ax, -hy, -az], [ax, -hy, az], [-ax, -hy, az], g(FACE_NY));
+    this.quad([-ax, -ay, hz], [ax, -ay, hz], [ax, ay, hz], [-ax, ay, hz], g(FACE_PZ));
+    this.quad([ax, -ay, -hz], [-ax, -ay, -hz], [-ax, ay, -hz], [ax, ay, -hz], g(FACE_NZ));
 
     if (cc <= 1e-4) return this;
 
@@ -472,6 +508,40 @@ export class GeoBuilder {
       this.poly([...ring[0][0], ...ring[0][1], ...ring[0][2], ...ring[0][3]], points[1]);
       const l = n - 1;
       this.poly([...ring[l][0], ...ring[l][1], ...ring[l][2], ...ring[l][3]], points[n - 2]);
+    }
+    return this;
+  }
+
+  /**
+   * Absorb a finished BufferGeometry through a matrix. This is how a prop
+   * prototype that is *not* worth an InstancedMesh gets welded into a shared
+   * static bucket instead: same triangles, same material, one fewer draw call
+   * per shadow cascade.
+   *
+   * The prototype's own UVs are copied rather than reprojected — it was
+   * authored at its own uvScale and a planar reprojection at the bucket's scale
+   * would resize its texture.
+   */
+  absorb(geometry, matrix) {
+    const src = geometry.getAttribute('position');
+    const nsrc = geometry.getAttribute('normal');
+    const usrc = geometry.getAttribute('uv');
+    const idx = geometry.index;
+    const n = idx ? idx.count : src.count;
+    const nm = new THREE.Matrix3().getNormalMatrix(matrix);
+    for (let k = 0; k < n; k++) {
+      const i = idx ? idx.getX(k) : k;
+      _p.fromBufferAttribute(src, i).applyMatrix4(matrix);
+      this.pos.push(_p.x, _p.y, _p.z);
+      if (nsrc) {
+        _n.fromBufferAttribute(nsrc, i).applyNormalMatrix(nm).normalize();
+        this.nrm.push(_n.x, _n.y, _n.z);
+      } else this.nrm.push(0, 1, 0);
+      if (usrc) this.uv.push(usrc.getX(i), usrc.getY(i));
+      else this.uv.push(0, 0);
+      _wea[0] = 0; _wea[1] = 0;
+      if (this.weather) this.weather(_p.x, _p.y, _p.z, _n.x, _n.y, _n.z, _wea);
+      this.wea.push(_wea[0], _wea[1]);
     }
     return this;
   }

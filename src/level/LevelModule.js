@@ -326,80 +326,156 @@ export class LevelModule {
     applyWeathering(M.tile, { grime: 1.0, stain: 1.0, dust: [0.228, 0.206, 0.162] });
   }
 
+  /**
+   * ==========================================================================
+   *  THE SHADOW BUDGET  —  read this before adding a bucket.
+   * ==========================================================================
+   *
+   * `renderer.info` accumulates over every pass in a frame, and at the HIGH
+   * tier the sun is split into four shadow cascades whose combined range
+   * (140 m) is larger than this map's longest diagonal (124 m). Nothing is
+   * outside them, so a mesh that casts is submitted FIVE times a frame: once
+   * for the camera and once per cascade. That is the whole story of the round-2
+   * regression. Measured on the round-2 build:
+   *
+   *     scene geometry            607k triangles across 116 meshes
+   *     of which shadow-casting   566k triangles across  73 meshes
+   *     reported by the harness   2.94M triangles, 547 draw calls
+   *     (607k + 566k x 4)         2.87M                408   <- the level's share
+   *
+   * The arithmetic is exact to 2%: culling rejects essentially nothing, because
+   * the compound fits inside every cascade. So the lever with by far the most
+   * leverage is not the triangle count of a bucket — it is whether the bucket
+   * casts at all, which is worth 4x, and how many *meshes* it is split across,
+   * which is worth 4x again on the draw-call side.
+   *
+   * Two rules follow, and both are applied below:
+   *
+   *  1. SPATIAL CELLS ARE OFF. They exist so a near cascade can reject a chunk
+   *     of the map. On a 80 x 92 m compound inside a 140 m shadow range there
+   *     is no chunk to reject: splitting `plasterPale` into five cells turned
+   *     five draw calls into twenty-five and rejected none of them. One mesh
+   *     per material. (The mechanism stays in Batcher.js — it is the right
+   *     answer for a larger map, and this one may yet grow.)
+   *
+   *  2. A BUCKET CASTS ONLY IF ITS SHADOW IS A SHAPE. Masonry, roofs, awnings,
+   *     stalls, vehicles, sandbags and palms all throw a legible shape onto the
+   *     ground or onto a wall, and they carry the map's lighting. Shutters
+   *     recessed inside a reveal, glazing bars, cables, railings, wheels under
+   *     a car body, chrome trim and the goods on a stall counter do not: their
+   *     shadows are either sub-texel hairlines that alias, or they fall inside
+   *     a shadow something bigger is already casting. Those are 4x savings for
+   *     a difference nobody can point at in a frame.
+   */
   _defineBuckets() {
     const M = this.materials;
     const b = this.batch;
     // uvScale must match the preset's worldScale, or the LOW tier — which
     // drops the triplanar path and falls back to these UVs — rescales.
-    b.define('sand', M.sand, { uvScale: 2.0, castShadow: false });
-    b.define('sandFar', M.sandFar, {
-      uvScale: 8.0, castShadow: false, receiveShadow: false, weather: false, cells: false,
-    });
-    b.define('gravel', M.gravel, { uvScale: 1.3, castShadow: false });
-    b.define('asphalt', M.asphalt, { uvScale: 1.5, castShadow: false });
-    b.define('tile', M.tile, { uvScale: 0.9, castShadow: false });
-    // Decals skip the spatial split: they never cast, they are a few thousand
-    // triangles between them, and four draw calls beats sixteen.
-    const dc = { castShadow: false, weather: false, cells: false };
-    b.define('decalDark', M.decalDark, Object.assign({ uvScale: 1.5 }, dc));
-    b.define('decalWear', M.decalWear, Object.assign({ uvScale: 1.3 }, dc));
-    b.define('decalOil', M.decalOil, Object.assign({ uvScale: 1.5 }, dc));
-    b.define('decalPale', M.decalPale, Object.assign({ uvScale: 1.5 }, dc));
+    // Every bucket is cells:false — see the shadow-budget note above.
+    const NC = { cells: false, castShadow: false };
+    const CC = { cells: false };
 
-    b.define('plaster', M.plaster, { uvScale: 2.0 });
-    b.define('plasterWarm', M.plasterWarm, { uvScale: 2.0 });
-    b.define('plasterPale', M.plasterPale, { uvScale: 2.0 });
-    b.define('concrete', M.concrete, { uvScale: 2.4 });
-    b.define('brick', M.brick, { uvScale: 2.0 });
+    b.define('sand', M.sand, { uvScale: 2.0, ...NC });
+    b.define('sandFar', M.sandFar, { uvScale: 8.0, ...NC, receiveShadow: false, weather: false });
+    b.define('gravel', M.gravel, { uvScale: 1.3, ...NC });
+    b.define('asphalt', M.asphalt, { uvScale: 1.5, ...NC });
+    b.define('tile', M.tile, { uvScale: 0.9, ...NC });
+    // Decals are coplanar with the ground they sit on; casting from them is not
+    // just wasted, it is the classic source of self-shadow acne on a road.
+    const dc = { ...NC, weather: false };
+    b.define('decalDark', M.decalDark, { uvScale: 1.5, ...dc });
+    b.define('decalWear', M.decalWear, { uvScale: 1.3, ...dc });
+    b.define('decalOil', M.decalOil, { uvScale: 1.5, ...dc });
+    b.define('decalPale', M.decalPale, { uvScale: 1.5, ...dc });
 
-    b.define('timber', M.timber, { uvScale: 2.2, weather: false });
-    b.define('shutter', M.shutter, { uvScale: 2.2, weather: false, cells: false });
-    b.define('metal', M.metal, { uvScale: 1.4, weather: false });
-    b.define('ironwork', M.ironwork, { uvScale: 1.4, weather: false });
-    b.define('corrugated', M.corrugated, { uvScale: 1.8, weather: false });
-    b.define('sandbagM', M.sandbag, { uvScale: 1.2, weather: false, cells: false });
-    b.define('glass', M.glass, { uvScale: 1.5, weather: false, cells: false, castShadow: false });
-    b.define('tyre', M.rubber, { uvScale: 0.5, weather: false, cells: false });
-    b.define('awning', M.awning, { uvScale: 0.6, weather: false });
-    b.define('awningRed', M.awningRed, { uvScale: 0.6, weather: false });
-    b.define('rug', M.rug, { uvScale: 0.6, weather: false, cells: false });
-    b.define('sack', M.sack, { uvScale: 0.6, weather: false, cells: false });
-    b.define('carpaint', M.carPaintA, { uvScale: 1.4, weather: false, cells: false });
-    b.define('carpaintB', M.carPaintB, { uvScale: 1.4, weather: false, cells: false });
-    b.define('chrome', M.chrome, { uvScale: 0.35, weather: false, cells: false });
-    b.define('signage', M.signage, { uvScale: 1.4, weather: false, cells: false });
-    b.define('emissive', M.emissive, { uvScale: 1.4, weather: false, cells: false, castShadow: false });
-    b.define('rubblebits', M.concrete, { uvScale: 2.4 });
+    // --- the massing. This is what the sun is actually drawing with. --------
+    b.define('plaster', M.plaster, { uvScale: 2.0, ...CC });
+    b.define('plasterWarm', M.plasterWarm, { uvScale: 2.0, ...CC });
+    b.define('plasterPale', M.plasterPale, { uvScale: 2.0, ...CC });
+    b.define('concrete', M.concrete, { uvScale: 2.4, ...CC });
+    b.define('brick', M.brick, { uvScale: 2.0, ...CC });
+    b.define('rubblebits', M.concrete, { uvScale: 2.4, ...CC });
+    b.define('concreteProp', M.concreteProp, { uvScale: 1.2, ...CC, weather: false });
+
+    b.define('timber', M.timber, { uvScale: 2.2, ...CC, weather: false });
+    b.define('metal', M.metal, { uvScale: 1.4, ...CC, weather: false });
+    b.define('polymer', M.polymer, { uvScale: 1.0, ...CC, weather: false });
+    b.define('corrugated', M.corrugated, { uvScale: 1.8, ...CC, weather: false });
+    b.define('sandbagM', M.sandbag, { uvScale: 1.2, ...CC, weather: false });
+    b.define('awning', M.awning, { uvScale: 0.6, ...CC, weather: false });
+    b.define('awningRed', M.awningRed, { uvScale: 0.6, ...CC, weather: false });
+    b.define('carpaint', M.carPaintA, { uvScale: 1.4, ...CC, weather: false });
+    b.define('carpaintB', M.carPaintB, { uvScale: 1.4, ...CC, weather: false });
+    // Structural steel that reads as a bar against the sky: stair stringers,
+    // roof plant frames, gates, balcony rails on a skyline.
+    b.define('ironwork', M.ironwork, { uvScale: 1.4, ...CC, weather: false });
+
+    // --- detail that lives inside somebody else's shadow -------------------
+    // A shutter sits 100 mm back inside a reveal whose jamb, hood and sill are
+    // already casting over it; a glazing bar is 35 mm across, which is a third
+    // of a shadow-map texel at this cascade resolution, so all it can produce
+    // is a crawling dotted line.
+    b.define('shutter', M.shutter, { uvScale: 2.2, ...NC, weather: false });
+    b.define('ironThin', M.ironwork, { uvScale: 1.4, ...NC, weather: false });
+    b.define('glass', M.glass, { uvScale: 1.5, ...NC, weather: false });
+    b.define('tyre', M.rubber, { uvScale: 0.5, ...NC, weather: false });
+    b.define('rug', M.rug, { uvScale: 0.6, ...CC, weather: false });
+    b.define('sack', M.sack, { uvScale: 0.6, ...NC, weather: false });
+    b.define('chrome', M.chrome, { uvScale: 0.35, ...NC, weather: false });
+    b.define('signage', M.signage, { uvScale: 1.4, ...NC, weather: false });
+    b.define('emissive', M.emissive, { uvScale: 1.4, ...NC, weather: false });
+
     // Backdrop masses: silhouette only. No shadow casting or receiving (they
-    // are outside every cascade anyway), no spatial cells (one draw call each),
-    // and they keep the weather attribute purely so they share the exact same
-    // shader program as the compound rather than compiling three more.
+    // are outside every cascade anyway), and they keep the weather attribute
+    // purely so they share the exact same shader program as the compound
+    // rather than compiling three more.
     const bg = { castShadow: false, receiveShadow: false, cells: false };
-    b.define('bgPale', M.plasterPale, Object.assign({ uvScale: 2.0 }, bg));
-    b.define('bgWarm', M.plasterWarm, Object.assign({ uvScale: 2.0 }, bg));
-    b.define('bgGrey', M.concrete, Object.assign({ uvScale: 2.4 }, bg));
+    b.define('bgPale', M.plasterPale, { uvScale: 2.0, ...bg });
+    b.define('bgWarm', M.plasterWarm, { uvScale: 2.0, ...bg });
+    b.define('bgGrey', M.concrete, { uvScale: 2.4, ...bg });
   }
 
+  /**
+   * INSTANCED OR MERGED? The break-even is not "does it repeat" — everything
+   * here repeats. An InstancedMesh costs one draw call in the camera pass and
+   * one in every shadow cascade it lands in, which on this map is five; a
+   * merged kind costs zero, because the bucket it welds into was already being
+   * drawn. So instancing only pays when the duplicated vertex data it saves is
+   * worth five draw calls, and at ~150 triangles a prototype that means it has
+   * to appear tens of times, not five.
+   *
+   * `mergeTo` names an existing bucket with the same material. Everything
+   * merged below is under 30 placements; everything instanced is over 40.
+   */
   _defineProps() {
     const M = this.materials;
     const i = this.inst;
+    // Instanced: 44–105 placements each, 10k–26k triangles of duplicate data
+    // avoided per kind.
     i.define('crateWood', protoCrate(0.62), M.timber);
-    i.define('crateWoodBig', protoCrate(0.86), M.timber);
     i.define('crateMetal', protoCrate(0.70), M.metal);
-    i.define('barrel', protoBarrel(), M.metal);
     i.define('barrelBlue', protoBarrel(), M.polymer);
-    // 7 courses ≈ 1.03 m (crouch cover), 10 ≈ 1.47 m (standing cover).
-    i.define('sandbagLow', protoSandbagWall(7, 2.0, 3), M.sandbag);
-    i.define('sandbagHigh', protoSandbagWall(10, 2.0, 8), M.sandbag);
-    i.define('jersey', protoJersey(), M.concreteProp);
-    i.define('pallet', protoPallet(), M.timber);
-    i.define('tyre', protoTyre(), M.rubber);
     i.define('ac', protoAcUnit(), M.metal);
-    i.define('pipes', protoPipeBundle(), M.metal);
-    i.define('rubble', protoRubble(11), M.concreteProp);
-    i.define('bollard', protoBollard(), M.concreteProp);
     i.define('tank', protoWaterTank(), M.polymer);
-    i.define('dish', protoDish(), M.metal);
+    // Rooftop dishes: 97 of them, and the only rooftop kind whose shadow is a
+    // 90 mm-deep drum edge-on to a low sun. Instanced, and not a caster.
+    i.define('dish', protoDish(), M.metal, { castShadow: false });
+
+    // Merged: five to thirty placements apiece, so an InstancedMesh for each
+    // was 40 draw calls' worth of shadow passes to save 54k triangles of
+    // vertex data across the whole map.
+    i.define('crateWoodBig', protoCrate(0.86), M.timber, { mergeTo: 'timber' });
+    i.define('barrel', protoBarrel(), M.metal, { mergeTo: 'metal' });
+    // 7 courses ≈ 1.03 m (crouch cover), 10 ≈ 1.47 m (standing cover).
+    i.define('sandbagLow', protoSandbagWall(7, 2.0, 3), M.sandbag, { mergeTo: 'sandbagM' });
+    i.define('sandbagHigh', protoSandbagWall(10, 2.0, 8), M.sandbag, { mergeTo: 'sandbagM' });
+    i.define('jersey', protoJersey(), M.concreteProp, { mergeTo: 'concreteProp' });
+    i.define('rubble', protoRubble(11), M.concreteProp, { mergeTo: 'concreteProp' });
+    i.define('bollard', protoBollard(), M.concreteProp, { mergeTo: 'concreteProp' });
+    i.define('pallet', protoPallet(), M.timber, { mergeTo: 'timber' });
+    i.define('pipes', protoPipeBundle(), M.metal, { mergeTo: 'metal' });
+    i.define('tyre', protoTyre(), M.rubber, { mergeTo: 'tyre' });
   }
 
   /* ==================================================================== */
@@ -697,22 +773,42 @@ export class LevelModule {
         const w = 9 + r() * 16, dp = 9 + r() * 16;
         const bk = buckets[(r() * 3) | 0];
         const b = this.batch.at(bk, x, z);
-        b.at(x, H / 2, z, a).box(w, H, dp, 0.08, [6, 3]);
+        // BUDGET. These masses stand 55–150 m out, behind most of the fog, and
+        // they neither cast nor receive. Everything that used to be spent on
+        // their *surface* was wasted: an 80 mm chamfer is a tenth of a pixel at
+        // that range, and the [6, 3] weathering grid put 40 quads on each of
+        // six faces — four of which face away — for a gradient no one can
+        // resolve. That was 253 triangles a mass, 17.5k across the ring. They
+        // are silhouette and nothing else, so they are built as silhouette:
+        // 12 triangles for the mass, and the whole saving goes back into the
+        // parapet, penthouse and tank stack that gives the skyline its steps.
+        b.at(x, H / 2, z, a).box(w, H, dp, 0, 0);
         // Parapet band and a coping: two more value steps per mass, and they
         // are the only thing that keeps these from reading as plain slabs.
-        b.at(x, H + 0.45, z, a).box(w + 0.2, 0.9, dp + 0.2, 0.06, 0);
-        b.at(x, H + 0.95, z, a).box(w + 0.5, 0.16, dp + 0.5, 0.05, 0);
+        b.at(x, H + 0.45, z, a).box(w + 0.2, 0.9, dp + 0.2, 0, 0);
+        b.at(x, H + 0.95, z, a).box(w + 0.5, 0.16, dp + 0.5, 0, 0);
+        // Setback: a second, smaller mass stepped in on top of the parapet on
+        // about half the ring. One step in plan is worth more to a skyline than
+        // any amount of surface detail on the box below it, and at 12 triangles
+        // it is a third of what the deleted grid cost.
+        if (r() < 0.5) {
+          const sw = w * (0.42 + r() * 0.3), sd = dp * (0.42 + r() * 0.3);
+          const sh = 3.5 + r() * (H * 0.45);
+          const ox = (r() - 0.5) * (w - sw) * 0.8, oz = (r() - 0.5) * (dp - sd) * 0.8;
+          b.at(x + ox, H + 1.03 + sh / 2, z + oz, a).box(sw, sh, sd, 0, 0);
+          b.at(x + ox, H + 1.03 + sh + 0.1, z + oz, a).box(sw + 0.4, 0.2, sd + 0.4, 0, 0);
+        }
         // A stair penthouse and a tank on roughly half of them.
         if (r() < 0.55) {
           const ox = (r() - 0.5) * w * 0.5, oz = (r() - 0.5) * dp * 0.5;
-          b.at(x + ox, H + 2.3, z + oz, a).box(3.0, 3.0, 3.4, 0.06, 0);
-          b.at(x + ox, H + 3.9, z + oz, a).box(3.4, 0.2, 3.8, 0.05, 0);
+          b.at(x + ox, H + 2.3, z + oz, a).box(3.0, 3.0, 3.4, 0, 0);
+          b.at(x + ox, H + 3.9, z + oz, a).box(3.4, 0.2, 3.8, 0, 0);
         }
         if (r() < 0.6) {
           const ox = (r() - 0.5) * w * 0.6, oz = (r() - 0.5) * dp * 0.6;
           const m = this.batch.at('bgGrey', x, z);
-          m.at(x + ox, H + 1.7, z + oz).cyl(0.75, 0.7, 1.5, 8, 0.05);
-          m.at(x + ox, H + 3.4, z + oz).cyl(0.07, 0.04, 2.0 + r() * 2.5, 5, 0);
+          m.at(x + ox, H + 1.7, z + oz).cyl(0.75, 0.7, 1.5, 6, 0, true, false);
+          m.at(x + ox, H + 3.4, z + oz).cyl(0.07, 0.04, 2.0 + r() * 2.5, 4, 0, false, false);
         }
         placed++;
       }
@@ -721,10 +817,13 @@ export class LevelModule {
     // orients the player from anywhere on it.
     for (const [x, z, h, rr] of [[-58, 92, 34, 1.7], [98, -54, 27, 2.6], [-92, -80, 30, 2.2]]) {
       const b = this.batch.at('bgPale', x, z);
-      b.at(x, h / 2, z).cyl(rr * 1.15, rr * 0.92, h, 10, 0.08);
-      b.at(x, h + 0.5, z).cyl(rr * 1.5, rr * 1.4, 1.0, 10, 0.06);
-      b.at(x, h + 2.4, z).cyl(rr * 1.2, rr * 0.9, 2.8, 10, 0.05);
-      b.at(x, h + 4.6, z).cyl(rr * 0.6, 0.02, 2.0, 8, 0.03);
+      // A landmark is read entirely from its outline, so it keeps its segment
+      // count where the outline is (the shaft and the gallery) and loses the
+      // chamfers, which at 90–150 m are below the reconstruction filter.
+      b.at(x, h / 2, z).cyl(rr * 1.15, rr * 0.92, h, 10, 0, false, false);
+      b.at(x, h + 0.5, z).cyl(rr * 1.5, rr * 1.4, 1.0, 10, 0, true, true);
+      b.at(x, h + 2.4, z).cyl(rr * 1.2, rr * 0.9, 2.8, 10, 0, false, false);
+      b.at(x, h + 4.6, z).cyl(rr * 0.6, 0.02, 2.0, 8, 0, false, false);
     }
     this._backdropCount = placed;
   }
@@ -1931,30 +2030,87 @@ export class LevelModule {
   /* ------------------------------------------------------------ finish -- */
 
   _finalise(engine) {
-    const stats = this.batch.stats();
+    // Merged prop kinds must land in their buckets while the batcher is still
+    // open, so the instance pool is resolved first.
+    const instMeshes = this.inst.flush(this.root, this.batch);
     const meshes = this.batch.flush(this.root);
-    const instMeshes = this.inst.flush(this.root);
 
     const collider = this.proxy.toMesh();
     engine.get('collision').build(collider);
     this.collider = collider;
 
-    let instTris = 0;
-    for (const m of instMeshes) instTris += (m.geometry.getAttribute('position').count / 3) * m.count;
+    this.stats = this._budget([...meshes, ...instMeshes]);
+    this._reportBudget();
+  }
 
-    this.stats = {
-      staticMeshes: meshes.length,
-      staticTris: stats.tris,
-      instancedMeshes: instMeshes.length,
+  /**
+   * Triangle/draw-call ledger.
+   *
+   * The only number that matters for the frame is not the scene's triangle
+   * count — it is what the renderer actually submits, which is the camera pass
+   * plus one pass per shadow cascade for everything that casts. That is what
+   * `renderer.info` reports and what the screenshot harness writes into its
+   * manifest, so it is what this models. Anything that fixes a budget by
+   * looking at the scene count alone is optimising the wrong number by 4x.
+   */
+  _budget(meshes) {
+    const cascades = Config.gfx.shadowCascades ?? 4;
+    const rows = [];
+    let tris = 0, castTris = 0, casters = 0, instTris = 0;
+    for (const m of meshes) {
+      const g = m.geometry;
+      const proto = (g.index ? g.index.count : g.getAttribute('position').count) / 3;
+      const count = m.isInstancedMesh ? m.count : 1;
+      const n = proto * count;
+      tris += n;
+      if (m.isInstancedMesh) instTris += n;
+      if (m.castShadow) { castTris += n; casters++; }
+      rows.push({ name: m.name, tris: n, proto, count, cast: !!m.castShadow });
+    }
+    rows.sort((a, b) => b.tris - a.tris);
+    return {
+      cascades,
+      rows,
+      meshes: meshes.length,
+      tris: Math.round(tris),
+      instancedMeshes: meshes.filter((m) => m.isInstancedMesh).length,
       instancedTris: Math.round(instTris),
+      casters,
+      castTris: Math.round(castTris),
+      submittedTris: Math.round(tris + castTris * cascades),
+      submittedDraws: meshes.length + casters * cascades,
       collisionTris: this.proxy.triangleCount,
       fixtures: this._lights.length,
     };
-    console.info('[Level] Suq al-Hadid —',
-      `${this.stats.staticMeshes} static meshes / ${(this.stats.staticTris / 1000).toFixed(0)}k tris,`,
-      `${this.stats.instancedMeshes} instanced kinds / ${(this.stats.instancedTris / 1000).toFixed(0)}k tris,`,
-      `collision ${this.stats.collisionTris} tris,`,
-      `${this.stats.fixtures} fixtures`);
+  }
+
+  /**
+   * Ranked ledger, printed once at boot. This exists because round 2 shipped a
+   * 40% triangle regression that nobody could locate: the harness reports one
+   * aggregate number, and an aggregate number cannot tell you that 42k of it
+   * is sandbags or that 63k of it is bevels on window trim. Ranked, per mesh,
+   * with the cast flag and the pass multiplier spelled out, it can.
+   */
+  _reportBudget() {
+    const s = this.stats;
+    const pad = (v, n) => String(v).padStart(n);
+    const lines = [
+      `[Level] Suq al-Hadid budget — ${s.meshes} meshes / ${(s.tris / 1000).toFixed(0)}k tris`,
+      `        ${s.casters} of them cast, carrying ${(s.castTris / 1000).toFixed(0)}k tris`,
+      `        submitted at ${s.cascades} cascades: `
+        + `${(s.submittedTris / 1000).toFixed(0)}k tris / ${s.submittedDraws} draws`,
+      `        collision proxy ${s.collisionTris} tris, ${s.fixtures} fixtures`,
+      '        ---- top 20 by submitted triangles ----',
+    ];
+    const ranked = s.rows.slice().sort(
+      (a, b) => (b.tris * (b.cast ? 1 + s.cascades : 1)) - (a.tris * (a.cast ? 1 + s.cascades : 1)),
+    );
+    for (const r of ranked.slice(0, 20)) {
+      const mult = r.cast ? 1 + s.cascades : 1;
+      lines.push(`        ${pad(Math.round(r.tris * mult), 8)}  ${r.cast ? 'cast' : '    '}  `
+        + `${pad(Math.round(r.tris), 7)}${r.count > 1 ? ` x${r.count}` : ''}  ${r.name}`);
+    }
+    console.info(lines.join('\n'));
   }
 
   update(dt) {

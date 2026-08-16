@@ -51,6 +51,13 @@ import {
 const S_RECV = 0, S_RAIL = 1, S_BARREL = 2, S_POLY = 3, S_RUBBER = 4, S_GLASS = 5, S_LENS = 6;
 
 /**
+ * Metres per texture tile for the merged body's shared UV projection. Every
+ * material slot is baked against this and tiled back to its own feature size
+ * with `repeat` — see the note in `weaponMaterials`.
+ */
+const BODY_TILE = 0.35;
+
+/**
  * Angular radius of the reticle quad, in radians, per optic family. The module
  * scales the plane by this times its collimated distance, so the pattern holds
  * a constant subtended angle wherever the geometry puts it. See `makeReticle`
@@ -63,6 +70,29 @@ const RETICLE_ANGLE = { reddot: 7.1e-3, reflex: 1.18e-2, scope: 3.0e-2 };
 
 /** Core radius as a fraction of the quad, per family. */
 const RETICLE_CORE = { reddot: 0.25, reflex: 0.13, scope: 0.085 };
+
+/**
+ * Material overrides forced onto every metal slot on the weapon, whatever
+ * recipe the library ends up publishing for it.
+ *
+ * **The receiver must never carry a metalness map.** The recipe is right that
+ * holster wear polishes phosphate back to bare conductor on the arrises, and at
+ * full bake resolution that is a few per cent of the part. But a viewmodel is
+ * the one surface in the game that is *magnified* — 300 mm of receiver across
+ * 250 px means the eye reads individual texels of the wear mask — and the mask
+ * is derived from curvature, which is meaningless until the height field is
+ * resolved. Every intermediate resolution therefore paints large patches of
+ * metalness 1, and metalness 1 under a sky environment is a mirror: the
+ * blue-black blocks the review read as digital camouflage are literally
+ * sky-coloured conductor blocks in the ARM map's blue channel.
+ *
+ * Parkerising is a dielectric conversion coating. Making the receiver a
+ * dielectric everywhere is both the physically correct answer and the only one
+ * that cannot degrade into camouflage: the polished arrises still read, because
+ * roughness — which survives low resolution as a smooth field rather than a
+ * thresholded one — still drops to a hard gloss on them.
+ */
+const DIELECTRIC = { metalnessMap: null, metalness: 0.0 };
 
 /**
  * Ask the materials library for a preset by name; if it has not published one
@@ -98,36 +128,56 @@ export function weaponMaterials() {
 
   // Receiver: manganese phosphate over forged aluminium. Matte dielectric,
   // ~0.05 albedo, wear only on the arrises. This is the reference surface, and
-  // `gunmetal` already is exactly this recipe — no shim needed.
+  // `gunmetal` already is exactly this recipe. The only override is
+  // `DIELECTRIC` — see the note on that constant; it is a viewmodel policy, not
+  // a fallback shim, so it rides in `opts.material` where it survives the
+  // library publishing a real `receiver_phosphate` preset later.
   const receiver = preset('receiver_phosphate', 'gunmetal', {
     seed: 91, size, detailStrength: 0.42,
+    envMapIntensity: 1.05,
+    material: Object.assign({ roughness: 1.0 }, DIELECTRIC),
   });
 
   // Rail, handguard and optic housings: type-III hard anodising. Darker than
   // the receiver and markedly rougher — anodising is a ceramic oxide, not a
   // coating, and it scatters rather than reflecting. Finer grain too, because
   // these are small extruded sections rather than a forging.
+  //
+  // `repeat` is not decoration. `worldScale` is the frequency the recipe BAKES
+  // at, and the contract in TextureFactory is that a UV-mapped caller sets its
+  // UV scale to match. The Kit projects the whole weapon at one scale
+  // (1/BODY_TILE) because the parts share a merged buffer and a single UV
+  // channel, so the only way to give a slot its own metres-per-tile is to tile
+  // its texture. Without this the anodised grain was baked for a 0.20 m tile
+  // and then stretched across a 0.35 m one — 1.75x too coarse, on the part that
+  // sits nearest the eye in ADS.
   const rail = preset('rail_anodised', 'gunmetal', {
     seed: 137, size: half, detailStrength: 0.58,
   }, {
     worldScale: 0.20,
+    repeat: BODY_TILE / 0.20,
     envMapIntensity: 0.70,
-    material: { color: new THREE.Color(0.62, 0.63, 0.66), roughness: 1.22, metalnessMap: null, metalness: 0.08 },
+    material: Object.assign({ color: new THREE.Color(0.62, 0.63, 0.66), roughness: 1.22 }, DIELECTRIC),
   });
 
   // Barrel, gas block and muzzle device: nitrided steel. Near-black, and the
   // only part of the gun with a genuinely hard specular — a barrel carries a
   // moving highlight down its length that nothing else on the weapon does.
+  // Nitriding IS a conductor surface, so this one keeps its metalness — but as
+  // a uniform scalar, never a thresholded map.
   const barrel = preset('barrel_nitride', 'gunmetal', {
     seed: 211, size: half, detailStrength: 0.26,
   }, {
     worldScale: 0.26,
+    repeat: BODY_TILE / 0.26,
     envMapIntensity: 1.75,
     material: { color: new THREE.Color(0.80, 0.82, 0.87), roughness: 0.46, metalnessMap: null, metalness: 0.62 },
   });
 
+  // Polymer already bakes at BODY_TILE, so it needs no tiling correction.
+  // Rubber bakes at 0.5 m and gets one for the same reason the rail does.
   const poly = preset('furniture_polymer', 'polymer', { seed: 43, size: half });
-  const rubber = preset('grip_rubber', 'rubber', { seed: 12, size: 256 });
+  const rubber = preset('grip_rubber', 'rubber', { seed: 12, size: 256, repeat: BODY_TILE / 0.5 });
 
   // Optic glass: an AR-coated lens reads as a dark surface with a green-magenta
   // bloom, never as a grey pane. No transmission — just a low-opacity
@@ -159,20 +209,26 @@ function detailLevel() {
 /**
  * Radial segment counts, by detail tier and by how large the part is on screen.
  *
- * A viewmodel barrel is 200 px of screen at hip and fills a third of the frame
- * when aimed. Twelve segments there is a 30-degree facet: a visible flat, a
- * visible arris, and a specular that snaps from one facet to the next as the
- * weapon sways. These numbers are the smallest that stop the silhouette
- * reading as a prism, not an arbitrary bump — the whole weapon at tier 2 is
- * still well under 40k triangles.
+ * A viewmodel barrel is 200 px of screen at hip and the optic bell is the
+ * largest single shape in the frame when aimed. The rule used here is that a
+ * facet must subtend less than about a pixel and a half of *chord sag* at the
+ * distance the part is actually seen from. For a cylinder of radius r at
+ * distance d, an n-gon's sag is r(1 - cos(pi/n)); with the bell at r = 19 mm
+ * and d = 200 mm, 36 segments leaves 0.7 mm of sag — three pixels — and the
+ * silhouette reads as a polygon against the sky. 56 brings it under a pixel.
+ * The barrel and handguard step up with it because they are seen at 300 mm.
+ *
+ * These are the smallest counts that stop the silhouette reading as a prism,
+ * not an arbitrary bump — the whole weapon at tier 2 is still under 30k
+ * triangles, and the merge means the extra geometry costs no extra draw calls.
  */
 const SEG = {
   //         LOW  MED  HIGH
-  barrel:   [10,  18,  28],
-  hguard:   [ 8,  14,  20],
-  optic:    [12,  22,  36],
-  small:    [ 8,  12,  18],
-  tiny:     [ 6,  10,  14],
+  barrel:   [12,  24,  40],
+  hguard:   [10,  18,  28],
+  optic:    [16,  32,  56],
+  small:    [ 8,  14,  22],
+  tiny:     [ 6,  10,  16],
 };
 function seg(kind, D) { return SEG[kind][D]; }
 
@@ -533,49 +589,94 @@ function pistolGrip(kit, M, D, anchor) {
 
 /* ----------------------------------------------------------------- stock */
 
-/** Stock: carbine (adjustable), folding (wire) or precision (chassis). */
+/**
+ * Stock: carbine (adjustable), folding (wire) or precision (chassis).
+ *
+ * **The rear third of the stock is not in the viewmodel.** A buttstock is a
+ * shoulder interface; it exists behind the shooter's eye, and a first-person
+ * camera sits roughly where the shooter's eye is. Modelling it at full length
+ * and then framing the weapon so it fits means either the butt pad is a
+ * hand's width from the lens — where it is the nearest, largest, flattest
+ * object in the frame, exactly the "large untextured block on the right" the
+ * review recorded — or the whole weapon has to be pushed so far forward that
+ * the gun reads as a toy held at arm's length.
+ *
+ * Every shipped first-person weapon resolves this the same way: the stock is
+ * foreshortened. `VM_STOCK` compresses everything behind the receiver toward
+ * the receiver, so the shape still reads as a stocked rifle in the lower-right
+ * of the frame, the butt pad and its detail still exist to catch the light,
+ * and the mass that used to sit 300 mm from the eye is gone. The world-model
+ * silhouette is unaffected because there is no world model — this geometry is
+ * only ever seen from here.
+ */
+const VM_STOCK = 0.55;
+
 function stockAssembly(kit, M, D, backZ) {
   const kind = M.stock;
   const tubeR = 0.0155;
-  const tubeLen = kind === 'folding' ? 0.055 : 0.155;
+  // `z(d)` places something `d` metres behind the receiver in real-gun terms
+  // and returns where it belongs in the foreshortened viewmodel.
+  const z = (d) => backZ + d * VM_STOCK;
+  const len = (d) => d * VM_STOCK;
+  const tubeLen = len(kind === 'folding' ? 0.055 : 0.155);
 
   kit.add(cyl(tubeR, tubeR, tubeLen, seg('small', D)), S_RECV, { pos: [0, -0.004, backZ] });
   if (D >= 1) {
     for (let i = 0; i < 6; i++) {              // length-of-pull notches
       kit.add(chamferBox(0.008, 0.0035, 0.0060, 0.0006), S_RECV,
-        { pos: [0, -0.004 - tubeR + 0.0015, backZ + 0.030 + i * 0.020] });
+        { pos: [0, -0.004 - tubeR + 0.0015, z(0.030 + i * 0.020)] });
     }
+    // Castle nut and receiver end plate — the joint the eye looks for where a
+    // buffer tube leaves a receiver, and the thing that stops the tube reading
+    // as a length of pipe glued on.
+    kit.add(cyl(0.0182, 0.0182, 0.0055, seg('small', D)), S_RECV, { pos: [0, -0.004, backZ + 0.0005] });
+    kit.add(chamferBox(0.036, 0.040, 0.0030, 0.0008), S_RECV, { pos: [0, -0.004, backZ - 0.0010] });
+    if (D >= 2) kit.addParts(knurl(12, 0.0176, 0.0050), S_RECV, { pos: [0, -0.004, backZ + 0.0005] });
   }
 
   if (kind === 'folding') {
-    kit.mirrored((k) => k.add(chamferBox(0.005, 0.006, 0.090, 0.0010), S_RECV,
-      { pos: [0.016, -0.006, backZ + 0.070], rot: [0, 0.10, 0] }));
-    kit.add(chamferBox(0.046, 0.030, 0.008, 0.0014), S_RUBBER, { pos: [0, -0.008, backZ + 0.116] });
-    return { buttZ: backZ + 0.120, cheekY: 0.010 };
+    kit.mirrored((k) => k.add(chamferBox(0.005, 0.006, len(0.090), 0.0010), S_RECV,
+      { pos: [0.016, -0.006, z(0.070)], rot: [0, 0.10, 0] }));
+    kit.add(chamferBox(0.046, 0.030, 0.008, 0.0014), S_RUBBER, { pos: [0, -0.008, z(0.116)] });
+    return { buttZ: z(0.120), cheekY: 0.010 };
   }
 
   if (kind === 'precision') {
-    kit.add(chamferBox(0.034, 0.052, 0.150, 0.0022), S_POLY, { pos: [0, -0.006, backZ + 0.082] });
-    kit.add(chamferBox(0.040, 0.014, 0.086, 0.0016), S_POLY, { pos: [0, 0.026, backZ + 0.070] });      // cheek riser
-    kit.mirrored((k) => k.add(chamferBox(0.006, 0.014, 0.030, 0.0008), S_RECV, { pos: [0.014, 0.014, backZ + 0.070] }));
-    kit.add(chamferBox(0.020, 0.026, 0.060, 0.0014), S_POLY, { pos: [0, -0.036, backZ + 0.058], rot: [0.12, 0, 0] }); // toe hook
-    kit.add(chamferBox(0.046, 0.062, 0.012, 0.0018), S_RUBBER, { pos: [0, -0.004, backZ + 0.160] });
-    kit.add(new THREE.TorusGeometry(0.0060, 0.0016, 8, 18), S_RECV, { pos: [0, -0.032, backZ + 0.140], rot: [0, Math.PI / 2, 0] });
-    return { buttZ: backZ + 0.166, cheekY: 0.033 };
+    kit.add(chamferBox(0.034, 0.052, len(0.150), 0.0022), S_POLY, { pos: [0, -0.006, z(0.082)] });
+    kit.add(chamferBox(0.040, 0.014, len(0.086), 0.0016), S_POLY, { pos: [0, 0.026, z(0.070)] });      // cheek riser
+    kit.mirrored((k) => k.add(chamferBox(0.006, 0.014, len(0.030), 0.0008), S_RECV, { pos: [0.014, 0.014, z(0.070)] }));
+    kit.add(chamferBox(0.020, 0.026, len(0.060), 0.0014), S_POLY, { pos: [0, -0.036, z(0.058)], rot: [0.12, 0, 0] }); // toe hook
+    kit.add(chamferBox(0.046, 0.062, 0.012, 0.0018), S_RUBBER, { pos: [0, -0.004, z(0.160)] });
+    kit.add(new THREE.TorusGeometry(0.0060, 0.0016, 8, 18), S_RECV, { pos: [0, -0.032, z(0.140)], rot: [0, Math.PI / 2, 0] });
+    return { buttZ: z(0.166), cheekY: 0.033 };
   }
 
   // Carbine: slim body clamped on the tube, cheek weld on top, rubber pad.
   kit.add(loft(octagon(0.042, 0.048, 0.0022), [
-    { z: backZ + 0.030, scale: 0.72, scaleY: 0.80 },
-    { z: backZ + 0.046, scale: 0.90, scaleY: 0.92 },
-    { z: backZ + 0.110, scale: 1.00, scaleY: 1.00 },
-    { z: backZ + 0.132, scale: 1.00, scaleY: 1.06 },
-    { z: backZ + 0.138, scale: 0.92, scaleY: 1.00 },
+    { z: z(0.030), scale: 0.72, scaleY: 0.80 },
+    { z: z(0.046), scale: 0.90, scaleY: 0.92 },
+    { z: z(0.110), scale: 1.00, scaleY: 1.00 },
+    { z: z(0.132), scale: 1.00, scaleY: 1.06 },
+    { z: z(0.138), scale: 0.92, scaleY: 1.00 },
   ]), S_POLY, { pos: [0, -0.006, 0] });
-  kit.add(chamferBox(0.044, 0.052, 0.014, 0.0016), S_RUBBER, { pos: [0, -0.008, backZ + 0.145] });
-  kit.add(chamferBox(0.012, 0.020, 0.030, 0.0010), S_POLY, { pos: [0, -0.036, backZ + 0.060], rot: [-0.25, 0, 0] });
-  kit.mirrored((k) => k.add(chamferBox(0.004, 0.016, 0.016, 0.0008), S_POLY, { pos: [0.022, -0.010, backZ + 0.106] }));
-  return { buttZ: backZ + 0.152, cheekY: 0.020 };
+  kit.add(chamferBox(0.044, 0.052, 0.014, 0.0016), S_RUBBER, { pos: [0, -0.008, z(0.145)] });
+  kit.add(chamferBox(0.012, 0.020, len(0.030), 0.0010), S_POLY, { pos: [0, -0.036, z(0.060)], rot: [-0.25, 0, 0] });
+  kit.mirrored((k) => k.add(chamferBox(0.004, 0.016, len(0.016), 0.0008), S_POLY, { pos: [0.022, -0.010, z(0.106)] }));
+
+  if (D >= 1) {
+    // The flat left flank of a carbine stock is the largest unbroken plane on
+    // the weapon and it faces the camera at hip. Give it the two things a real
+    // one has: the adjustment-lever slot down its underside and a sling loop
+    // through the heel. Without them it photographs as a slab.
+    kit.mirrored((k) => k.addParts(recessPanel(0.010, len(0.058), 0.0022, { lip: 0.0014 }), S_POLY, {
+      m: new THREE.Matrix4().makeTranslation(0.0212, -0.006, z(0.092))
+        .multiply(new THREE.Matrix4().makeRotationZ(-Math.PI / 2)),
+    }));
+    kit.add(chamferBox(0.020, 0.012, len(0.044), 0.0010), S_POLY, { pos: [0, -0.030, z(0.086)] });   // release lever
+    kit.mirrored((k) => k.add(chamferBox(0.0035, 0.014, 0.010, 0.0008), S_POLY, { pos: [0.019, -0.018, z(0.128)] }));
+    kit.add(new THREE.TorusGeometry(0.0055, 0.0018, 6, 14), S_RECV, { pos: [0, -0.028, z(0.126)], rot: [0, Math.PI / 2, 0] });
+  }
+  return { buttZ: z(0.152), cheekY: 0.020 };
 }
 
 /* ------------------------------------------------------------- magazine */
@@ -627,12 +728,43 @@ function magazineMesh(M, mats, D) {
  * optical-axis reference come back out so the module can collimate the reticle
  * and derive the ADS pose.
  *
- * `eyeRelief` is not the manufacturer's figure. A 30 mm tube held at a real
- * 60 mm subtends 39 degrees against a 55-degree viewmodel FOV and swallows two
- * thirds of the screen; every shooter pushes the optic out until the housing
- * takes about a third of the frame height and the target stays visible around
- * it. These numbers are that distance, solved for each optic's own diameter.
+ * `eyeRelief` is not the manufacturer's figure and it is not a cheek weld. It
+ * is the distance that sets the optic's APPARENT SIZE, and it is solved
+ * backwards from a target: the housing's outside diameter should subtend about
+ * a fifth of the frame height, which is where a shipped red dot sits and where
+ * enough of the world stays visible around the tube to fight with it.
+ *
+ *   subtend = 2 * rHousing / relief,  frame height = 2 * tan(fov/2)
+ *   relief  = rHousing / ( FRAME_FRAC * tan(fov/2) )
+ *
+ * The previous figures targeted a third of the frame height and, at 105 mm,
+ * put a 38 mm bell across 37% of it — the single largest object in the ADS
+ * frame, with the target hidden behind its own sight. Pushing the optic out
+ * costs nothing (the ADS pose is derived from this number, so the whole weapon
+ * simply sits further forward) and it is what the eye expects, because a
+ * shooter's own optic is never that close to the cornea either.
  */
+
+/**
+ * Fraction of the frame HEIGHT the optic housing may subtend when aimed. A
+ * scope is allowed more because the player is meant to be looking *through* it;
+ * a red dot is meant to be looked *past*.
+ */
+const OPTIC_FRAME_FRAC = { reddot: 0.22, reflex: 0.22, scope: 0.30 };
+
+/**
+ * Solve eye relief so a housing of radius `r` lands on its frame fraction.
+ * Measured against the ADS field of view, not the hip one: CameraRig narrows
+ * the viewmodel FOV by `ADS_FOV_SCALE` while aiming, and that is the frame the
+ * optic is actually judged in. Getting this wrong by that factor is a 16% error
+ * in the only number the complaint was about.
+ */
+const ADS_FOV_SCALE = 0.86;
+function eyeReliefFor(r, kind) {
+  const fov = Config.camera.viewmodelFov * ADS_FOV_SCALE;
+  const tanY = Math.tan(THREE.MathUtils.degToRad(fov) * 0.5);
+  return r / ((OPTIC_FRAME_FRAC[kind] ?? OPTIC_FRAME_FRAC.reddot) * tanY);
+}
 function opticAssembly(kit, M, D, kind, railY, zc) {
   // The optic bell is a 40 mm circle held 100 mm from the eye — it subtends
   // more of the frame than any other single part and it is the one shape the
@@ -662,7 +794,10 @@ function opticAssembly(kit, M, D, kind, railY, zc) {
     kit.add(cyl(0.0110, 0.0098, 0.014, sgS), S_RAIL, { pos: [0.014, axisY, zc - 0.010], rot: [0, -Math.PI / 2, 0] });
     kit.add(cyl(0.0195, 0.0195, 0.020, sgS), S_RAIL, { pos: [0, axisY, zR - 0.050] });
     if (D >= 1) kit.addParts(knurl(D >= 2 ? 20 : 14, 0.0198, 0.018), S_RAIL, { pos: [0, axisY, zR - 0.041] });
-    return { axisY, rearZ: zR - 0.028, frontZ: zF + 0.004, glassR: 0.0132, eyeRelief: 0.130 };
+    return {
+      axisY, rearZ: zR - 0.028, frontZ: zF + 0.004, glassR: 0.0132,
+      eyeRelief: eyeReliefFor(0.0215, 'scope'),
+    };
   }
 
   if (kind === 'reflex') {
@@ -673,7 +808,10 @@ function opticAssembly(kit, M, D, kind, railY, zc) {
     kit.add(chamferBox(0.037, 0.016, 0.020, 0.0012), S_RAIL, { pos: [0, axisY - 0.017, zc + 0.008] });
     kit.add(chamferBox(0.028, 0.010, 0.014, 0.0010), S_RAIL, { pos: [0, axisY - 0.011, zc - 0.026] });
     kit.add(chamferBox(0.030, 0.008, 0.032, 0.0010), S_RAIL, { pos: [0, axisY - 0.026, zc] });  // rail clamp
-    return { axisY, rearZ: zc + 0.020, frontZ: zc - 0.022, glassR: 0.0125, eyeRelief: 0.092, flat: true };
+    return {
+      axisY, rearZ: zc + 0.020, frontZ: zc - 0.022, glassR: 0.0125,
+      eyeRelief: eyeReliefFor(0.0175, 'reflex'), flat: true,
+    };
   }
 
   // 30 mm tube red dot with an integral mount, sun hood and turret caps.
@@ -695,7 +833,10 @@ function opticAssembly(kit, M, D, kind, railY, zc) {
   if (D >= 1) {
     kit.addParts(knurl(D >= 2 ? 18 : 12, 0.0086, 0.010), S_RAIL, { pos: [0, axisY + 0.020, zc + 0.002], rot: [-Math.PI / 2, 0, 0] });
   }
-  return { axisY, rearZ: zR - 0.004, frontZ: zF + 0.004, glassR: 0.0148, eyeRelief: 0.105 };
+  return {
+    axisY, rearZ: zR - 0.004, frontZ: zF + 0.004, glassR: 0.0148,
+    eyeRelief: eyeReliefFor(0.0192, 'reddot'),
+  };
 }
 
 /* --------------------------------------------------------------- assembly */
@@ -889,7 +1030,7 @@ export function buildWeapon(def, mats) {
   const hipPose = solveHipPose([
     { array: bodyGeo.attributes.position.array, offset: null },
     { array: mag.geometry.attributes.position.array, offset: mag.position },
-  ], muzzle.position, { rx: 0, ry: 0.26, rz: 0.045 });
+  ], muzzle.position, sightGroup.position, { rx: 0, ry: 0.26, rz: 0.045 });
 
   const anchors = {
     rightHand: grip.hand.clone(),
@@ -902,6 +1043,7 @@ export function buildWeapon(def, mats) {
     root, body, parts, muzzle, ejectPort, reticle,
     sight: {
       group: sightGroup, glassR: optic.glassR, eyeRelief: optic.eyeRelief, flat: !!optic.flat,
+      scoped: def.optic === 'scope',
       // Angular radius of the reticle quad, in radians (see RETICLE_ANGLE).
       reticleAngle: RETICLE_ANGLE[def.optic] ?? RETICLE_ANGLE.reddot,
     },
@@ -942,7 +1084,8 @@ export function buildWeapon(def, mats) {
  *
  * So the pose is solved from the weapon's own geometry against the actual
  * viewmodel frustum:
- *   1. push it out until the rearmost vertex clears the eye by `BUTT_CLEAR`;
+ *   1. push it out until the OPTIC sits `SIGHT_DIST` from the eye, never
+ *      letting the rearmost vertex come nearer than `BUTT_MIN`;
  *   2. raise it until *every* vertex clears the bottom edge;
  *   3. slide it right until the muzzle sits just inboard of centre — the bore
  *      converging toward the point of aim, which is what hip fire looks like —
@@ -962,17 +1105,28 @@ export function buildWeapon(def, mats) {
  *
  * Screen targets are in NDC, so they hold at any aspect and any FOV.
  */
-function solveHipPose(meshes, muzzleLocal, rot) {
+function solveHipPose(meshes, muzzleLocal, sightLocal, rot) {
   // These targets decide the weapon's APPARENT SIZE, not just whether it fits.
-  // Solving the silhouette out to the frame edges (the previous -1.05 / 0.99
-  // with a 17.5cm butt clearance) is a maximisation, not a framing: it put the
-  // buttstock a hand's width from the eye and let the weapon span the full
-  // diagonal. A viewmodel should read as held at the shoulder and occupy the
-  // lower-right quadrant, leaving the sightline and the upper frame clear.
-  const BUTT_CLEAR = 0.30;    // metres from the eye to the rearmost vertex
-  const BOTTOM_NDC = -0.98;   // lowest vertex, just clipped by the bottom edge
-  const RIGHT_NDC = 0.78;     // keep the silhouette clear of the right edge
-  const MUZZLE_NDC = 0.02;    // muzzle sits fractionally right of the crosshair
+  //
+  // The previous solve set depth from BUTT CLEARANCE: push the gun out until
+  // the rearmost vertex is 0.30 m from the eye. That is the wrong control
+  // variable, and it fails in a way that is invisible until you change the
+  // geometry. Apparent size is set by the distance to the part of the weapon
+  // the eye actually reads — the receiver and the optic — but butt clearance
+  // measures the distance to the part *furthest from* it. Shorten the stock and
+  // the gun gets closer and therefore BIGGER, which is the opposite of what
+  // shortening a stock is supposed to do; lengthen it and the gun shrinks even
+  // though nothing about the part the player looks at has changed.
+  //
+  // So depth is solved against the sight instead: put the optic SIGHT_DIST from
+  // the eye and everything else falls where the weapon's own proportions put
+  // it. Butt clearance survives as a *floor* (the near plane is 5 mm and
+  // geometry inside it eats the bottom of the frame), not as the target.
+  const SIGHT_DIST = 0.56;    // metres from the eye to the optical axis origin
+  const BUTT_MIN = 0.20;      // rearmost vertex may come no nearer than this
+  const BOTTOM_NDC = -1.03;   // lowest vertex, just inside the bottom edge
+  const RIGHT_NDC = 0.72;     // keep the silhouette clear of the right edge
+  const MUZZLE_NDC = 0.03;    // muzzle sits fractionally right of the crosshair
   const NEAR = 0.02;
 
   const fovY = THREE.MathUtils.degToRad(Config.camera.viewmodelFov);
@@ -995,7 +1149,8 @@ function solveHipPose(meshes, muzzleLocal, rot) {
 
   let maxZ = -Infinity;
   each((p) => { if (p.z > maxZ) maxZ = p.z; });
-  const tz = -(maxZ + BUTT_CLEAR);
+  const sightZ = sightLocal.clone().applyQuaternion(q).z;
+  const tz = Math.min(-(sightZ + SIGHT_DIST), -(maxZ + BUTT_MIN));
 
   let ty = -Infinity, txCap = Infinity;
   each((p) => {
@@ -1070,6 +1225,116 @@ function makeReticle(def, mat, D) {
   mesh.renderOrder = 12;
   mesh.userData.disposeTexture = tex;
   return mesh;
+}
+
+/* --------------------------------------------------------------- collimate */
+
+const _cG = new THREE.Vector3();
+const _cA = new THREE.Vector3();
+const _cP = new THREE.Vector3();
+const _cQ = new THREE.Quaternion();
+const _cQ2 = new THREE.Quaternion();
+
+/**
+ * Place a build's reticle where a collimator would put it, and say what it did.
+ *
+ * WHY THE LAST TWO RETICLES PHOTOGRAPHED AS CLEAR GLASS
+ *
+ * Not the size, and not the material — both were fixed last round and both are
+ * fine. It was the eyebox gate. The dot was hidden whenever the sight axis
+ * missed the rear lens centre by more than `glassR * 0.92`, with the fade
+ * starting at 55% of that — a 13.6 mm window on a 30 mm optic, which is
+ * tighter than a real one and, far more importantly, tighter than the ADS
+ * transition ever gets inside.
+ *
+ * Work it through with the numbers the capture actually runs at. The harness
+ * holds a shot for ~520 ms; under software rasterisation that is three frames,
+ * and the aim spring is still around 85% blended when the shutter opens. At
+ * 85% the sight axis is 0.04 rad off and the lens sits 0.20 m out, so the axis
+ * misses the lens centre by 21 mm — 1.5 apertures. `visible` evaluated to
+ * exactly zero, every time, in every ADS frame ever captured. The reticle was
+ * being placed correctly, scaled correctly, and then switched off.
+ *
+ * The replacement keeps the physics and drops the cliff:
+ *
+ *  - **The dot is clamped onto the aperture** rather than allowed to wander off
+ *    the glass. This is what a collimator does anyway — the dot you see is
+ *    formed by the objective, so it cannot appear outside it. While the axis is
+ *    inside the window the clamp is inactive and the dot slides across the
+ *    glass exactly as before, holding its world point; once outside, it parks
+ *    at the rim instead of vanishing mid-transition.
+ *  - **The fade is measured against the tube, not the lens.** A dot is lost
+ *    when the eye leaves the eyebox, which for a tube sight is when the axis
+ *    walks out past the housing — a couple of apertures, not 0.9 of one. At hip
+ *    fire the axis misses by 15 apertures, so the dot is still correctly gone
+ *    and the HUD crosshair is still the only hip reference.
+ *
+ * @param build     a `buildWeapon` result
+ * @param cam       the viewmodel camera the reticle is parented to
+ * @param adsBlend  0..1 aim blend, for the brightness trim only
+ * @param scope     optional ScopeOverlay
+ * @returns diagnostics — the numbers a test asserts on instead of a screenshot
+ */
+export function collimate(build, cam, adsBlend = 0, scope = null) {
+  cam.updateMatrixWorld(true);
+
+  const sight = build.sight.group;
+  const ret = build.reticle;
+  const G = _cG.setFromMatrixPosition(sight.matrixWorld);
+  cam.worldToLocal(G);
+
+  const camQi = cam.getWorldQuaternion(_cQ).invert();
+  const A = _cA.set(0, 0, -1)
+    .applyQuaternion(sight.getWorldQuaternion(_cQ2))
+    .applyQuaternion(camQi)
+    .normalize();
+
+  const t = G.dot(A);
+  if (!(t > 0.01)) {
+    ret.visible = false;
+    scope?.update(0, 0, 0);
+    return { visible: false, reason: 'behind', t, off: 0, opacity: 0, scale: 0 };
+  }
+
+  const P = _cP.copy(A).multiplyScalar(t);
+  const off = P.distanceTo(G);
+  const R = build.sight.glassR;
+
+  // Clamp onto the aperture: the objective forms the dot, so the dot cannot be
+  // outside it. `k < 1` only once the axis has already left the glass.
+  const rim = R * 0.88;
+  if (off > rim && off > 1e-6) {
+    P.sub(G).multiplyScalar(rim / off).add(G);
+  }
+
+  // Eyebox falloff, measured in apertures. Full brightness while the axis is
+  // anywhere on the glass, gone by the time it is two apertures outside.
+  const fade = 1 - THREE.MathUtils.smoothstep(off, R * 1.05, R * 2.6);
+  const scale = t * (build.sight.reticleAngle || 5.8e-4);
+
+  ret.position.copy(P);
+  ret.quaternion.identity();
+  ret.scale.setScalar(scale);
+
+  // Bright while aiming; trimmed a little at the hip so a dot parked at the rim
+  // of the glass never competes with the HUD crosshair.
+  let opacity = fade * (0.78 + 0.22 * adsBlend);
+
+  if (scope) {
+    const scoped = build.sight.scoped;
+    const k = R > 0 ? 1 / R : 0;
+    scope.update(scoped ? Math.pow(adsBlend, 1.6) : 0,
+      (P.x - G.x) * k * 0.42, (P.y - G.y) * k * 0.42);
+    // The etched overlay reticle replaces the 3D one once the eye is in.
+    if (scoped) opacity *= 1 - Math.pow(adsBlend, 3);
+  }
+
+  ret.material.opacity = opacity;
+  ret.visible = opacity > 0.01;
+  return {
+    visible: ret.visible, reason: 'ok', t, off, offApertures: off / R,
+    opacity, scale, pos: P.toArray(),
+  };
 }
 
 /**

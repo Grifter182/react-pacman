@@ -49,25 +49,35 @@ export function protoCrate(size = 0.62) {
 export function protoBarrel() {
   return build((b) => {
     const r = 0.29, h = 0.88;
-    b.at(0, h / 2, 0).cyl(r, r, h, 16, 0.02);
+    // 14 sides on a 580 mm drum is a 130 mm facet: still round at the 1 m a
+    // player vaults one at, and 32 triangles cheaper across 75 placements.
+    b.at(0, h / 2, 0).cyl(r, r, h, 14, 0.02);
     // Rolling hoops. Unchamfered on purpose: at 55 mm tall the bevel is below
     // a pixel at any range, and `cyl` now emits one band instead of three.
     for (const y of [h * 0.28, h * 0.5, h * 0.72]) {
-      b.at(0, y, 0).cyl(r + 0.022, r + 0.022, 0.055, 14, 0, false, false);
+      b.at(0, y, 0).cyl(r + 0.022, r + 0.022, 0.055, 10, 0, false, false);
     }
-    b.at(0, h - 0.012, 0).cyl(r - 0.02, r - 0.02, 0.05, 16, 0.012);
-    b.at(0.13, h + 0.012, 0.05).cyl(0.045, 0.045, 0.05, 8, 0.008);
+    b.at(0, h - 0.012, 0).cyl(r - 0.02, r - 0.02, 0.05, 12, 0);
+    b.at(0.13, h + 0.012, 0.05).cyl(0.045, 0.045, 0.05, 6, 0);
   }, 0.8);
 }
 
-/** Sandbag: an ellipsoid-ish lozenge, deliberately lumpy. */
-function sandbagLump(b, x, y, z, ry, len = 0.46, wid = 0.26, hgt = 0.17, seed = 1) {
+/**
+ * Sandbag: an ellipsoid-ish lozenge, deliberately lumpy.
+ *
+ * `double` adds the second, offset slab that makes the bag read as slumped
+ * rather than as a brick. It doubles the bag's cost, so it is spent where it
+ * changes the *outline* of the revetment — the top course, the two ends of
+ * every course, and a scattered third of the rest — and skipped in the middle
+ * of the stack, where the bag either side hides it completely. Measured: a
+ * 7-course section went 2,464 -> 1,232 triangles with no change to any
+ * silhouette, across 22 instanced walls.
+ */
+function sandbagLump(b, x, y, z, ry, len = 0.46, wid = 0.26, hgt = 0.17, seed = 1, double = true) {
   const r = rng(seed);
-  // Two overlapping chamfered slabs of slightly different size and yaw read as
-  // a slumped bag; a third adds nothing a revetment wall of ninety bags can
-  // show, and the wall is instanced twenty times.
   b.at(x, y, z, ry);
   b.box(len, hgt, wid, hgt * 0.45);
+  if (!double) return;
   b.at(x + (r() - 0.5) * 0.06, y + hgt * 0.14, z, ry + (r() - 0.5) * 0.28);
   b.box(len * 0.84, hgt * 0.82, wid * 0.94, hgt * 0.4);
 }
@@ -88,8 +98,12 @@ export function protoSandbagWall(courses = 6, length = 2.0, seed = 3) {
       for (let i = 0; i < per; i++) {
         const x = -length / 2 + bagL * (i + 0.5) + stagger - bagL * 0.25;
         if (Math.abs(x) > length / 2) continue;
+        // Silhouette bags: the crest, both ends of every course, and a third
+        // of the interior for irregularity.
+        const onEdge = c === courses - 1 || i === 0 || i === per - 1;
         sandbagLump(b, x, y, (r() - 0.5) * 0.04 + inset * 0.3,
-          (r() - 0.5) * 0.13, bagL - inset, 0.26 - inset * 0.5, bagH, seed + c * 7 + i);
+          (r() - 0.5) * 0.13, bagL - inset, 0.26 - inset * 0.5, bagH, seed + c * 7 + i,
+          onEdge || ((c * 3 + i) % 3 === 0));
       }
     }
   }, 0.7);
@@ -130,7 +144,7 @@ export function protoPallet() {
 /** Truck tyre. */
 export function protoTyre() {
   return build((b) => {
-    const R = 0.42, r = 0.14, seg = 16;
+    const R = 0.42, r = 0.14, seg = 12;
     for (let i = 0; i < seg; i++) {
       const a0 = (i / seg) * Math.PI * 2, a1 = ((i + 1) / seg) * Math.PI * 2;
       const c0 = Math.cos(a0), s0 = Math.sin(a0), c1 = Math.cos(a1), s1 = Math.sin(a1);
@@ -150,21 +164,27 @@ export function protoTyre() {
   }, 0.5);
 }
 
-/** Rooftop air-conditioning unit with a fan cowl and a grille. */
+/**
+ * Rooftop air-conditioning unit with a fan cowl and a grille.
+ *
+ * 83 of these sit on the skyline, so the section count is set by what survives
+ * at 30 m and not by what looks right in isolation: the body keeps its chamfer
+ * (that edge is the unit's whole read against the sky), the cowl drops from a
+ * 12-sided chamfered drum to an 8-sided plain one, and the fan and louvre
+ * counts fall to the point where the *pattern* still reads. 316 -> 192.
+ */
 export function protoAcUnit() {
   return build((b) => {
     b.at(0, 0.34, 0).box(0.92, 0.68, 0.72, 0.03);
     b.at(0, 0.70, 0).box(0.98, 0.06, 0.78, 0.02);
-    b.at(0, 0.76, 0).cyl(0.27, 0.27, 0.10, 12, 0.02);
+    b.at(0, 0.76, 0).cyl(0.27, 0.27, 0.10, 8, 0);
+    for (let i = 0; i < 3; i++) {
+      b.at(0, 0.80, 0, (i / 3) * Math.PI).box(0.46, 0.014, 0.07, 0.005);
+    }
     for (let i = 0; i < 4; i++) {
-      b.at(0, 0.80, 0, (i / 4) * Math.PI).box(0.46, 0.014, 0.07, 0.005);
+      b.at(-0.46 - 0.005, 0.18 + i * 0.125, 0).box(0.02, 0.06, 0.6, 0.006);
     }
-    for (let i = 0; i < 6; i++) {
-      b.at(-0.46 - 0.005, 0.16 + i * 0.09, 0).box(0.02, 0.045, 0.6, 0.006);
-    }
-    for (const s of [-1, 1]) {
-      for (const t of [-1, 1]) b.at(s * 0.38, 0.03, t * 0.28).box(0.1, 0.06, 0.1, 0.012);
-    }
+    for (const s of [-1, 1]) b.at(s * 0.38, 0.03, 0).box(0.1, 0.06, 0.62, 0.012);
   }, 0.9);
 }
 
@@ -221,8 +241,11 @@ export function protoBollard() {
 /** Plastic water tank on a stand — a rooftop silhouette staple. */
 export function protoWaterTank() {
   return build((b) => {
-    b.at(0, 0.86, 0).cyl(0.56, 0.52, 1.10, 14, 0.05);
-    b.at(0, 1.43, 0).cyl(0.20, 0.20, 0.08, 10, 0.02);
+    // The drum keeps its rim chamfer — 105 of these are on roofs and that
+    // rounded top edge is what separates a water tank from a bollard at range
+    // — but loses four sides, and the outlet collar becomes a plain hexagon.
+    b.at(0, 0.86, 0).cyl(0.56, 0.52, 1.10, 10, 0.05);
+    b.at(0, 1.43, 0).cyl(0.20, 0.20, 0.08, 6, 0);
     for (let i = 0; i < 4; i++) {
       const a = (i / 4) * Math.PI * 2 + 0.4;
       b.at(Math.cos(a) * 0.46, 0.16, Math.sin(a) * 0.46).box(0.08, 0.32, 0.08, 0.015);
@@ -235,7 +258,9 @@ export function protoWaterTank() {
 export function protoDish() {
   return build((b) => {
     b.at(0, 0.28, 0).box(0.26, 0.56, 0.26, 0.02);
-    b.at(0, 0.72, 0, 0, -0.5).cyl(0.44, 0.40, 0.09, 14, 0.03);
+    // A 90 mm deep drum has no rim to chamfer at any range this is seen from;
+    // the tilt is the whole silhouette. 176 -> 104, times 97 placements.
+    b.at(0, 0.72, 0, 0, -0.5).cyl(0.44, 0.40, 0.09, 10, 0);
     b.at(0, 0.86, 0.16).box(0.05, 0.05, 0.34, 0.01);
     b.at(0, 0.92, 0.32).box(0.09, 0.09, 0.12, 0.02);
   }, 0.7);
@@ -296,12 +321,15 @@ export function placeStall(kit, o) {
   // Goods on the counter: sacks and stacked produce boxes.
   const g = batch.at(o.goodsBucket || 'sack', o.x, o.z);
   g.frame(frame);
-  for (let i = 0; i < 5; i++) {
-    const x = -w / 2 + 0.3 + (w - 0.6) * (i / 4);
+  // Four sacks on the counter rather than five: they overlap at 0.34 m across
+  // a 2.0 m counter, so the fifth was hidden by the fourth from every angle a
+  // player can stand at.
+  for (let i = 0; i < 4; i++) {
+    const x = -w / 2 + 0.3 + (w - 0.6) * (i / 3);
     g.at(x + (r() - 0.5) * 0.1, 1.06, d / 2 - 0.34 + (r() - 0.5) * 0.2, r() * 3.14)
       .box(0.34, 0.24, 0.3, 0.09);
   }
-  for (let i = 0; i < 3; i++) {
+  for (let i = 0; i < 2; i++) {
     g.at(-w / 2 + 0.4 + r() * (w - 0.8), 0.17 + r() * 0.3, -d / 2 + 0.4 + r() * 0.5, r() * 3.14)
       .box(0.4, 0.32, 0.36, 0.11);
   }
@@ -389,9 +417,9 @@ export function placeVehicle(kit, o) {
     for (const sx of [-1, 1]) {
       const wy = o.flat && sz < 0 ? tyreR * 0.68 : tyreR;
       tyreB.at(sx * (W / 2 - 0.11), wy, sz * wb / 2, 0, 0, Math.PI / 2)
-        .cyl(tyreR, tyreR, 0.24, 14, 0.06);
+        .cyl(tyreR, tyreR, 0.24, 10, 0.06);
       trimB.at(sx * (W / 2 - 0.09), wy, sz * wb / 2, 0, 0, Math.PI / 2)
-        .cyl(tyreR * 0.55, tyreR * 0.55, 0.26, 10, 0.03);
+        .cyl(tyreR * 0.55, tyreR * 0.55, 0.26, 8, 0);
     }
   }
 
@@ -429,11 +457,27 @@ export function placeHangingRug(kit, o) {
     p[2] += Math.sin(u * 6.0 + phase) * 0.055 * (0.2 + v);
     p[0] += Math.sin(u * 3.0 + phase) * 0.02 * v;
   };
-  c.quad([-w / 2, top, 0], [w / 2, top, 0], [w / 2, top - h, 0], [-w / 2, top - h, 0], 0.22, warp);
-  // Fringe.
-  for (let i = 0; i < 10; i++) {
-    const x = -w / 2 + w * ((i + 0.5) / 10);
-    c.at(x, top - h - 0.045, 0).box(w / 14, 0.09, 0.012, 0.004);
+  // Anisotropic, for the same reason the wall kit is: the warp is three sine
+  // periods across the *width* and dead linear down the drop, so the cloth
+  // needs eight columns and three rows, not eight columns and ten rows.
+  c.quad([-w / 2, top, 0], [w / 2, top, 0], [w / 2, top - h, 0], [-w / 2, top - h, 0],
+    [0.19, 0.7], warp);
+  // Fringe. This was ten 12-triangle boxes — 120 triangles of solid per rug,
+  // more than the rug itself, on tassels 12 mm thick. Across the 97 hangings
+  // and awnings on the map that was 11.6k triangles for something that is
+  // *only* a broken hem: nothing about it is ever seen in section. A saw-tooth
+  // strip off the hem, in the same plane and carrying the same warp, is one
+  // triangle per tassel and reads as a deeper, more irregular fringe than the
+  // even comb of rectangles it replaces.
+  const teeth = 11;
+  for (let i = 0; i < teeth; i++) {
+    const x0 = -w / 2 + w * (i / teeth), x1 = -w / 2 + w * ((i + 1) / teeth);
+    const p = [0, 0, 0];
+    warp(0.5 + (x0 + x1) / (2 * w), 1, p);
+    const z = p[2], dx = p[0];
+    const drop = 0.075 + ((i * 7) % 5) * 0.014;
+    c.poly([x0 + dx, top - h, z, x1 + dx, top - h, z,
+      (x0 + x1) / 2 + dx, top - h - drop, z], [(x0 + x1) / 2 + dx, top - h, z + 1]);
   }
   c.clearFrame();
 }
@@ -442,11 +486,14 @@ export function placeHangingRug(kit, o) {
  * Overhead cable run between two anchors, hanging in a real catenary.
  * `sag` is the drop at mid-span in metres.
  */
-export function placeCable(kit, a, bPt, sag = 0.5, radius = 0.018, bucket = 'ironwork') {
+export function placeCable(kit, a, bPt, sag = 0.5, radius = 0.018, bucket = 'ironThin') {
   const { batch } = kit;
   const g = batch.at(bucket, (a[0] + bPt[0]) / 2, (a[2] + bPt[2]) / 2);
   g.identity();
-  const N = 10;
+  // Six spans, not ten. A catenary over a 12 m street drops ~0.5 m; six
+  // chords track that to under 15 mm, which is the cable's own diameter, and
+  // the run costs 48 triangles instead of 80. There are 184 of these.
+  const N = 6;
   const pts = [];
   for (let i = 0; i <= N; i++) {
     const t = i / N;

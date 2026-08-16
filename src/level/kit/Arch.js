@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { groundGrime, clamp01, lerp } from './Geo.js';
+import { groundGrime, clamp01, lerp, FACE_TOP, FACE_SIDES } from './Geo.js';
 
 /**
  * OWNER: level-art agent.
@@ -141,7 +141,7 @@ export function wall(kit, o) {
 
   b.withWeather(weather, () => {
     if (!openings.length) {
-      b.at(0, H / 2, 0).box(L, H, T, chamfer, gridA);
+      b.at(0, H / 2, 0).box(L, H, T, chamfer, gridA, FACE_SIDES);
     } else {
       // Sort openings and walk the run: pier, opening (with lintel above and
       // apron below), pier, ... The pier side faces double as the reveals.
@@ -153,17 +153,17 @@ export function wall(kit, o) {
         const head = sill + k.h;
         if (l - cursor > 0.02) {
           const w = l - cursor;
-          b.at(cursor + w / 2, H / 2, 0).box(w, H, T, chamfer, gridA);
+          b.at(cursor + w / 2, H / 2, 0).box(w, H, T, chamfer, gridA, FACE_SIDES);
         }
-        if (sill > 0.02) b.at(k.x, sill / 2, 0).box(k.w, sill, T, chamfer, gridA);
+        if (sill > 0.02) b.at(k.x, sill / 2, 0).box(k.w, sill, T, chamfer, gridA, FACE_SIDES);
         if (H - head > 0.02) {
-          b.at(k.x, (head + H) / 2, 0).box(k.w, H - head, T, chamfer, gridA);
+          b.at(k.x, (head + H) / 2, 0).box(k.w, H - head, T, chamfer, gridA, FACE_SIDES);
         }
         cursor = r;
       }
       if (L / 2 - cursor > 0.02) {
         const w = L / 2 - cursor;
-        b.at(cursor + w / 2, H / 2, 0).box(w, H, T, chamfer, gridA);
+        b.at(cursor + w / 2, H / 2, 0).box(w, H, T, chamfer, gridA, FACE_SIDES);
       }
     }
   });
@@ -195,41 +195,57 @@ export function wall(kit, o) {
   // reads as a decal of a window rather than a hole in a wall. Everything here
   // is now dimensioned so it casts onto its own elevation — a 260 mm hood over
   // the head, a 300 mm sill on corbels, and jambs standing 110 mm proud.
+  //
+  // ROUND 3. Every member below used to carry a 20–28 mm bevel, and none of
+  // them is thick enough for one to survive: they are 110–170 mm bars, so the
+  // bevel was a fifth of the member and 32 of its 44 triangles. Across ~200
+  // openings the surround alone was 63k triangles — a tenth of the entire map
+  // — for bevels that vanish at 6 m. They are gone (the chamfer LOD in Geo.js
+  // now catches them by section), and a third of what came back is spent here,
+  // on the one axis that does read at every range: how far the surround stands
+  // off the wall. Jambs went 110 -> 150 mm, the hood oversails 340 mm instead
+  // of 260, the sill projects 400 mm. Same triangle budget as a flat surround,
+  // three times the shadow.
   const relief = o.relief ?? 1;
   const hoods = o.hoods !== false && relief > 0;
   for (const k of openings) {
     const sill = k.sill ?? 0;
     const head = sill + k.h;
-    const pj = 0.11 * relief;                                  // jamb projection
+    const pj = 0.15 * relief;                                  // jamb projection
     const side = -(T / 2 + pj * 0.5);
     for (const sx of [-1, 1]) {
       tb.at(k.x + sx * (k.w / 2 + 0.085), (sill + head) / 2, side)
-        .box(0.17, k.h + 0.26, pj, 0.022, 0);
+        .box(0.17, k.h + 0.26, pj, 0, 0);
     }
     // Head: a lintel band, then a hood that oversails it. The hood is the
     // single most valuable 12 triangles on the whole elevation.
-    tb.at(k.x, head + 0.075, side).box(k.w + 0.34, 0.15, pj + 0.02, 0.025, 0);
+    tb.at(k.x, head + 0.075, side).box(k.w + 0.34, 0.15, pj + 0.02, 0, 0);
     if (hoods && k.h > 1.0) {
-      tb.at(k.x, head + 0.20, -(T / 2 + 0.13 * relief))
-        .box(k.w + 0.52, 0.10, 0.26 * relief + 0.06, 0.028, 0);
+      tb.at(k.x, head + 0.20, -(T / 2 + 0.17 * relief))
+        .box(k.w + 0.52, 0.10, 0.34 * relief + 0.06, 0, 0);
       for (const sx of [-1, 1]) {
-        tb.at(k.x + sx * (k.w / 2 + 0.13), head + 0.115, -(T / 2 + 0.11 * relief))
-          .box(0.11, 0.14, 0.22 * relief, 0.02, 0);
+        tb.at(k.x + sx * (k.w / 2 + 0.13), head + 0.115, -(T / 2 + 0.14 * relief))
+          .box(0.11, 0.14, 0.28 * relief, 0, 0);
       }
+      // Keystone. One box, dead centre, standing proud of the hood: it breaks
+      // the head into two shorter runs and gives the elevation a vertical
+      // accent per opening instead of a ladder of horizontals.
+      tb.at(k.x, head + 0.13, -(T / 2 + 0.19 * relief))
+        .box(0.22, 0.30, 0.30 * relief, 0, 0);
     }
     if (sill > 0.3) {
-      tb.at(k.x, sill - 0.055, -(T / 2 + 0.15 * relief))
-        .box(k.w + 0.40, 0.11, 0.30 * relief + 0.04, 0.025, 0);
+      tb.at(k.x, sill - 0.055, -(T / 2 + 0.19 * relief))
+        .box(k.w + 0.40, 0.11, 0.38 * relief + 0.04, 0, 0);
       // Corbels under the sill: they are what puts a hard vertical shadow on
       // the wall directly below a window instead of a soft gradient.
       if (relief > 0) {
         for (const sx of [-1, 1]) {
-          tb.at(k.x + sx * (k.w / 2 - 0.02), sill - 0.19, -(T / 2 + 0.10 * relief))
-            .box(0.13, 0.17, 0.20 * relief, 0.02, 0);
+          tb.at(k.x + sx * (k.w / 2 - 0.02), sill - 0.19, -(T / 2 + 0.13 * relief))
+            .box(0.13, 0.17, 0.26 * relief, 0, 0);
         }
       }
     } else {
-      tb.at(k.x, 0.055, side).box(k.w + 0.28, 0.11, pj, 0.02, 0);            // threshold
+      tb.at(k.x, 0.055, side).box(k.w + 0.28, 0.11, pj, 0, 0);               // threshold
     }
   }
 
@@ -295,7 +311,7 @@ export function windowFill(kit, frame, k, T, opts = {}) {
   const sh = batch.at(opts.shutter || 'shutter', p.x, p.z);
   sh.frame(frame);
   sh.at(k.x, cy, T * 0.30).box(k.w - 0.06, k.h - 0.06, 0.07, 0.02, 0);
-  const slats = Math.max(2, Math.min(4, Math.round(k.h / 0.42)));
+  const slats = Math.max(2, Math.min(3, Math.round(k.h / 0.62)));
   for (let i = 0; i < slats; i++) {
     const y = sill + 0.14 + (k.h - 0.28) * (i / (slats - 1 || 1));
     sh.at(k.x, y, T * 0.30 - 0.055).box(k.w - 0.12, 0.10, 0.035, 0.012, 0);
@@ -318,7 +334,11 @@ export function windowFill(kit, frame, k, T, opts = {}) {
   sh.clearFrame();
 
   if (opts.bars) {
-    const mb = batch.at(opts.barBucket || 'ironwork', p.x, p.z);
+    // `ironThin` is the same steel material as `ironwork`, on a mesh that does
+    // not cast: a 35 mm bar is under half a shadow-map texel at this cascade
+    // resolution, so all it can produce is a crawling dotted line across the
+    // reveal it is already sitting inside the shadow of.
+    const mb = batch.at(opts.barBucket || 'ironThin', p.x, p.z);
     mb.frame(frame);
     const n = Math.max(2, Math.round(k.w / 0.34));
     for (let i = 0; i < n; i++) {
@@ -355,7 +375,11 @@ export function roof(kit, o) {
   const th = o.thickness ?? 0.30;
 
   const b = batch.at(bucket, cx, cz);
-  b.at(cx, y - th / 2, cz).box(w + 0.34, th, d + 0.34, 0.05, 1.6);
+  // Weathering grid on the deck only. A 20 x 14 m roof at a 1.6 m step is 144
+  // quads per face; five of those six faces are the underside and the four
+  // 300 mm edge bands, none of which has a weathering gradient worth
+  // resolving. Top-face-only turns 640 triangles a roof into 330.
+  b.at(cx, y - th / 2, cz).box(w + 0.34, th, d + 0.34, 0.05, 1.6, FACE_TOP);
 
   if (o.parapet !== 0) {
     const ph = o.parapet ?? SCALE.parapet;
