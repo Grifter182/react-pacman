@@ -171,6 +171,26 @@ export const Config = {
     useAuthored: true,
     environment: 'daysky',
     environmentIntensity: 1.0,
+    /**
+     * KNOWN BROKEN — off until fixed.
+     *
+     * Swapping level surfaces to the authored sets makes the street stop
+     * rendering. Established so far: the meshes exist, are visible, carry
+     * 3.4k triangles with valid UVs and normals, and the textures load; the
+     * collision proxy is present (a ray down hits it at 1.65 m); and sampling
+     * the HDR buffer dead-centre while looking straight down gives EXACTLY
+     * the same value with the ground shown and hidden, so those meshes are
+     * contributing nothing to the frame. Neither the shared-texture dispose
+     * nor the surface-shader metalness theory explained it.
+     *
+     * The remaining suspect is the Batcher path: buckets default to
+     * `weather: true`, which emits an `aWeather` attribute and applies the
+     * Weathering injection to whatever material the bucket holds, and that
+     * machinery was written against the procedural surface shader.
+     *
+     * The environment probe is independent of this and stays on.
+     */
+    levelTextures: false,
     /** Metres of world per texture tile, per surface class. */
     groundTileMetres: 3.0,
     metalTileMetres: 1.6,

@@ -213,6 +213,7 @@ export class LevelModule {
    */
   async _applyAuthoredMaterials() {
     if (Config.assets?.useAuthored === false) return;
+    if (Config.assets?.levelTextures !== true) return;   // see Config.assets.levelTextures
     const M = this.materials;
 
     // `sandFar` must be swapped alongside `sand`: they are the inner and outer
