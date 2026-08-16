@@ -16,7 +16,7 @@ Two jobs.
    wrong" rather than "the code is wrong".
 
 2. EQUIRECT HDRI (.exr) -> RGBE (.hdr)
-   Three reads .hdr with RGBELoader, which ships in the examples bundle — no
+   Three reads .hdr with HDRLoader, which ships in the examples bundle — no
    new dependency, and RGBE is 4 bytes/pixel against EXR's 6+ for half-float
    RGB. The sky is downsampled: PMREM only needs modest resolution for
    irradiance, and 2K equirect is still sharp enough to sit behind an 80-degree

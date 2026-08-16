@@ -207,8 +207,11 @@ export class LevelModule {
     if (Config.assets?.useAuthored === false) return;
     const M = this.materials;
 
+    // `sandFar` must be swapped alongside `sand`: they are the inner and outer
+    // rings of the same ground, and leaving one procedural puts a visible
+    // material seam across the map at 54 m.
     const swaps = [
-      { set: 'rock063', targets: ['sand', 'gravel'], normalScale: 1.0 },
+      { set: 'rock063', targets: ['sand', 'sandFar', 'gravel'], normalScale: 1.0 },
       { set: 'metal053c', targets: ['metal', 'corrugated', 'ironwork'], normalScale: 0.85 },
     ];
 
@@ -228,7 +231,11 @@ export class LevelModule {
             t.repeat.copy(rep);
             t.needsUpdate = true;
           }
-          mat.map?.dispose?.();
+          // DO NOT dispose the outgoing textures. The catalogue deliberately
+          // shares one baked set between tinted variants of the same recipe,
+          // so freeing them here pulls the texture out from under every other
+          // material still using it — which renders those surfaces as nothing
+          // at all. The procedural set is freed with the rest of the level.
           mat.map = map;
           mat.normalMap = normalMap;
           mat.aoMap = ormMap;

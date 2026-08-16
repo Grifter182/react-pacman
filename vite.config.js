@@ -9,7 +9,7 @@ export default defineConfig({
   optimizeDeps: {
     include: [
       'three',
-      'three/examples/jsm/loaders/RGBELoader.js',
+      'three/examples/jsm/loaders/HDRLoader.js',
       'three/examples/jsm/utils/BufferGeometryUtils.js',
     ],
   },

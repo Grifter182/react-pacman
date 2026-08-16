@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { RGBELoader } from 'three/examples/jsm/loaders/RGBELoader.js';
+import { HDRLoader } from 'three/examples/jsm/loaders/HDRLoader.js';
 
 /**
  * Authored art assets, as opposed to the procedurally generated ones.
@@ -42,7 +42,7 @@ export const ENVIRONMENTS = {
 const _texCache = new Map();
 const _envCache = new Map();
 const _texLoader = new THREE.TextureLoader();
-let _rgbeLoader = null;
+let _hdrLoader = null;
 
 function url(p) {
   return `${BASE}${p}`.replace(/([^:])\/{2,}/g, '$1/');
@@ -125,10 +125,10 @@ export async function makeAuthoredMaterial(name, opts = {}) {
  */
 export function loadEnvironment(name) {
   if (_envCache.has(name)) return _envCache.get(name);
-  if (!_rgbeLoader) _rgbeLoader = new RGBELoader();
+  if (!_hdrLoader) _hdrLoader = new HDRLoader();
 
   const tex = new Promise((resolve, reject) => {
-    _rgbeLoader.load(url(`env/${name}.hdr`), (t) => {
+    _hdrLoader.load(url(`env/${name}.hdr`), (t) => {
       t.mapping = THREE.EquirectangularReflectionMapping;
       resolve(t);
     }, undefined, reject);
