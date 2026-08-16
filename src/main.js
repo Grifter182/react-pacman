@@ -1,5 +1,6 @@
 import { Engine } from './core/Engine.js';
 import { Config, autoDetectQuality } from './core/Config.js';
+import { flushMaterialBakes, materialsReady } from './materials/TextureFactory.js';
 
 import { RenderModule } from './render/RenderModule.js';
 import { PostStack } from './render/PostStack.js';
@@ -46,6 +47,37 @@ async function boot() {
 
   await engine.init();
   engine.start();
+
+  // Headless capture control surface.
+  //
+  // Procedural textures bake progressively on a per-frame time budget so the
+  // game is playable while they refine. Under software rasterisation frames
+  // take ~160ms, so that budget is never met and the capture would photograph
+  // 32px preview maps upscaled — which is exactly what a review would then
+  // (reasonably) call "blurry camouflage". Capture must force completion.
+  window.__game = {
+    engine,
+    flushMaterialBakes,
+    materialsReady,
+    /** Hide debug overlays that must never appear in a captured frame. */
+    setCaptureMode(on) {
+      Config.debug.showStats = !on && Config.debug.showStats;
+      Config.debug.captureMode = !!on;
+      document.body.classList.toggle('capture-mode', !!on);
+      if (on && !document.getElementById('capture-style')) {
+        const st = document.createElement('style');
+        st.id = 'capture-style';
+        // Debug readouts and the click-to-deploy overlay are development
+        // affordances, not part of the game's presentation.
+        st.textContent = `.capture-mode .perf,
+          .capture-mode .stats,
+          .capture-mode .debug-only,
+          .capture-mode .prompt { display: none !important; }`;
+        document.head.appendChild(st);
+      }
+      engine.bus.emit('ui:capture', { capture: !!on });
+    },
+  };
 
   // Signal to headless capture that the first frame has presented.
   requestAnimationFrame(() => requestAnimationFrame(() => {

@@ -138,14 +138,29 @@ export const Config = {
   },
 
   debug: {
+    /** Set by the headless harness; suppresses development-only overlays. */
+    captureMode: false,
     showStats: false,
     freeCam: false,
     wireframe: false,
   },
 };
 
-/** Pick a starting tier from a cheap capability probe. */
+/**
+ * Pick a starting tier from a cheap capability probe.
+ *
+ * `?quality=ultra` in the URL overrides the probe. This exists for the
+ * headless capture harness: it renders through SwiftShader, which the probe
+ * (correctly, for a real player) demotes to MEDIUM — but that would mean every
+ * visual review judged a mid-tier image and never saw the effects gated to the
+ * top tiers. Reviews must look at the image the game is actually trying to
+ * produce.
+ */
 export function autoDetectQuality(renderer) {
+  try {
+    const forced = new URLSearchParams(location.search).get('quality');
+    if (forced && QualityPresets[forced]) return forced;
+  } catch { /* no location in a worker/test context */ }
   try {
     const gl = renderer.getContext();
     const dbg = gl.getExtension('WEBGL_debug_renderer_info');

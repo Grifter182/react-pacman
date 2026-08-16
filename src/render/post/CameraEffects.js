@@ -71,7 +71,15 @@ export class CameraEffects {
     u.uJitter.value.copy(ctx.jitterUv);
     u.uCameraMatrix.value.copy(ctx.cameraMatrixWorld);
     u.uPrevViewProj.value.copy(ctx.prevViewProj);
-    u.uStrength.value = this.shutter;
+    // The velocity buffer holds per-pixel motion for ONE frame, so its
+    // magnitude scales with frame time. A fixed shutter therefore means a
+    // 16ms frame gets a 3px smear and a 160ms frame gets a 30px smear — the
+    // effect gets catastrophically worse exactly when the machine is already
+    // struggling. Normalise against a 60Hz reference so the blur represents a
+    // constant real-world exposure time regardless of frame rate.
+    const dt = Math.max(ctx.dt || 1 / 60, 1e-4);
+    const rateScale = Math.min(1, (1 / 60) / dt);
+    u.uStrength.value = this.shutter * rateScale;
     u.uMaxRadius.value = this.maxBlurRadius;
     this.motionBlur.render(renderer, outTarget);
   }

@@ -95,7 +95,14 @@ export class TemporalAA {
     u.uJitter.value.copy(ctx.jitterUv);
     u.uCameraMatrix.value.copy(ctx.cameraMatrixWorld);
     u.uPrevViewProj.value.copy(ctx.prevViewProj);
-    u.uFeedback.value = this.feedback;
+    // Feedback is a per-frame blend weight, so the history's effective
+    // exposure time is dt/(1-feedback). Tuned at 60Hz, 0.92 means ~200ms of
+    // accumulation; at a 160ms frame that becomes two full seconds and the
+    // image smears into paste. Hold the exposure time constant instead of the
+    // blend weight, so a slow frame trusts history proportionally less.
+    const dt = Math.max(ctx.dt || 1 / 60, 1e-4);
+    const targetExposure = (1 / 60) / (1 - this.feedback);
+    u.uFeedback.value = THREE.MathUtils.clamp(1 - dt / targetExposure, 0.5, this.feedback);
     u.uCameraShift.value = ctx.cameraShift;
     u.uValid.value = this._valid ? 1 : 0;
     this.resolve.render(renderer, write);

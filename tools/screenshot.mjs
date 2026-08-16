@@ -91,7 +91,13 @@ async function main() {
   });
   page.on('pageerror', (e) => logs.push(`[pageerror] ${e.message}\n${e.stack || ''}`));
 
-  await page.goto(server.url, { waitUntil: 'load', timeout: 60000 });
+  // Force the quality tier. Headless runs on SwiftShader, which the runtime
+  // probe demotes to MEDIUM — correct for a real player on software GL, but it
+  // would mean every visual review judged an image with the top-tier effects
+  // switched off. Reviews must see what the game is actually trying to render.
+  const quality = arg('quality', 'ultra');
+  const target = `${server.url}${server.url.includes('?') ? '&' : '?'}quality=${quality}`;
+  await page.goto(target, { waitUntil: 'load', timeout: 60000 });
 
   // Wait for the engine to present its first frame.
   await page.waitForFunction(() => document.body.dataset.ready === '1' || document.querySelector('pre'), { timeout: 90000 })
@@ -105,6 +111,21 @@ async function main() {
     await writeFile(path.join(OUT, 'BOOT-FAILURE.txt'), boot.message || 'unknown');
     logs.push('[harness] BOOT FAILURE — see BOOT-FAILURE.txt');
   }
+
+  // Force every procedural texture to full resolution and hide debug overlays.
+  // Without this the capture photographs low-res preview maps, because the
+  // progressive bake budget is never met under software rasterisation.
+  const prep = await page.evaluate(async () => {
+    const g = window.__game;
+    if (!g) return { ok: false, reason: 'window.__game missing' };
+    g.setCaptureMode(true);
+    const t0 = performance.now();
+    g.flushMaterialBakes();
+    await g.materialsReady();
+    return { ok: true, bakeMs: Math.round(performance.now() - t0) };
+  }).catch((e) => ({ ok: false, reason: String(e) }));
+  if (!prep.ok) logs.push(`[harness] capture prep failed: ${prep.reason}`);
+  else console.log(`[harness] material bake flush ${prep.bakeMs}ms`);
 
   await page.waitForTimeout(SETTLE);
 
