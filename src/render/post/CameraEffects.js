@@ -27,6 +27,10 @@ export class CameraEffects {
     this.maxBlurRadius = 0.035;   // fraction of screen height
     this.aperture = 0.55;
     this.adsAperture = 1.35;
+    // Far-field defocus, as a fraction of the near-field aperture. Small enough
+    // that the midground reads sharp; ADS lifts it to isolate the target.
+    this.farScale = 0.10;
+    this.adsFarScale = 0.30;
     this.maxCoCRadius = 9.0;      // pixels
   }
 
@@ -52,6 +56,7 @@ export class CameraEffects {
       uInvProj: { value: new THREE.Matrix4() },
       uJitter: { value: new THREE.Vector2() },
       uAperture: { value: this.aperture },
+      uFarScale: { value: this.farScale },
       uMaxRadius: { value: this.maxCoCRadius },
       uTime: { value: 0 },
     }, { defines: { DOF_TAPS: 22 } });
@@ -92,6 +97,7 @@ export class CameraEffects {
     u.uInvProj.value.copy(ctx.invProj);
     u.uJitter.value.copy(ctx.jitterUv);
     u.uAperture.value = THREE.MathUtils.lerp(this.aperture, this.adsAperture, ctx.ads);
+    u.uFarScale.value = THREE.MathUtils.lerp(this.farScale, this.adsFarScale, ctx.ads);
     u.uMaxRadius.value = this.maxCoCRadius;
     u.uTime.value = ctx.time;
     this.dof.render(renderer, outTarget);
@@ -167,6 +173,7 @@ uniform vec2 uTexel;
 uniform mat4 uInvProj;
 uniform vec2 uJitter;
 uniform float uAperture;
+uniform float uFarScale;
 uniform float uMaxRadius;
 uniform float uTime;
 
@@ -176,11 +183,21 @@ float viewZ(vec2 uv){
   return viewFromDepth(uv - uJitter, d, uInvProj).z;
 }
 
-/* Signed circle of confusion, normalised to [-1,1]. */
+/* Signed circle of confusion, normalised to [-1,1].
+ *
+ * (dist - focus) / dist tends to 1.0 as dist grows, so the far field saturates
+ * at the full aperture and NOTHING beyond the focus plane is ever sharp again.
+ * With auto-focus sitting a couple of metres out that blurs the entire world,
+ * which hides the midground instead of shaping it. A real lens stopped down for
+ * a game camera is hyperfocal: the near field falls off fast, the far field
+ * stays essentially sharp. Scaling only the positive (far) side gives that,
+ * while keeping the foreground defocus that separates the weapon from the map.
+ */
 float coc(float z, float focus){
   float dist = -z;                       // positive metres in front of the eye
   float c = (dist - focus) / max(dist, 0.05);
-  return clamp(c * uAperture, -1.0, 1.0);
+  float ap = c > 0.0 ? uAperture * uFarScale : uAperture;
+  return clamp(c * ap, -1.0, 1.0);
 }
 
 void main(){
