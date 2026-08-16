@@ -1,52 +1,21 @@
 {
-  "name": "react-pacman",
-  "version": "0.0.4",
-  "description": "Pacman game written as a React component",
-  "main": "index.js",
+  "name": "operation-blackout",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Operation Blackout — a AAA-styled first-person shooter built on Three.js / WebGL2",
   "scripts": {
-    "build": "rsync -av --exclude '*.js' src/Pacman/ dist/ && BABEL_ENV=production babel src/Pacman --out-dir dist",
-    "prepublish": "npm run build",
-    "dev": "NODE_ENV=development webpack-dev-server --mode development --hot",
-    "test": "NODE_ENV=test mocha --require babel-register \"test/**/*.spec.js\"",
-    "lint": "eslint test src"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/nurra01/react-pacman.git"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "MIT",
-  "bugs": {
-    "url": "https://github.com/nurra01/react-pacman/issues"
-  },
-  "homepage": "https://github.com/nurra01/react-pacman#readme",
-  "devDependencies": {
-    "@babel/cli": "^7.5.5",
-    "@babel/core": "^7.5.5",
-    "@babel/plugin-proposal-class-properties": "^7.5.5",
-    "@babel/preset-env": "^7.5.5",
-    "@babel/preset-react": "^7.0.0",
-    "babel-eslint": "^8.0.0",
-    "babel-loader": "^8.0.6",
-    "chai": "^4.1.2",
-    "css-loader": "^3.2.0",
-    "eslint": "^4.19.1",
-    "eslint-plugin-babel": "^5.1.0",
-    "eslint-plugin-react": "^7.8.2",
-    "html-loader": "^0.5.5",
-    "html-webpack-plugin": "^3.2.0",
-    "react-hot-loader": "^4.2.0",
-    "sass-loader": "^7.0.1",
-    "style-loader": "^0.21.0",
-    "webpack": "^4.8.3",
-    "webpack-cli": "^3.1.1",
-    "sass": "^1.49.11",
-    "webpack-dev-server": "^3.1.4"
+    "dev": "vite --host 0.0.0.0 --port 5173",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0 --port 4173",
+    "shot": "node tools/screenshot.mjs"
   },
   "dependencies": {
-    "classnames": "^2.2.5",
-    "react": "^16.9.0",
-    "react-dom": "^16.9.0"
+    "three": "^0.185.1",
+    "three-mesh-bvh": "^0.9.1"
+  },
+  "devDependencies": {
+    "playwright": "^1.62.1",
+    "vite": "^7.0.0"
   }
 }
