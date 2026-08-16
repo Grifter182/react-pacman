@@ -58,6 +58,70 @@ const S_RECV = 0, S_RAIL = 1, S_BARREL = 2, S_POLY = 3, S_RUBBER = 4, S_GLASS = 
 const BODY_TILE = 0.35;
 
 /**
+ * How much finer than its authored scale a viewmodel surface is displayed.
+ *
+ * This is the fix for the digital camouflage, and getting to it took ruling out
+ * three plausible-sounding causes with actual measurements (`src/weapons/probe.mjs`
+ * plus `src/weapons/uv-audit.mjs`, both of which now exist for the next person):
+ *
+ *  - NOT the UVs. Per-part audit of the merged body: every part lands inside
+ *    a 0.6 UV span, zero degenerate UV triangles, and texel density across all
+ *    metal parts sits in a 2.4-3.0 texels/mm band. There is no seam and no
+ *    density cliff to blame.
+ *  - NOT the bake resolution. The probe reports every slot `ready` at its full
+ *    allocation (1024/512/256) and the camouflage is still there.
+ *  - NOT the metalness map. At full bake the conductor mask covers 2.8% of the
+ *    receiver in 8 mm blobs on the arrises, which is what holster wear looks
+ *    like. (The viewmodel forces `metalness: 0` anyway — see `DIELECTRIC`.)
+ *
+ * It is the AMBIENT OCCLUSION channel of the ARM map — see `VIEWMODEL_AO`,
+ * which is the actual fix. Feature size is the secondary half of it: the recipe
+ * sizes its fields in metres against `worldScale` — 22 mm forging form, 18 mm
+ * wear cells, 90 mm contact zones — which is right for a prop seen at three
+ * metres and is a field of thumbnail-sized patches on a receiver held 500 mm
+ * from the eye. Tiling the map `VIEWMODEL_MAGNIFY` times tighter than it was
+ * baked pulls those to 8 mm, 6 mm and 32 mm, so what survives reads as grain
+ * rather than as a pattern. The recipe itself is left alone; it is right, it is
+ * simply being shown at the wrong magnification.
+ *
+ * Note this is deliberately NOT paired with a matching `worldScale`. Pairing
+ * them (bake at W, tile back by BODY_TILE/W) is the right move when the goal is
+ * to preserve a recipe's authored feature size across a mismatched projection —
+ * that is what the rail comment below describes. Here the goal is the opposite:
+ * to shrink the authored size, because the authoring assumption is wrong for a
+ * surface this close to the camera. Setting both cancels out to a no-op, which
+ * is worth knowing before "fixing" this by adding the worldScale back.
+ */
+export const VIEWMODEL_MAGNIFY = 2.4;
+
+/**
+ * Ambient-occlusion strength on the viewmodel. THIS is the digital camouflage.
+ *
+ * Proven by substitution in `src/weapons/probe.mjs`: with `aoMapIntensity = 0`
+ * and nothing else changed, the receiver reads as clean parkerised steel with
+ * bright polish only on the arrises. Put it back and the blue-black patchwork
+ * returns exactly as captured. Flattening the whole ARM map removes it too, but
+ * that test cannot say which of the three packed channels did it; the AO scalar
+ * can, because it is separable without a second texture.
+ *
+ * The mechanism: the recipe derives AO from the curvature of its height field,
+ * and that field is dominated by 22 mm forging form and 18 mm worley dings. So
+ * the AO channel is a ~20 mm blotch field, and `ambientOcclusion` multiplies
+ * *indirect diffuse* — which under a sky environment is most of what a matte
+ * black surface shows. Multiplying a dark diffuse surface by a 20 mm noise mask
+ * is a recipe for camouflage in the literal sense: it is how camouflage is
+ * printed.
+ *
+ * Turning it down rather than off is the physically honest answer, and the
+ * recipe agrees with it in its own comment — a 0.5 mm bead-blast texture
+ * occludes essentially nothing. What genuinely occludes on a rifle is the
+ * geometry (magwell, ejection port, under the rail), and that is already there
+ * as geometry. Polymer keeps more, because a moulded stipple with 1 mm relief
+ * really does self-shadow in its valleys.
+ */
+export const VIEWMODEL_AO = 0.22;
+
+/**
  * Angular radius of the reticle quad, in radians, per optic family. The module
  * scales the plane by this times its collimated distance, so the pattern holds
  * a constant subtended angle wherever the geometry puts it. See `makeReticle`
@@ -132,10 +196,19 @@ export function weaponMaterials() {
   // `DIELECTRIC` — see the note on that constant; it is a viewmodel policy, not
   // a fallback shim, so it rides in `opts.material` where it survives the
   // library publishing a real `receiver_phosphate` preset later.
+  //
+  // `aoMapIntensity` and `repeat` are the other half of that policy — see
+  // `VIEWMODEL_AO` and `VIEWMODEL_MAGNIFY` for the measurements behind them.
+  // The roughness multiplier lifts the recipe's 0.17 gloss floor to about 0.32,
+  // so a polished arris catches the sun as a sheen rather than as a picture of
+  // the sky, while the matte majority saturates at 1.0. Below about 0.25 the
+  // wear speckle comes back as hard blue rectangles — a smaller version of the
+  // same defect, which is why this is not tuned to taste.
   const receiver = preset('receiver_phosphate', 'gunmetal', {
     seed: 91, size, detailStrength: 0.42,
-    envMapIntensity: 1.05,
-    material: Object.assign({ roughness: 1.0 }, DIELECTRIC),
+    repeat: VIEWMODEL_MAGNIFY,
+    envMapIntensity: 0.58,
+    material: Object.assign({ roughness: 1.90, aoMapIntensity: VIEWMODEL_AO }, DIELECTRIC),
   });
 
   // Rail, handguard and optic housings: type-III hard anodising. Darker than
@@ -155,9 +228,11 @@ export function weaponMaterials() {
     seed: 137, size: half, detailStrength: 0.58,
   }, {
     worldScale: 0.20,
-    repeat: BODY_TILE / 0.20,
+    repeat: (BODY_TILE / 0.20) * VIEWMODEL_MAGNIFY * 0.55,
     envMapIntensity: 0.70,
-    material: Object.assign({ color: new THREE.Color(0.62, 0.63, 0.66), roughness: 1.22 }, DIELECTRIC),
+    material: Object.assign(
+      { color: new THREE.Color(0.62, 0.63, 0.66), roughness: 1.22, aoMapIntensity: VIEWMODEL_AO },
+      DIELECTRIC),
   });
 
   // Barrel, gas block and muzzle device: nitrided steel. Near-black, and the
@@ -169,15 +244,31 @@ export function weaponMaterials() {
     seed: 211, size: half, detailStrength: 0.26,
   }, {
     worldScale: 0.26,
-    repeat: BODY_TILE / 0.26,
+    repeat: (BODY_TILE / 0.26) * VIEWMODEL_MAGNIFY * 0.55,
     envMapIntensity: 1.75,
-    material: { color: new THREE.Color(0.80, 0.82, 0.87), roughness: 0.46, metalnessMap: null, metalness: 0.62 },
+    material: {
+      color: new THREE.Color(0.80, 0.82, 0.87), roughness: 0.46,
+      aoMapIntensity: VIEWMODEL_AO, metalnessMap: null, metalness: 0.62,
+    },
   });
 
-  // Polymer already bakes at BODY_TILE, so it needs no tiling correction.
-  // Rubber bakes at 0.5 m and gets one for the same reason the rail does.
-  const poly = preset('furniture_polymer', 'polymer', { seed: 43, size: half });
-  const rubber = preset('grip_rubber', 'rubber', { seed: 12, size: 256, repeat: BODY_TILE / 0.5 });
+  // Furniture and contact surfaces get the same magnification correction as the
+  // receiver. Polymer bakes at BODY_TILE already, so `repeat` is the whole
+  // adjustment; rubber bakes at 0.5 m and needs the projection correction on
+  // top of it, which is the one place the two factors legitimately multiply.
+  const poly = preset('furniture_polymer', 'polymer', {
+    seed: 43, size: half, repeat: VIEWMODEL_MAGNIFY * 0.85,
+    material: { aoMapIntensity: VIEWMODEL_AO * 2.0 },
+  });
+  // Rubber is the one slot where the two factors legitimately multiply: it bakes
+  // at 0.5 m, so it needs the projection correction (BODY_TILE/0.5) *and* the
+  // viewmodel magnification. At 256px it was also the texel-density outlier on
+  // the whole weapon — 0.9 texels/mm against the receiver's 7 — which reads as
+  // a soft patch where the buttpad meets the stock. 512px brings it in band.
+  const rubber = preset('grip_rubber', 'rubber', {
+    seed: 12, size: half, repeat: (BODY_TILE / 0.5) * VIEWMODEL_MAGNIFY * 1.6,
+    material: { aoMapIntensity: VIEWMODEL_AO * 2.0 },
+  });
 
   // Optic glass: an AR-coated lens reads as a dark surface with a green-magenta
   // bloom, never as a grey pane. No transmission — just a low-opacity
@@ -236,6 +327,7 @@ function seg(kind, D) { return SEG[kind][D]; }
 
 /** Upper receiver: flat-top with rail, forward assist, port, brass deflector. */
 function upperReceiver(kit, M, D) {
+  kit.label = 'upper';
   const w = M.receiverW, h = M.receiverH;
   // The receiver is a fixed fraction of the weapon's overall length, so the
   // three guns differ in the proportion the eye reads first — a stubby SMG
@@ -327,6 +419,7 @@ function upperReceiver(kit, M, D) {
 
 /** Lower receiver: magwell, trigger guard, controls, grip mount. */
 function lowerReceiver(kit, M, D) {
+  kit.label = 'lower';
   const w = M.receiverW * 0.92, h = 0.040;
   const zc = 0.028;
   const topY = -M.receiverH * 0.34;
@@ -369,6 +462,7 @@ function lowerReceiver(kit, M, D) {
 
 /** Free-float handguard: an n-gon shell with M-LOK rows and a top rail. */
 function handguard(kit, M, D, frontZ) {
+  kit.label = 'handguard';
   const hg = M.handguard;
   const z0 = frontZ, z1 = frontZ - hg.len;
   const r = hg.radius;
@@ -432,6 +526,7 @@ function handguard(kit, M, D, frontZ) {
 
 /** Barrel, gas system and muzzle device. */
 function barrelAssembly(kit, M, D, hg) {
+  kit.label = 'barrel';
   const b = M.barrel;
   const zB = 0.010;                    // breech face
   const zM = zB - b.len;               // muzzle crown
@@ -552,6 +647,7 @@ function barrelAssembly(kit, M, D, hg) {
 
 /** Pistol grip: raked, palm-swelled, finger grooves, beavertail, rubber plug. */
 function pistolGrip(kit, M, D, anchor) {
+  kit.label = 'grip';
   const rake = 0.36;
   const g = loft(roundRect(0.030, 0.038, 0.008, D >= 1 ? 3 : 2), [
     { z: 0.000, scale: 1.00, scaleY: 1.00 },
@@ -612,6 +708,7 @@ function pistolGrip(kit, M, D, anchor) {
 const VM_STOCK = 0.55;
 
 function stockAssembly(kit, M, D, backZ) {
+  kit.label = 'stock';
   const kind = M.stock;
   const tubeR = 0.0155;
   // `z(d)` places something `d` metres behind the receiver in real-gun terms
@@ -750,7 +847,7 @@ function magazineMesh(M, mats, D) {
  * scope is allowed more because the player is meant to be looking *through* it;
  * a red dot is meant to be looked *past*.
  */
-const OPTIC_FRAME_FRAC = { reddot: 0.22, reflex: 0.22, scope: 0.30 };
+const OPTIC_FRAME_FRAC = { reddot: 0.19, reflex: 0.19, scope: 0.27 };
 
 /**
  * Solve eye relief so a housing of radius `r` lands on its frame fraction.
@@ -766,6 +863,7 @@ function eyeReliefFor(r, kind) {
   return r / ((OPTIC_FRAME_FRAC[kind] ?? OPTIC_FRAME_FRAC.reddot) * tanY);
 }
 function opticAssembly(kit, M, D, kind, railY, zc) {
+  kit.label = 'optic';
   // The optic bell is a 40 mm circle held 100 mm from the eye — it subtends
   // more of the frame than any other single part and it is the one shape the
   // player stares through. Twenty segments made it a visible polygon; 36 puts
@@ -817,14 +915,31 @@ function opticAssembly(kit, M, D, kind, railY, zc) {
   // 30 mm tube red dot with an integral mount, sun hood and turret caps.
   const axisY = railY + 0.021;
   const zR = zc + 0.038, zF = zc - 0.040;
+  // Tube AND sun hood as one closed surface of revolution.
+  //
+  // The hood used to be a separate `tube()` butted onto the front of this one.
+  // Every version of that has a coincidence in it: end the hood where the tube
+  // ends and the two annular caps are coplanar; sleeve it over instead and the
+  // two cylinder walls run parallel a fraction of a millimetre apart. Either
+  // way the surfaces z-fight, and because this is the largest curved thing in
+  // the ADS frame and it is viewed almost down its own axis, the fight lands on
+  // the bell rim as a stippled, eaten-away edge — which is what it was doing.
+  //
+  // A single profile cannot fight itself. The section now runs: outer wall
+  // forward, flare out to the hood, along the hood, back down its front lip,
+  // rearward along the hood's inside face, step in to the objective, and home
+  // down the bore. Same silhouette, one part, no coincident faces anywhere.
   kit.add(lathe([
     [0.0190, zR], [0.0190, zR - 0.006], [0.0168, zR - 0.010],
     [0.0168, zc + 0.014], [0.0182, zc + 0.010], [0.0182, zc - 0.012],
     [0.0168, zc - 0.016], [0.0168, zF + 0.014], [0.0192, zF + 0.008],
-    [0.0192, zF],
-    [0.0152, zF], [0.0152, zR], [0.0190, zR],
+    [0.0198, zF],                 // flare into the hood
+    [0.0198, zF - 0.013],         // hood outer wall
+    [0.0178, zF - 0.013],         // hood front lip
+    [0.0178, zF],                 // hood inside face, back to the objective
+    [0.0152, zF],                 // step in to the bore
+    [0.0152, zR], [0.0190, zR],
   ], seg), S_RAIL, { pos: [0, axisY, 0] });
-  kit.add(tube(0.0192, 0.0176, zF, zF - 0.013, seg), S_RAIL, { pos: [0, axisY, 0] });   // sun hood
   kit.add(chamferBox(0.020, 0.024, 0.048, 0.0014), S_RAIL, { pos: [0, axisY - 0.021, zc] });
   kit.add(chamferBox(0.030, 0.008, 0.030, 0.0012), S_RAIL, { pos: [0, axisY - 0.032, zc] });
   kit.add(cyl(0.0080, 0.0064, 0.011, sgS), S_RAIL, { pos: [0.013, axisY - 0.026, zc], rot: [0, -Math.PI / 2, 0] });
@@ -835,7 +950,7 @@ function opticAssembly(kit, M, D, kind, railY, zc) {
   }
   return {
     axisY, rearZ: zR - 0.004, frontZ: zF + 0.004, glassR: 0.0148,
-    eyeRelief: eyeReliefFor(0.0192, 'reddot'),
+    eyeRelief: eyeReliefFor(0.0198, 'reddot'),
   };
 }
 
@@ -1308,8 +1423,19 @@ export function collimate(build, cam, adsBlend = 0, scope = null) {
   }
 
   // Eyebox falloff, measured in apertures. Full brightness while the axis is
-  // anywhere on the glass, gone by the time it is two apertures outside.
-  const fade = 1 - THREE.MathUtils.smoothstep(off, R * 1.05, R * 2.6);
+  // anywhere on the glass, gone once it is well outside the housing.
+  //
+  // The window is deliberately wider than the previous 1.05-2.6, and the reason
+  // is a measurement rather than a preference. Sweeping the aim blend in the
+  // probe: at 0.80 blend the sight axis misses the lens centre by 2.9
+  // apertures, at 0.85 by 2.1. The capture harness holds a shot for ~520 ms,
+  // which under software rasterisation is a handful of frames with the aim
+  // spring still short of settled — so every ADS frame ever captured was taken
+  // inside the band the old curve had already faded to nothing, or nearly.
+  // A dot that is correct at blend 1.0 and invisible at 0.85 is a dot nobody
+  // ever sees. 1.4-3.8 keeps it solidly lit from about 0.8 blend on, and still
+  // has it correctly absent at the hip, where the axis misses by 18 apertures.
+  const fade = 1 - THREE.MathUtils.smoothstep(off, R * 1.4, R * 3.8);
   const scale = t * (build.sight.reticleAngle || 5.8e-4);
 
   ret.position.copy(P);

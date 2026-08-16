@@ -73,13 +73,21 @@ export function protoBarrel() {
  * 7-course section went 2,464 -> 1,232 triangles with no change to any
  * silhouette, across 22 instanced walls.
  */
-function sandbagLump(b, x, y, z, ry, len = 0.46, wid = 0.26, hgt = 0.17, seed = 1, double = true) {
+function sandbagLump(b, x, y, z, ry, len = 0.46, wid = 0.26, hgt = 0.17, seed = 1,
+  double = true, round = true) {
   const r = rng(seed);
   b.at(x, y, z, ry);
-  b.box(len, hgt, wid, hgt * 0.45);
+  // ROUNDED ONLY ON THE OUTLINE. The bevel is what turns a brick into a bag and
+  // it costs 32 of the lump's 44 triangles — but a bag in the middle of a
+  // revetment has a bag hard against it on all four sides, so the only edge of
+  // it that is ever against sky or ground is the one facing the viewer, and
+  // that edge is a seam between two bags rather than a silhouette. Rounding is
+  // spent on the crest course and the two end columns, which is the entire
+  // outline of the wall, and skipped in the field.
+  b.box(len, hgt, wid, round ? hgt * 0.45 : 0);
   if (!double) return;
   b.at(x + (r() - 0.5) * 0.06, y + hgt * 0.14, z, ry + (r() - 0.5) * 0.28);
-  b.box(len * 0.84, hgt * 0.82, wid * 0.94, hgt * 0.4);
+  b.box(len * 0.84, hgt * 0.82, wid * 0.94, round ? hgt * 0.4 : 0);
 }
 
 /**
@@ -98,12 +106,15 @@ export function protoSandbagWall(courses = 6, length = 2.0, seed = 3) {
       for (let i = 0; i < per; i++) {
         const x = -length / 2 + bagL * (i + 0.5) + stagger - bagL * 0.25;
         if (Math.abs(x) > length / 2) continue;
-        // Silhouette bags: the crest, both ends of every course, and a third
-        // of the interior for irregularity.
+        // Silhouette bags: the crest and both ends of every course. Those are
+        // the bags that make the outline, so they are the ones that get both
+        // the bevel and the second slumped slab. Everything in the field is a
+        // plain lozenge — 12 triangles instead of 44 — and reads identically,
+        // because its neighbours cover every edge it has.
         const onEdge = c === courses - 1 || i === 0 || i === per - 1;
         sandbagLump(b, x, y, (r() - 0.5) * 0.04 + inset * 0.3,
           (r() - 0.5) * 0.13, bagL - inset, 0.26 - inset * 0.5, bagH, seed + c * 7 + i,
-          onEdge || ((c * 3 + i) % 3 === 0));
+          c === courses - 1 || (i === 0 && (c & 1) === 0), onEdge);
       }
     }
   }, 0.7);

@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { makeMaterial } from '../materials/TextureFactory.js';
 import { Config, QualityTier } from '../core/Config.js';
 
-import { ProxySet, rng, fbm2 } from './kit/Geo.js';
+import { ProxySet, rng, fbm2, FACE_ALL, FACE_NY } from './kit/Geo.js';
 import { Batcher, InstancePool } from './kit/Batcher.js';
 import { applyWeathering, disposeWeathering } from './kit/Weathering.js';
 import { Foliage } from './kit/Foliage.js';
@@ -95,6 +95,8 @@ const PROP_COLLIDERS = {
   crateWood: [0.64, 0.64, 0.64],
   crateWoodBig: [0.88, 0.88, 0.88],
   crateMetal: [0.72, 0.72, 0.72],
+  crateRoof: [0.72, 0.72, 0.72],
+  barrelRoof: [0.60, 0.90, 0.60],
   barrel: [0.60, 0.90, 0.60],
   barrelBlue: [0.60, 0.90, 0.60],
   sandbagLow: [2.00, 1.03, 0.60],
@@ -344,96 +346,146 @@ export class LevelModule {
    *     (607k + 566k x 4)         2.87M                408   <- the level's share
    *
    * The arithmetic is exact to 2%: culling rejects essentially nothing, because
-   * the compound fits inside every cascade. So the lever with by far the most
-   * leverage is not the triangle count of a bucket — it is whether the bucket
-   * casts at all, which is worth 4x, and how many *meshes* it is split across,
-   * which is worth 4x again on the draw-call side.
+   * the compound fits inside every cascade.
    *
-   * Two rules follow, and both are applied below:
+   * ROUND 3 CORRECTION, AND IT IS THE WHOLE ROUND. The clause above — "a mesh
+   * that casts is submitted five times" — is not the rule the renderer runs.
+   * `RenderModule` selects `THREE.VSMShadowMap`, and three's shadow pass admits
+   * an object when
    *
-   *  1. SPATIAL CELLS ARE OFF. They exist so a near cascade can reject a chunk
-   *     of the map. On a 80 x 92 m compound inside a 140 m shadow range there
-   *     is no chunk to reject: splitting `plasterPale` into five cells turned
-   *     five draw calls into twenty-five and rejected none of them. One mesh
-   *     per material. (The mechanism stays in Batcher.js — it is the right
-   *     answer for a larger map, and this one may yet grow.)
+   *     object.castShadow || ( object.receiveShadow && type === VSMShadowMap )
    *
-   *  2. A BUCKET CASTS ONLY IF ITS SHADOW IS A SHAPE. Masonry, roofs, awnings,
-   *     stalls, vehicles, sandbags and palms all throw a legible shape onto the
-   *     ground or onto a wall, and they carry the map's lighting. Shutters
-   *     recessed inside a reveal, glazing bars, cables, railings, wheels under
-   *     a car body, chrome trim and the goods on a stall counter do not: their
-   *     shadows are either sub-texel hairlines that alias, or they fall inside
-   *     a shadow something bigger is already casting. Those are 4x savings for
-   *     a difference nobody can point at in a frame.
+   * `receiveShadow` is true on every bucket here, because a surface that does
+   * not receive cannot be shadowed by anything. So EVERY bucket was already
+   * paying the 5x, and round 2's careful sorting of buckets into casters and
+   * non-casters — shutters, glazing bars, cables, chrome — saved nothing at
+   * all. It is the reason the budget moved the wrong way while the ledger said
+   * it should not have.
+   *
+   * Three rules follow, and all three are applied below:
+   *
+   *  1. SPATIAL CELLS STAY OFF, and now for a reason with numbers behind it.
+   *     They exist so a near cascade can reject a chunk of the map. Running
+   *     `CascadedShadows`' own split scheme (near 0.6, max 140, lambda 0.65) at
+   *     this camera's 80 degree FOV gives ortho half-sizes of 19, 42, 83 and
+   *     193 m. Only cascade 0's 38 m box is smaller than the 80 x 92 m
+   *     compound; cascades 1-3 contain all of it. So splitting a bucket into
+   *     cells can reject at most three quarters of one pass out of five — call
+   *     it 15% of the shadow cost — and it costs a draw call per cell per
+   *     cascade to try. One mesh per material. (The mechanism stays in
+   *     Batcher.js: it is the right answer for a larger map or a shorter
+   *     shadow range, and this one may yet grow.)
+   *
+   *  2. THE ONLY WAY OUT OF THE SHADOW PASS IS `shadow: false` — cast AND
+   *     receive both off. That is a real decision with a real cost: such a
+   *     surface is lit by the sun even when it stands in shade, so it can only
+   *     be used where nothing is ever between it and the sun. Which is exactly
+   *     what the skyline is. Rooftop plant, aerials, dishes, cables, parapet
+   *     ironwork, roof railings and the backdrop all sit above every occluder
+   *     on the map, and their own shadows fall on roofs nobody stands on.
+   *
+   *  3. SO SILHOUETTE DETAIL IS 5x CHEAPER THAN SURFACE DETAIL. A triangle in a
+   *     `SKY` bucket costs one submission; the same triangle on a wall costs
+   *     five. That inverts the round-2 instinct to spend on facades: the budget
+   *     freed below is spent almost entirely on the roofline, where it both
+   *     costs a fifth and changes the outline — which is the only kind of
+   *     detail that survives being 40 m away and 30 px tall.
    */
   _defineBuckets() {
     const M = this.materials;
     const b = this.batch;
     // uvScale must match the preset's worldScale, or the LOW tier — which
     // drops the triplanar path and falls back to these UVs — rescales.
-    // Every bucket is cells:false — see the shadow-budget note above.
-    const NC = { cells: false, castShadow: false };
-    const CC = { cells: false };
+    //
+    // Three shadow classes, and only three:
+    //   LIT   casts and receives.  5x.  Anything whose shadow is a shape.
+    //   RECV  receives only.       5x.  Coplanar decals and ground, where
+    //                                   casting is self-shadow acne, but which
+    //                                   must take the shadow of everything else.
+    //   SKY   neither.             1x.  Only for geometry that nothing on this
+    //                                   map can stand between and the sun, and
+    //                                   whose own shadow lands where no player
+    //                                   is: the roofline, and the backdrop.
+    const LIT = { cells: false };
+    const RECV = { cells: false, castShadow: false };
+    const SKY = { cells: false, castShadow: false, receiveShadow: false };
 
-    b.define('sand', M.sand, { uvScale: 2.0, ...NC });
-    b.define('sandFar', M.sandFar, { uvScale: 8.0, ...NC, receiveShadow: false, weather: false });
-    b.define('gravel', M.gravel, { uvScale: 1.3, ...NC });
-    b.define('asphalt', M.asphalt, { uvScale: 1.5, ...NC });
-    b.define('tile', M.tile, { uvScale: 0.9, ...NC });
+    b.define('sand', M.sand, { uvScale: 2.0, ...RECV });
+    b.define('sandFar', M.sandFar, { uvScale: 8.0, ...SKY, weather: false });
+    b.define('gravel', M.gravel, { uvScale: 1.3, ...RECV });
+    b.define('asphalt', M.asphalt, { uvScale: 1.5, ...RECV });
+    b.define('tile', M.tile, { uvScale: 0.9, ...RECV });
     // Decals are coplanar with the ground they sit on; casting from them is not
     // just wasted, it is the classic source of self-shadow acne on a road.
-    const dc = { ...NC, weather: false };
+    const dc = { ...RECV, weather: false };
     b.define('decalDark', M.decalDark, { uvScale: 1.5, ...dc });
     b.define('decalWear', M.decalWear, { uvScale: 1.3, ...dc });
     b.define('decalOil', M.decalOil, { uvScale: 1.5, ...dc });
     b.define('decalPale', M.decalPale, { uvScale: 1.5, ...dc });
 
     // --- the massing. This is what the sun is actually drawing with. --------
-    b.define('plaster', M.plaster, { uvScale: 2.0, ...CC });
-    b.define('plasterWarm', M.plasterWarm, { uvScale: 2.0, ...CC });
-    b.define('plasterPale', M.plasterPale, { uvScale: 2.0, ...CC });
-    b.define('concrete', M.concrete, { uvScale: 2.4, ...CC });
-    b.define('brick', M.brick, { uvScale: 2.0, ...CC });
-    b.define('rubblebits', M.concrete, { uvScale: 2.4, ...CC });
-    b.define('concreteProp', M.concreteProp, { uvScale: 1.2, ...CC, weather: false });
+    // Everything here is LIT: it is at or below eye level, it stands in other
+    // things' shadows, and its own shadow is the map's lighting.
+    b.define('plaster', M.plaster, { uvScale: 2.0, ...LIT });
+    b.define('plasterWarm', M.plasterWarm, { uvScale: 2.0, ...LIT });
+    b.define('plasterPale', M.plasterPale, { uvScale: 2.0, ...LIT });
+    b.define('concrete', M.concrete, { uvScale: 2.4, ...LIT });
+    b.define('brick', M.brick, { uvScale: 2.0, ...LIT });
+    b.define('rubblebits', M.concrete, { uvScale: 2.4, ...LIT });
+    b.define('concreteProp', M.concreteProp, { uvScale: 1.2, ...LIT, weather: false });
 
-    b.define('timber', M.timber, { uvScale: 2.2, ...CC, weather: false });
-    b.define('metal', M.metal, { uvScale: 1.4, ...CC, weather: false });
-    b.define('polymer', M.polymer, { uvScale: 1.0, ...CC, weather: false });
-    b.define('corrugated', M.corrugated, { uvScale: 1.8, ...CC, weather: false });
-    b.define('sandbagM', M.sandbag, { uvScale: 1.2, ...CC, weather: false });
-    b.define('awning', M.awning, { uvScale: 0.6, ...CC, weather: false });
-    b.define('awningRed', M.awningRed, { uvScale: 0.6, ...CC, weather: false });
-    b.define('carpaint', M.carPaintA, { uvScale: 1.4, ...CC, weather: false });
-    b.define('carpaintB', M.carPaintB, { uvScale: 1.4, ...CC, weather: false });
-    // Structural steel that reads as a bar against the sky: stair stringers,
-    // roof plant frames, gates, balcony rails on a skyline.
-    b.define('ironwork', M.ironwork, { uvScale: 1.4, ...CC, weather: false });
+    b.define('timber', M.timber, { uvScale: 2.2, ...LIT, weather: false });
+    b.define('metal', M.metal, { uvScale: 1.4, ...LIT, weather: false });
+    b.define('polymer', M.polymer, { uvScale: 1.0, ...LIT, weather: false });
+    b.define('corrugated', M.corrugated, { uvScale: 1.8, ...LIT, weather: false });
+    b.define('sandbagM', M.sandbag, { uvScale: 1.2, ...LIT, weather: false });
+    b.define('awning', M.awning, { uvScale: 0.6, ...LIT, weather: false });
+    b.define('awningRed', M.awningRed, { uvScale: 0.6, ...LIT, weather: false });
+    b.define('carpaint', M.carPaintA, { uvScale: 1.4, ...LIT, weather: false });
+    b.define('carpaintB', M.carPaintB, { uvScale: 1.4, ...LIT, weather: false });
+    b.define('rug', M.rug, { uvScale: 0.6, ...LIT, weather: false });
 
     // --- detail that lives inside somebody else's shadow -------------------
-    // A shutter sits 100 mm back inside a reveal whose jamb, hood and sill are
-    // already casting over it; a glazing bar is 35 mm across, which is a third
-    // of a shadow-map texel at this cascade resolution, so all it can produce
-    // is a crawling dotted line.
-    b.define('shutter', M.shutter, { uvScale: 2.2, ...NC, weather: false });
-    b.define('ironThin', M.ironwork, { uvScale: 1.4, ...NC, weather: false });
-    b.define('glass', M.glass, { uvScale: 1.5, ...NC, weather: false });
-    b.define('tyre', M.rubber, { uvScale: 0.5, ...NC, weather: false });
-    b.define('rug', M.rug, { uvScale: 0.6, ...CC, weather: false });
-    b.define('sack', M.sack, { uvScale: 0.6, ...NC, weather: false });
-    b.define('chrome', M.chrome, { uvScale: 0.35, ...NC, weather: false });
-    b.define('signage', M.signage, { uvScale: 1.4, ...NC, weather: false });
-    b.define('emissive', M.emissive, { uvScale: 1.4, ...NC, weather: false });
+    // Receives, does not cast. A shutter sits 100 mm back inside a reveal whose
+    // jamb, hood and sill are already casting over it; a glazing bar is 35 mm
+    // across, a third of a shadow-map texel, so all it can produce is a
+    // crawling dotted line. But they are all in shade half the day, so they
+    // stay in the pass as receivers.
+    // Ironwork below the parapet line: downpipes, hoppers, gates, condenser
+    // brackets, the stair stringers in the yard. It stands on walls that shade
+    // it, so it receives; it is 35-110 mm in section, so it never casts.
+    b.define('ironwork', M.ironwork, { uvScale: 1.4, ...RECV, weather: false });
+    b.define('shutter', M.shutter, { uvScale: 2.2, ...RECV, weather: false });
+    b.define('glass', M.glass, { uvScale: 1.5, ...RECV, weather: false });
+    b.define('tyre', M.rubber, { uvScale: 0.5, ...RECV, weather: false });
+    b.define('sack', M.sack, { uvScale: 0.6, ...RECV, weather: false });
+    b.define('chrome', M.chrome, { uvScale: 0.35, ...RECV, weather: false });
+    b.define('signage', M.signage, { uvScale: 1.4, ...RECV, weather: false });
+    b.define('emissive', M.emissive, { uvScale: 1.4, ...RECV, weather: false });
 
-    // Backdrop masses: silhouette only. No shadow casting or receiving (they
-    // are outside every cascade anyway), and they keep the weather attribute
-    // purely so they share the exact same shader program as the compound
-    // rather than compiling three more.
-    const bg = { castShadow: false, receiveShadow: false, cells: false };
-    b.define('bgPale', M.plasterPale, { uvScale: 2.0, ...bg });
-    b.define('bgWarm', M.plasterWarm, { uvScale: 2.0, ...bg });
-    b.define('bgGrey', M.concrete, { uvScale: 2.4, ...bg });
+    // --- SKY: the roofline. Costs 1x. Spend here. --------------------------
+    // The test for admission is physical, not aesthetic: is there anything on
+    // this map that can come between this surface and the sun, and does its own
+    // shadow land anywhere a player stands? Above the parapet line the answer
+    // to both is no — the compound is uniformly 4-9 m and the sun is at
+    // campaign elevation — so these surfaces are in full sun in every frame
+    // they appear in, and a shadow term they can never use costs 4 extra
+    // submissions of every triangle.
+    //
+    // This is the budget the round spends. `roofline` is the parapet-top kit
+    // (vent stacks, chimney pots, aerials, water-tank stands, weather heads);
+    // `ironThin` carries every cable, aerial guy and roof railing on the map.
+    b.define('ironThin', M.ironwork, { uvScale: 1.4, ...SKY, weather: false });
+    b.define('roofline', M.concrete, { uvScale: 2.4, ...SKY });
+    b.define('rooflinePale', M.plasterPale, { uvScale: 2.0, ...SKY });
+    b.define('rooflineTin', M.corrugated, { uvScale: 1.8, ...SKY, weather: false });
+
+    // Backdrop masses: silhouette only, and outside every cascade anyway. They
+    // keep the weather attribute purely so they share the exact same shader
+    // program as the compound rather than compiling three more.
+    b.define('bgPale', M.plasterPale, { uvScale: 2.0, ...SKY });
+    b.define('bgWarm', M.plasterWarm, { uvScale: 2.0, ...SKY });
+    b.define('bgGrey', M.concrete, { uvScale: 2.4, ...SKY });
   }
 
   /**
@@ -456,11 +508,24 @@ export class LevelModule {
     i.define('crateWood', protoCrate(0.62), M.timber);
     i.define('crateMetal', protoCrate(0.70), M.metal);
     i.define('barrelBlue', protoBarrel(), M.polymer);
-    i.define('ac', protoAcUnit(), M.metal);
-    i.define('tank', protoWaterTank(), M.polymer);
-    // Rooftop dishes: 97 of them, and the only rooftop kind whose shadow is a
-    // 90 mm-deep drum edge-on to a low sun. Instanced, and not a caster.
-    i.define('dish', protoDish(), M.metal, { castShadow: false });
+
+    // ROOF-ONLY KINDS, AND THEY ARE `SKY`. 105 tanks, 83 condensers and 97
+    // dishes is 42k triangles that sit above every parapet on the map: nothing
+    // can shade them and their own shadows fall on decks no player stands on.
+    // Out of the shadow pass entirely, they cost 42k instead of 212k and 3
+    // draw calls instead of 15. This is the single largest line in the round.
+    // (Grep first if you ever place one of these at ground level — the flag is
+    // per kind, not per placement.)
+    const SKY_PROP = { castShadow: false, receiveShadow: false };
+    i.define('ac', protoAcUnit(), M.metal, SKY_PROP);
+    i.define('tank', protoWaterTank(), M.polymer, SKY_PROP);
+    i.define('dish', protoDish(), M.metal, SKY_PROP);
+    // Roof-deck crates and drums. Identical prototypes to the street kinds —
+    // same asset, same material — but a separate pool, because the flag that
+    // matters is per kind and these ones are on roofs. Two extra draw calls
+    // buys ~80 placements out of the shadow passes.
+    i.define('crateRoof', protoCrate(0.70), M.metal, SKY_PROP);
+    i.define('barrelRoof', protoBarrel(), M.polymer, SKY_PROP);
 
     // Merged: five to thirty placements apiece, so an InstancedMesh for each
     // was 40 draw calls' worth of shadow passes to save 54k triangles of
@@ -892,8 +957,8 @@ export class LevelModule {
     const land = this.batch.at('concrete', -36, 15);
     land.at(-36.4, 6.25, 15.0).box(7.4, 0.30, 4.2, 0.05, 1.5);
     this.proxy.extent(-40.1, 5.95, 12.9, -32.7, 6.4, 17.1);
-    railing(this.kit, { x0: -32.8, z0: 12.9, x1: -32.8, z1: 17.1, y: 6.4, height: 1.05 });
-    railing(this.kit, { x0: -40, z0: 17.1, x1: -32.8, z1: 17.1, y: 6.4, height: 1.05 });
+    railing(this.kit, { x0: -32.8, z0: 12.9, x1: -32.8, z1: 17.1, y: 6.4, height: 1.05, bucket: 'ironThin' });
+    railing(this.kit, { x0: -40, z0: 17.1, x1: -32.8, z1: 17.1, y: 6.4, height: 1.05, bucket: 'ironThin' });
 
     // Plank bridge, roof of W4 across the alley to the V row. Roof-to-roof
     // movement is what makes the alley worth holding from above.
@@ -904,8 +969,8 @@ export class LevelModule {
     bridge.at(-29.5, 6.18, 28.4).box(7.6, 0.16, 0.16, 0.03, 0);
     bridge.at(-29.5, 6.18, 30.1).box(7.6, 0.16, 0.16, 0.03, 0);
     this.proxy.extent(-33.2, 6.05, 28.2, -25.8, 6.35, 30.3);
-    railing(this.kit, { x0: -33.2, z0: 28.2, x1: -25.8, z1: 28.2, y: 6.35, height: 1.0, collide: false });
-    railing(this.kit, { x0: -33.2, z0: 30.3, x1: -25.8, z1: 30.3, y: 6.35, height: 1.0, collide: false });
+    railing(this.kit, { x0: -33.2, z0: 28.2, x1: -25.8, z1: 28.2, y: 6.35, height: 1.0, collide: false, bucket: 'ironThin' });
+    railing(this.kit, { x0: -33.2, z0: 30.3, x1: -25.8, z1: 30.3, y: 6.35, height: 1.0, collide: false, bucket: 'ironThin' });
   }
 
   _buildVRow() {
@@ -990,7 +1055,8 @@ export class LevelModule {
 
     roof(this.kit, {
       x0: x0 + 0.04, z0: z0 + 0.04, x1: x1 - 0.04, z1: z1 - 0.04,
-      y: H, bucket: 'concrete', trim: 'plasterPale', parapet: SCALE.parapet,
+      y: H, bucket: 'concrete', trim: 'plasterPale', capBucket: 'rooflinePale',
+      parapet: SCALE.parapet,
       parapetVary: 1, seed: 517,
     });
     this._roofSlots.push({ x0, z0, x1, z1, y: H, sides: 'nsew' });
@@ -1164,7 +1230,8 @@ export class LevelModule {
     const roofY = PY + H + 0.34 + 0.28;
     roof(this.kit, {
       x0: -X + 0.6, z0: -Z + 0.6, x1: X - 0.6, z1: Z - 0.6,
-      y: roofY, bucket: 'concrete', trim: 'plasterPale', parapet: 0.95,
+      y: roofY, bucket: 'concrete', trim: 'plasterPale', capBucket: 'rooflinePale',
+      parapet: 0.95,
       thickness: 0.30, sides: 'nsw',      // east side opens onto the roof stair
     });
     // Ceiling underside is timber joists — the player spends real time under it.
@@ -1183,7 +1250,7 @@ export class LevelModule {
     const land = this.batch.at('concrete', 10, 5.4);
     land.at(9.9, roofY - 0.14, 5.4).box(3.4, 0.28, 2.0, 0.05, 1.2);
     this.proxy.extent(8.2, roofY - 0.28, 4.4, 11.6, roofY, 6.4);
-    railing(this.kit, { x0: 11.6, z0: 6.4, x1: 8.2, z1: 6.4, y: roofY, height: 1.05 });
+    railing(this.kit, { x0: 11.6, z0: 6.4, x1: 8.2, z1: 6.4, y: roofY, height: 1.05, bucket: 'ironThin' });
     pillar(this.kit, { x: 11.2, z: 6.0, height: roofY - 0.28, size: 0.4, bucket: 'concrete' });
 
     // Hanging lamps between the columns.
@@ -1607,14 +1674,14 @@ export class LevelModule {
           this._prop('ac', x, s.y + (stand ? 0.62 : 0), z, yaw);
         } else if (pick < 0.78) {
           // Dishes go on a post so they stand at head height above the coping.
-          const post = this.batch.at('ironwork', x, z);
+          const post = this.batch.at('ironThin', x, z);
           post.at(x, s.y + 0.55, z).box(0.11, 1.1, 0.11, 0.02, 0);
           this._prop('dish', x, s.y + 1.1, z, yaw);
         } else if (pick < 0.90) {
-          this._prop('crateMetal', x, s.y, z, yaw);
-          if (r() < 0.5) this._prop('crateWood', x + 0.5, s.y, z + 0.3, yaw + 0.7);
+          this._prop('crateRoof', x, s.y, z, yaw);
+          if (r() < 0.5) this._prop('crateRoof', x + 0.5, s.y, z + 0.3, yaw + 0.7);
         } else {
-          this._prop('barrelBlue', x, s.y, z, yaw);
+          this._prop('barrelRoof', x, s.y, z, yaw);
         }
       }
 
@@ -1632,17 +1699,112 @@ export class LevelModule {
       // it is a building rather than a block.
       if (w * d > 90 && r() < 0.85) {
         const bx = cx + (r() - 0.5) * (w - 4), bz = cz + (r() - 0.5) * (d - 4);
-        const bl = this.batch.at('plasterPale', bx, bz);
+        const bl = this.batch.at('rooflinePale', bx, bz);
         bl.at(bx, s.y + 1.3, bz).box(2.2, 2.6, 2.6, 0.05, [3.2, 1.2]);
         bl.at(bx, s.y + 2.68, bz).box(2.5, 0.16, 2.9, 0.04, 0);
         bl.at(bx, s.y + 2.86, bz).box(2.1, 0.20, 2.5, 0.04, 0);
-        const dr = this.batch.at('shutter', bx, bz);
+        const dr = this.batch.at('rooflineTin', bx, bz);
         dr.at(bx, s.y + 1.05, bz - 1.32).box(0.95, 2.05, 0.09, 0.02, 0);
         this.proxy.box(bx, s.y + 1.3, bz, 2.2, 2.6, 2.6);
         // Vent stub off the bulkhead roof.
-        const vt = this.batch.at('ironwork', bx, bz);
+        const vt = this.batch.at('ironThin', bx, bz);
         vt.at(bx + 0.6, s.y + 3.25, bz).cyl(0.14, 0.14, 0.7, 8, 0.02);
         vt.at(bx + 0.6, s.y + 3.66, bz).cyl(0.22, 0.10, 0.16, 8, 0.02);
+      }
+
+      // ---- the roofline itself ------------------------------------------
+      // Everything from here down is in a `SKY` bucket, so it is submitted
+      // once per frame instead of five times. That is the whole reason this
+      // pass can afford to exist at the same time as a triangle budget: the
+      // round bought it by taking the parapet coping, the rooftop plant and
+      // every cable on the map out of the shadow passes, and spends it here,
+      // on the one line in the frame that is always against the sky.
+
+      // A masonry flue: tapered shaft, corbelled-out head, clay pots. Four
+      // stacked blocks that read as a chimney at 60 m and cost 100 triangles.
+      const flues = 1 + ((r() * 2.6) | 0);
+      for (let k = 0; k < flues; k++) {
+        const fx = cx + (r() - 0.5) * (w - 1.8), fz = cz + (r() - 0.5) * (d - 1.8);
+        const fh = 1.5 + r() * 1.4;
+        const fl = this.batch.at('roofline', fx, fz);
+        fl.at(fx, s.y + fh / 2, fz).box(0.62, fh, 0.52, 0.03, 0, FACE_ALL, FACE_NY);
+        fl.at(fx, s.y + fh + 0.09, fz).box(0.80, 0.18, 0.70, 0.03, 0);
+        fl.at(fx, s.y + fh + 0.24, fz).box(0.66, 0.14, 0.58, 0.025, 0);
+        const pots = 1 + ((r() * 2) | 0);
+        for (let q = 0; q < pots; q++) {
+          const ox = (q - (pots - 1) / 2) * 0.24;
+          fl.at(fx + ox, s.y + fh + 0.52, fz).cyl(0.09, 0.10, 0.42, 7, 0.015, false, false);
+        }
+        this.proxy.box(fx, s.y + fh / 2, fz, 0.62, fh, 0.52);
+      }
+
+      // A corrugated lean-to over one corner of the deck: the strongest single
+      // silhouette break available, because its roof is the only sloped plane
+      // on a compound made entirely of flat ones.
+      if (w * d > 70 && r() < 0.85) {
+        const sw = 2.6 + r() * 1.4, sd = 2.0 + r() * 0.8;
+        const corner = (r() * 4) | 0;
+        const sx = corner < 2 ? s.x0 + sw / 2 + 0.5 : s.x1 - sw / 2 - 0.5;
+        const sz = (corner & 1) ? s.z0 + sd / 2 + 0.5 : s.z1 - sd / 2 - 0.5;
+        const hi = 2.3 + r() * 0.5, lo = hi - 0.55 - r() * 0.35;
+        const tin = this.batch.at('rooflineTin', sx, sz);
+        const post = this.batch.at('ironThin', sx, sz);
+        for (const ax2 of [-1, 1]) {
+          for (const az2 of [-1, 1]) {
+            const ph = az2 < 0 ? hi : lo;
+            post.at(sx + ax2 * (sw / 2 - 0.06), s.y + ph / 2, sz + az2 * (sd / 2 - 0.06))
+              .box(0.09, ph, 0.09, 0.018, 0);
+          }
+        }
+        // The sheet, pitched across Z. One quad plus a ridge capping and a
+        // fascia lip, so the edge reads as folded metal rather than paper.
+        tin.identity().quad(
+          [sx - sw / 2, s.y + hi, sz - sd / 2], [sx + sw / 2, s.y + hi, sz - sd / 2],
+          [sx + sw / 2, s.y + lo, sz + sd / 2], [sx - sw / 2, s.y + lo, sz + sd / 2],
+          [sw / 3, sd],
+        );
+        tin.at(sx, s.y + hi + 0.05, sz - sd / 2).box(sw + 0.22, 0.10, 0.20, 0.02, 0);
+        tin.at(sx, s.y + lo - 0.04, sz + sd / 2 + 0.02).box(sw + 0.22, 0.12, 0.08, 0.02, 0);
+        // Two sides sheeted, two open — an open bay is what makes it a shelter.
+        tin.at(sx - sw / 2 - 0.02, s.y + (hi + lo) / 4 + 0.1, sz)
+          .box(0.06, (hi + lo) / 2, sd, 0.015, 0);
+        this.proxy.box(sx, s.y + hi / 2, sz, sw, hi, sd);
+      }
+
+      // Corner blocks. A parapet whose run is broken into bays still turns its
+      // corners with a single mitre, and a mitre is invisible from the street —
+      // it is the one place the outline reads as an extruded rectangle. A
+      // taller block on each corner, stepped twice, is what makes the four
+      // elevations look like they belong to a building rather than a box.
+      {
+        const cap = this.batch.at('rooflinePale', cx, cz);
+        for (const ox of [s.x0, s.x1]) {
+          for (const oz of [s.z0, s.z1]) {
+            const ch = 1.62 + ((Math.abs(ox * 3 + oz * 7) | 0) % 5) * 0.11;
+            // Full six faces: the block straddles the roof corner and oversails
+            // the deck edge, so its underside is on the street's sightline.
+            cap.at(ox, s.y + ch / 2, oz).box(0.62, ch, 0.62, 0.04, 0);
+            cap.at(ox, s.y + ch + 0.07, oz).box(0.80, 0.14, 0.80, 0.03, 0);
+            cap.at(ox, s.y + ch + 0.20, oz).box(0.54, 0.14, 0.54, 0.03, 0);
+          }
+        }
+      }
+
+      // A ladder hooked over the parapet, and a stack of spare sheeting leaning
+      // on it. Both cross the parapet line, which is the point.
+      if (r() < 0.5) {
+        const side = (r() * 2) | 0;
+        const lz = side ? s.z0 + 0.34 : s.z1 - 0.34;
+        const lx = s.x0 + 1.5 + r() * Math.max(0.1, w - 3);
+        const ld = this.batch.at('ironThin', lx, lz);
+        const top = s.y + 1.55;
+        for (const sx2 of [-0.21, 0.21]) {
+          ld.at(lx + sx2, s.y + 0.72, lz, 0, 0.13).box(0.05, 2.1, 0.05, 0.012, 0);
+        }
+        for (let q = 0; q < 6; q++) {
+          ld.at(lx, s.y + 0.06 + q * 0.31, lz + (q * 0.31 - 0.8) * 0.13).box(0.46, 0.035, 0.035, 0.01, 0);
+        }
+        void top;
       }
 
       // Aerial masts: cheap, tall, and they break the parapet line. Two or
@@ -1651,7 +1813,7 @@ export class LevelModule {
       for (let k = 0; k < masts; k++) {
         if (r() > 0.75) continue;
         const mx = cx + (r() - 0.5) * (w - 2), mz = cz + (r() - 0.5) * (d - 2);
-        const m = this.batch.at('ironwork', mx, mz);
+        const m = this.batch.at('ironThin', mx, mz);
         const hh = 2.6 + r() * 3.2;
         m.at(mx, s.y + hh / 2, mz).cyl(0.05, 0.025, hh, 6, 0.01);
         for (let j = 0; j < 3; j++) {
@@ -1674,7 +1836,7 @@ export class LevelModule {
           x0: s.x0 + 0.9, z0: t0, x1: s.x1 - 0.9, z1: t0 + (r() - 0.5) * 2,
           y: s.y + 2.1, clear: s.y + 0.9, count: 2 + ((r() * 3) | 0),
           width: 1.0, sag: 0.22, seed: 300 + (t0 | 0), bucket: r() < 0.5 ? 'awning' : 'rug',
-          posts: true, postBase: s.y, postBucket: 'ironwork', collide: false,
+          posts: true, postBase: s.y, postBucket: 'ironThin', collide: false,
         });
       }
     }
@@ -1690,7 +1852,7 @@ export class LevelModule {
 
   /** Steel sleeper frame that lifts roof plant clear of the parapet coping. */
   _roofStand(x, y, z, w, d, h, ry = 0) {
-    const b = this.batch.at('ironwork', x, z);
+    const b = this.batch.at('ironThin', x, z);
     b.at(x, y + h - 0.05, z, ry).box(w, 0.10, d, 0.02, 0);
     for (const sx of [-1, 1]) {
       for (const sz of [-1, 1]) {
@@ -1963,7 +2125,13 @@ export class LevelModule {
     const pl = this.batch.at('brick', 21, 41);
     pl.at(21.0, 0.20, 41.0).box(7.6, 0.40, 5.6, 0.05, 1.6);
     this.proxy.extent(17.2, 0, 38.2, 24.8, 0.40, 43.8);
-    this.root.add(this.foliage.flush());
+    const fol = this.foliage.flush();
+    this.root.add(fol);
+    // The palms and scrub are InstancedMeshes the Foliage kit owns, but they
+    // are level geometry and they cast and receive like everything else. They
+    // used to be missing from the ledger, which under-reported the level by
+    // three meshes and fifteen shadow draws.
+    this._foliageMeshes = fol.children.filter((c) => c.isMesh);
   }
 
   /* ---------------------------------------------------------- lighting -- */
@@ -2039,7 +2207,7 @@ export class LevelModule {
     engine.get('collision').build(collider);
     this.collider = collider;
 
-    this.stats = this._budget([...meshes, ...instMeshes]);
+    this.stats = this._budget([...meshes, ...instMeshes, ...(this._foliageMeshes || [])]);
     this._reportBudget();
   }
 
@@ -2048,15 +2216,38 @@ export class LevelModule {
    *
    * The only number that matters for the frame is not the scene's triangle
    * count — it is what the renderer actually submits, which is the camera pass
-   * plus one pass per shadow cascade for everything that casts. That is what
-   * `renderer.info` reports and what the screenshot harness writes into its
-   * manifest, so it is what this models. Anything that fixes a budget by
-   * looking at the scene count alone is optimising the wrong number by 4x.
+   * plus one pass per shadow cascade. That is what `renderer.info` reports and
+   * what the screenshot harness writes into its manifest.
+   *
+   * ROUND 3 — WHAT ACTUALLY DRIVES THE MULTIPLIER. This ledger used to charge
+   * the cascade multiplier to `castShadow`, and that is not the rule this
+   * renderer runs under. `RenderModule` selects `THREE.VSMShadowMap`, and
+   * `WebGLShadowMap.renderObject` reads:
+   *
+   *     if ( object.castShadow || ( object.receiveShadow && type === VSMShadowMap ) )
+   *
+   * so under VSM a mesh is rendered into EVERY cascade if it casts *or*
+   * receives — and `receiveShadow` defaults to true on every bucket, because a
+   * surface that does not receive cannot be shadowed by anything. The whole map
+   * was therefore being submitted 1 + 4 times regardless of its cast flags, and
+   * turning casting off on a bucket bought exactly nothing.
+   *
+   * The model checks out against the harness to under 1%:
+   *
+   *   round 1  424k unique x 5                       = 2,122k   (manifest 2,122k)
+   *   round 2  (607k - 31k backdrop) x 5 + 31k       = 2,914k   (manifest 2,939k)
+   *
+   * Two consequences drive every decision below. First, cutting triangles is
+   * worth 5x, not 1x. Second — and this is where the map gets *better* rather
+   * than thinner — geometry that neither casts nor receives costs 1x, so
+   * anything that lives against the sky (rooflines, aerials, cables, rooftop
+   * plant, thin steel) can carry five times the detail of anything sitting on a
+   * wall. See `SKY` in `_defineBuckets`.
    */
   _budget(meshes) {
     const cascades = Config.gfx.shadowCascades ?? 4;
     const rows = [];
-    let tris = 0, castTris = 0, casters = 0, instTris = 0;
+    let tris = 0, shadowTris = 0, shadowMeshes = 0, instTris = 0;
     for (const m of meshes) {
       const g = m.geometry;
       const proto = (g.index ? g.index.count : g.getAttribute('position').count) / 3;
@@ -2064,8 +2255,14 @@ export class LevelModule {
       const n = proto * count;
       tris += n;
       if (m.isInstancedMesh) instTris += n;
-      if (m.castShadow) { castTris += n; casters++; }
-      rows.push({ name: m.name, tris: n, proto, count, cast: !!m.castShadow });
+      // THE RULE — see the note above `_budget`. Under VSM a mesh enters every
+      // cascade if it casts OR receives.
+      const inShadowPass = !!(m.castShadow || m.receiveShadow);
+      if (inShadowPass) { shadowTris += n; shadowMeshes++; }
+      rows.push({
+        name: m.name, tris: n, proto, count,
+        cast: !!m.castShadow, recv: !!m.receiveShadow, pass: inShadowPass,
+      });
     }
     rows.sort((a, b) => b.tris - a.tris);
     return {
@@ -2075,10 +2272,10 @@ export class LevelModule {
       tris: Math.round(tris),
       instancedMeshes: meshes.filter((m) => m.isInstancedMesh).length,
       instancedTris: Math.round(instTris),
-      casters,
-      castTris: Math.round(castTris),
-      submittedTris: Math.round(tris + castTris * cascades),
-      submittedDraws: meshes.length + casters * cascades,
+      casters: shadowMeshes,
+      castTris: Math.round(shadowTris),
+      submittedTris: Math.round(tris + shadowTris * cascades),
+      submittedDraws: meshes.length + shadowMeshes * cascades,
       collisionTris: this.proxy.triangleCount,
       fixtures: this._lights.length,
     };
@@ -2096,18 +2293,26 @@ export class LevelModule {
     const pad = (v, n) => String(v).padStart(n);
     const lines = [
       `[Level] Suq al-Hadid budget — ${s.meshes} meshes / ${(s.tris / 1000).toFixed(0)}k tris`,
-      `        ${s.casters} of them cast, carrying ${(s.castTris / 1000).toFixed(0)}k tris`,
+      `        ${s.casters} meshes enter the shadow passes (cast OR receive, VSM),`
+        + ` carrying ${(s.castTris / 1000).toFixed(0)}k tris at ${1 + s.cascades}x`,
+      `        ${s.meshes - s.casters} are SKY (neither), carrying `
+        + `${((s.tris - s.castTris) / 1000).toFixed(0)}k tris at 1x`,
       `        submitted at ${s.cascades} cascades: `
         + `${(s.submittedTris / 1000).toFixed(0)}k tris / ${s.submittedDraws} draws`,
+      `        NOTE: ${(s.castTris * s.cascades / 1000).toFixed(0)}k of that is the shadow`
+        + ' passes. Under VSM a receiver is drawn into every cascade even when it'
+        + ' never casts; switching RenderModule off VSMShadowMap, or dropping'
+        + ' Config.gfx.shadowCascades, is worth more than any geometry left here.',
       `        collision proxy ${s.collisionTris} tris, ${s.fixtures} fixtures`,
       '        ---- top 20 by submitted triangles ----',
     ];
     const ranked = s.rows.slice().sort(
-      (a, b) => (b.tris * (b.cast ? 1 + s.cascades : 1)) - (a.tris * (a.cast ? 1 + s.cascades : 1)),
+      (a, b) => (b.tris * (b.pass ? 1 + s.cascades : 1)) - (a.tris * (a.pass ? 1 + s.cascades : 1)),
     );
     for (const r of ranked.slice(0, 20)) {
-      const mult = r.cast ? 1 + s.cascades : 1;
-      lines.push(`        ${pad(Math.round(r.tris * mult), 8)}  ${r.cast ? 'cast' : '    '}  `
+      const mult = r.pass ? 1 + s.cascades : 1;
+      const tag = r.pass ? `x${mult} ${r.cast ? 'c' : '-'}${r.recv ? 'r' : '-'}` : ' x1 sky';
+      lines.push(`        ${pad(Math.round(r.tris * mult), 8)}  ${tag}  `
         + `${pad(Math.round(r.tris), 7)}${r.count > 1 ? ` x${r.count}` : ''}  ${r.name}`);
     }
     console.info(lines.join('\n'));

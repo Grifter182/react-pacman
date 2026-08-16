@@ -345,10 +345,20 @@ export function makeMaterial(preset, opts = {}) {
       detail,
       detailScale,
       detailStrength: opts.detailStrength ?? recipe.detailStrength ?? 0.5,
+      detailAlbedo: opts.detailAlbedo ?? recipe.detailAlbedo ?? 0.55,
       detailFade: opts.detailFade || [8, 26],
       macro: opts.macro ?? recipe.macro ?? 0,
-      macroPeriod: opts.macroPeriod ?? 7,
+      macroPeriod: opts.macroPeriod ?? recipe.macroPeriod ?? 9,
       macroPeriodLow: opts.macroPeriodLow ?? 30,
+      macroHue: opts.macroHue ?? recipe.macroHue ?? 0.40,
+      // Opt-in, and only recipes with no straight lines in them ask for it.
+      warpTiles: opts.warpTiles ?? recipe.warpTiles ?? 0,
+      // The phase key decorrelates one material's macro field from every
+      // other's. It must include the tint, because two materials that share a
+      // bake and differ only by `color` are two visually distinct surfaces and
+      // wearing the same blobs in the same places is exactly what gives the
+      // modular kit away.
+      phaseKey: key,
       triplanar,
       worldScale,
       triSharp: opts.triSharp ?? 6,

@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { Config, QualityTier } from '../core/Config.js';
 import { makeMaterial } from '../materials/TextureFactory.js';
 import { Kit, loft, roundRect, chamferBox, cyl } from './GunGeo.js';
+import { VIEWMODEL_AO, VIEWMODEL_MAGNIFY } from './Gunsmith.js';
 
 /**
  * OWNER: weapons agent.
@@ -31,10 +32,32 @@ import { Kit, loft, roundRect, chamferBox, cyl } from './GunGeo.js';
 
 const GLOVE = 0, SLEEVE = 1, PAD = 2;
 
+/**
+ * The hands sit closer to the camera than any part of the weapon and they take
+ * up more of the hip-fire frame than the receiver does, so they get the same
+ * two viewmodel corrections the gunsmith applies to the gun — and for the same
+ * measured reason. See `VIEWMODEL_AO` in Gunsmith.js: the recipes bake an
+ * ambient-occlusion channel off a micro height field, `ambientOcclusion`
+ * multiplies indirect diffuse, and on a surface this close that reads as a
+ * printed camouflage pattern rather than as dirt in the creases. Fixing the gun
+ * and leaving the gloves camouflaged would have moved the defect, not removed
+ * it: they are the same defect and they share the constant that names it.
+ *
+ * `repeat` is scaled less aggressively here than on the gun. A glove and a
+ * canvas sleeve genuinely do have a coarser weave than a machined receiver has
+ * grain, and the arms Kit already projects at a tighter tile (0.22 m against
+ * the body's 0.35 m), so part of the correction is paid for by the projection.
+ */
 export function armMaterials() {
-  const glove = makeMaterial('rubber', { seed: 71, size: 512, detailStrength: 0.55 });
-  const sleeve = makeMaterial('canvas', { seed: 33, size: 512, repeat: 2 });
-  const pad = makeMaterial('polymer', { seed: 88, size: 256 });
+  const AO = { aoMapIntensity: VIEWMODEL_AO };
+  const M = VIEWMODEL_MAGNIFY * 0.7;
+  const glove = makeMaterial('rubber', {
+    seed: 71, size: 512, detailStrength: 0.55, repeat: M, material: AO,
+  });
+  const sleeve = makeMaterial('canvas', {
+    seed: 33, size: 512, repeat: 2 * M, material: AO,
+  });
+  const pad = makeMaterial('polymer', { seed: 88, size: 256, repeat: M, material: AO });
   return [glove, sleeve, pad];
 }
 

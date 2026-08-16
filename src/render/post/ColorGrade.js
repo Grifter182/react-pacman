@@ -14,6 +14,7 @@ import { GradeShared } from './GradeShared.js';
  * Order matters and is not negotiable:
  *
  *   chromatic aberration  (a lens property: it must sample the *scene*)
+ *   aerial-perspective recovery                (see below)
  *   + bloom + anamorphic streak + lens dirt   (light scattered in the lens)
  *   x auto exposure                            (sensor sensitivity)
  *   -> ACES filmic tonemap                     (sensor response)
@@ -36,6 +37,34 @@ import { GradeShared } from './GradeShared.js';
  * lookup is therefore display-referred, including the grain and the vignette,
  * which is where both of them belong physically anyway.
  *
+ * AERIAL-PERSPECTIVE RECOVERY
+ * ---------------------------
+ * The atmosphere pass mixes every fragment toward the sky's inscatter colour:
+ * `c' = c*T + I*(1-T)`. That is the correct physics and it is also, exactly, a
+ * low-pass filter applied to the two things the eye uses to tell one material
+ * from another — local contrast and chroma are BOTH multiplied by T, while the
+ * mean level is dragged toward I. Past about 40 m on this map T is low enough
+ * that a brick facade, a plaster facade and a corrugated roof arrive at the
+ * same flat tan, so the midground and the background stop being separate
+ * planes and become one wash.
+ *
+ * The fix is not less fog. Less fog removes the depth cue as well. What this
+ * does instead is put back the AC component and the chroma in proportion to how
+ * much haze a pixel is behind, and leave the *mean* exactly where the fog put
+ * it. The distance cue (things get lighter, bluer and lower-contrast with
+ * range) survives in full; what comes back is material identity.
+ *
+ * It runs in linear light before bloom, because it is conceptually a partial
+ * inverse of an extinction that also happened in linear light, and because
+ * sharpening the bloom would be a lens artefact sharpening itself. Sky
+ * fragments (depth == 1) are excluded — the sky IS the inscatter reference and
+ * there is nothing behind it to recover.
+ *
+ * The radius is deliberately wider than the sharpen pass at the end of the
+ * chain: this works the 2-3 px band where a distant window reveal or a course
+ * of brick lives, the sharpen works the 1 px acutance band, and they do not
+ * fight.
+ *
  * There is no unconditional lift in this pass. The previous build added
  * (0.004, 0.008, 0.018) on top of a LUT that was itself lifting, and the two
  * together put the floor of every frame at RGB(32,56,74). If a look ever needs
@@ -48,6 +77,21 @@ export class ColorGrade {
     this.streakIntensity = 0.05;
     this.dirtIntensity = 1.6;
     this.chromatic = 0.0022;
+    /**
+     * Aerial-perspective recovery. See the class comment.
+     *   near/far  metres over which the recovery ramps in. Nothing inside 22 m
+     *             is touched — that geometry is not hazed and does not need it.
+     *   contrast  gain on the recovered local (2-3 px) detail at full range.
+     *   chroma    saturation gain at full range, which is what puts material
+     *             identity back into a distant wall.
+     *   radius    high-pass radius in pixels at 1080p-ish; kept clear of the
+     *             sharpen pass's 1 px band.
+     */
+    this.aerialNear = 22.0;
+    this.aerialFar = 105.0;
+    this.aerialContrast = 0.62;
+    this.aerialChroma = 0.34;
+    this.aerialRadius = 2.4;
     /**
      * Grain was 0.030 across the whole midtone range, which on an image that
      * had no real detail in it read as compression noise rather than as film
@@ -77,6 +121,12 @@ export class ColorGrade {
       tDirt: { value: dirt },
       tLut: { value: lut },
       tAdapt: { value: null },
+      tDepth: { value: null },
+      uInvProj: { value: new THREE.Matrix4() },
+      uHasDepth: { value: 0 },
+      uAerial: { value: new THREE.Vector4(
+        this.aerialNear, this.aerialFar, this.aerialContrast, this.aerialChroma) },
+      uAerialRadius: { value: this.aerialRadius },
       uLutSize: { value: lutSize },
       uTexel: { value: new THREE.Vector2() },
       uKeyValue: { value: GradeShared.keyValue },
@@ -107,6 +157,17 @@ export class ColorGrade {
     u.tBloom.value = bloomTexture || ctx.blackTexture;
     u.tStreak.value = streakTexture || ctx.blackTexture;
     u.tAdapt.value = ctx.adaptTexture || ctx.blackTexture;
+    // The prepass is optional; without it there is no depth and the recovery
+    // simply does not run, rather than running against a 1x1 black texture.
+    const depth = ctx.depthTexture;
+    const hasDepth = !!depth && depth !== ctx.blackTexture;
+    u.tDepth.value = depth || ctx.blackTexture;
+    u.uHasDepth.value = hasDepth ? 1 : 0;
+    if (hasDepth) u.uInvProj.value.copy(ctx.invProj);
+    u.uAerial.value.set(
+      this.aerialNear, Math.max(this.aerialNear + 1, this.aerialFar),
+      this.aerialContrast, this.aerialChroma);
+    u.uAerialRadius.value = this.aerialRadius;
     u.uHasBloom.value = bloomTexture ? 1 : 0;
     u.uHasAdapt.value = ctx.adaptTexture ? 1 : 0;
     u.uStaticExposure.value = ctx.staticExposure;
@@ -136,6 +197,11 @@ uniform sampler2D tBloom;
 uniform sampler2D tStreak;
 uniform sampler2D tDirt;
 uniform sampler2D tAdapt;
+uniform sampler2D tDepth;
+uniform mat4 uInvProj;
+uniform int uHasDepth;
+uniform vec4 uAerial;        // x near m, y far m, z contrast gain, w chroma gain
+uniform float uAerialRadius; // px
 uniform highp sampler3D tLut;
 uniform float uLutSize;
 uniform vec2 uTexel;
@@ -199,6 +265,30 @@ void main(){
     colour = texture(tColor, uv).rgb;
   }
   colour = max(colour, vec3(0.0));
+
+  // --- aerial-perspective recovery -----------------------------------------
+  // Put back the local contrast and the chroma the fog's mix scaled away,
+  // in proportion to range, without touching the mean level the fog set. The
+  // sky (depth == 1) is the inscatter reference and is left alone.
+  if (uHasDepth == 1) {
+    float d = texture(tDepth, uv).x;
+    if (d < 1.0) {
+      float dist = -viewFromDepth(uv, d, uInvProj).z;
+      float aerial = smoothstep(uAerial.x, uAerial.y, dist);
+      if (aerial > 0.002) {
+        vec2 r = uTexel * uAerialRadius;
+        // Diagonal 4-tap: one bilinear box per corner, no axis bias, and it
+        // costs four samples instead of the nine a separable blur would.
+        vec3 lo = ( texture(tColor, uv + vec2( r.x,  r.y)).rgb
+                  + texture(tColor, uv + vec2(-r.x,  r.y)).rgb
+                  + texture(tColor, uv + vec2( r.x, -r.y)).rgb
+                  + texture(tColor, uv + vec2(-r.x, -r.y)).rgb ) * 0.25;
+        colour = max(colour + (colour - max(lo, vec3(0.0))) * (uAerial.z * aerial), vec3(0.0));
+        float lu = luma(colour);
+        colour = max(mix(vec3(lu), colour, 1.0 + uAerial.w * aerial), vec3(0.0));
+      }
+    }
+  }
 
   // --- lens scatter ---------------------------------------------------------
   if (uHasBloom == 1) {

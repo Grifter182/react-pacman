@@ -353,8 +353,17 @@ export class GeoBuilder {
    * never weathered and usually never seen — carried 288 triangles of gradient
    * resolution, twice over, per roof. Same for the backdrop masses, whose four
    * hidden sides cost more than their visible two.
+   *
+   * `omit` is the same bitmask again, but it removes the face entirely rather
+   * than de-tessellating it. Most of this map's buildings are `interior: false`
+   * closed shells: the player cannot get inside them, so the *inner* leaf of
+   * every one of their walls, and the underside of every one of their wall
+   * segments, is geometry that is never rasterised from any reachable camera
+   * position — and under VSM it was being submitted five times a frame. It is
+   * only ever safe where the solid is genuinely sealed against the world, so
+   * `wall()` asks for it explicitly and no default uses it.
    */
-  box(w, h, d, c = 0.02, grid = 0, gridFaces = FACE_ALL) {
+  box(w, h, d, c = 0.02, grid = 0, gridFaces = FACE_ALL, omit = 0) {
     const hx = w * 0.5, hy = h * 0.5, hz = d * 0.5;
     let cc = Math.min(c, hx * 0.9, hy * 0.9, hz * 0.9);
     // Chamfer LOD — see MIN_CHAMFER. Small parts fall back to a plain solid,
@@ -363,30 +372,39 @@ export class GeoBuilder {
     const ax = hx - cc, ay = hy - cc, az = hz - cc;
     const O = [0, 0, 0];
     const g = (bit) => ((gridFaces & bit) ? grid : 0);
+    const on = (bit) => (omit & bit) === 0;
 
     // Six main faces, inset by the chamfer on all four sides.
-    this.quad([hx, -ay, -az], [hx, -ay, az], [hx, ay, az], [hx, ay, -az], g(FACE_PX));
-    this.quad([-hx, -ay, az], [-hx, -ay, -az], [-hx, ay, -az], [-hx, ay, az], g(FACE_NX));
-    this.quad([-ax, hy, az], [ax, hy, az], [ax, hy, -az], [-ax, hy, -az], g(FACE_PY));
-    this.quad([-ax, -hy, -az], [ax, -hy, -az], [ax, -hy, az], [-ax, -hy, az], g(FACE_NY));
-    this.quad([-ax, -ay, hz], [ax, -ay, hz], [ax, ay, hz], [-ax, ay, hz], g(FACE_PZ));
-    this.quad([ax, -ay, -hz], [-ax, -ay, -hz], [-ax, ay, -hz], [ax, ay, -hz], g(FACE_NZ));
+    if (on(FACE_PX)) this.quad([hx, -ay, -az], [hx, -ay, az], [hx, ay, az], [hx, ay, -az], g(FACE_PX));
+    if (on(FACE_NX)) this.quad([-hx, -ay, az], [-hx, -ay, -az], [-hx, ay, -az], [-hx, ay, az], g(FACE_NX));
+    if (on(FACE_PY)) this.quad([-ax, hy, az], [ax, hy, az], [ax, hy, -az], [-ax, hy, -az], g(FACE_PY));
+    if (on(FACE_NY)) this.quad([-ax, -hy, -az], [ax, -hy, -az], [ax, -hy, az], [-ax, -hy, az], g(FACE_NY));
+    if (on(FACE_PZ)) this.quad([-ax, -ay, hz], [ax, -ay, hz], [ax, ay, hz], [-ax, ay, hz], g(FACE_PZ));
+    if (on(FACE_NZ)) this.quad([ax, -ay, -hz], [-ax, -ay, -hz], [-ax, ay, -hz], [ax, ay, -hz], g(FACE_NZ));
 
     if (cc <= 1e-4) return this;
 
-    // Twelve edge bevels.
+    // Twelve edge bevels. A bevel is dropped only when BOTH the faces it joins
+    // were dropped — a bevel next to one surviving face is still on the
+    // silhouette from somewhere.
+    const FX = (s) => (s > 0 ? FACE_PX : FACE_NX);
+    const FY = (s) => (s > 0 ? FACE_PY : FACE_NY);
+    const FZ = (s) => (s > 0 ? FACE_PZ : FACE_NZ);
     for (let sy = -1; sy <= 1; sy += 2) {
       for (let sx = -1; sx <= 1; sx += 2) {
+        if (!on(FX(sx)) && !on(FY(sy))) continue;
         this.poly([sx * hx, sy * ay, -az, sx * hx, sy * ay, az,
           sx * ax, sy * hy, az, sx * ax, sy * hy, -az], O);
       }
       for (let sz = -1; sz <= 1; sz += 2) {
+        if (!on(FZ(sz)) && !on(FY(sy))) continue;
         this.poly([-ax, sy * ay, sz * hz, ax, sy * ay, sz * hz,
           ax, sy * hy, sz * az, -ax, sy * hy, sz * az], O);
       }
     }
     for (let sx = -1; sx <= 1; sx += 2) {
       for (let sz = -1; sz <= 1; sz += 2) {
+        if (!on(FX(sx)) && !on(FZ(sz))) continue;
         this.poly([sx * hx, -ay, sz * az, sx * hx, ay, sz * az,
           sx * ax, ay, sz * hz, sx * ax, -ay, sz * hz], O);
       }
@@ -395,6 +413,7 @@ export class GeoBuilder {
     for (let sx = -1; sx <= 1; sx += 2) {
       for (let sy = -1; sy <= 1; sy += 2) {
         for (let sz = -1; sz <= 1; sz += 2) {
+          if (!on(FX(sx)) && !on(FY(sy)) && !on(FZ(sz))) continue;
           this.poly([sx * hx, sy * ay, sz * az, sx * ax, sy * hy, sz * az,
             sx * ax, sy * ay, sz * hz], O);
         }

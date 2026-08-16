@@ -1,5 +1,8 @@
 import * as THREE from 'three';
-import { groundGrime, clamp01, lerp, FACE_TOP, FACE_SIDES } from './Geo.js';
+import {
+  groundGrime, clamp01, lerp,
+  FACE_TOP, FACE_SIDES, FACE_ALL, FACE_NZ, FACE_PX, FACE_NX, FACE_NY,
+} from './Geo.js';
 
 /**
  * OWNER: level-art agent.
@@ -110,6 +113,9 @@ function wallWeather(frameInv, openings, height, opts = {}) {
  *   cornice      height of the crowning band, 0 to omit
  *   collide      emit collision proxies (default true)
  *   grid         face tessellation for weathering (default 0.8 m)
+ *   sealed       this wall encloses a void the player cannot reach, so its
+ *                inner leaf is de-tessellated and its underside removed. Set
+ *                automatically by `building({ interior: false })`.
  */
 export function wall(kit, o) {
   const { batch, proxy } = kit;
@@ -139,9 +145,24 @@ export function wall(kit, o) {
   // vertically. On this map that is 48k triangles of pure redundancy removed.
   const gridA = grid > 0 ? [grid * 3, grid] : 0;
 
+  // SEALED SHELLS. `building({ interior: false })` closes the shell with one
+  // collision box and there is no way in, so the +Z leaf of every segment of
+  // this wall is a surface no reachable camera resolves. Deleting it outright
+  // was tried and reverted: a doorway has no fill, and a 30 mm slot runs round
+  // every shutter, so a missing inner leaf shows as a backface-culled slit
+  // straight through the building. What is safe is to stop *tessellating* it —
+  // the weathering field is authored for the elevation, and on a sealed block
+  // the inner leaf was carrying the same five-row gradient as the outer one for
+  // nobody. Grid on the exterior and the two returns only, one quad inside.
+  //
+  // The underside of a wall segment is a different matter: it is on the ground
+  // plane, under the plinth, on every wall in the kit. That one comes out.
+  const gridSides = o.sealed ? (FACE_NZ | FACE_PX | FACE_NX) : FACE_SIDES;
+  const hidden = FACE_NY;
+
   b.withWeather(weather, () => {
     if (!openings.length) {
-      b.at(0, H / 2, 0).box(L, H, T, chamfer, gridA, FACE_SIDES);
+      b.at(0, H / 2, 0).box(L, H, T, chamfer, gridA, gridSides, hidden);
     } else {
       // Sort openings and walk the run: pier, opening (with lintel above and
       // apron below), pier, ... The pier side faces double as the reveals.
@@ -153,17 +174,17 @@ export function wall(kit, o) {
         const head = sill + k.h;
         if (l - cursor > 0.02) {
           const w = l - cursor;
-          b.at(cursor + w / 2, H / 2, 0).box(w, H, T, chamfer, gridA, FACE_SIDES);
+          b.at(cursor + w / 2, H / 2, 0).box(w, H, T, chamfer, gridA, gridSides, hidden);
         }
-        if (sill > 0.02) b.at(k.x, sill / 2, 0).box(k.w, sill, T, chamfer, gridA, FACE_SIDES);
+        if (sill > 0.02) b.at(k.x, sill / 2, 0).box(k.w, sill, T, chamfer, gridA, gridSides, FACE_NY);
         if (H - head > 0.02) {
-          b.at(k.x, (head + H) / 2, 0).box(k.w, H - head, T, chamfer, gridA, FACE_SIDES);
+          b.at(k.x, (head + H) / 2, 0).box(k.w, H - head, T, chamfer, gridA, gridSides);
         }
         cursor = r;
       }
       if (L / 2 - cursor > 0.02) {
         const w = L / 2 - cursor;
-        b.at(cursor + w / 2, H / 2, 0).box(w, H, T, chamfer, gridA, FACE_SIDES);
+        b.at(cursor + w / 2, H / 2, 0).box(w, H, T, chamfer, gridA, gridSides, hidden);
       }
     }
   });
@@ -221,12 +242,18 @@ export function wall(kit, o) {
     // single most valuable 12 triangles on the whole elevation.
     tb.at(k.x, head + 0.075, side).box(k.w + 0.34, 0.15, pj + 0.02, 0, 0);
     if (hoods && k.h > 1.0) {
+      // ROUND 3. The hood used to sit on two 110 x 140 mm brackets. A bracket
+      // that lives directly under the slab it supports is inside that slab's
+      // own shadow at every sun angle this map ever sees, so all it ever
+      // contributed was 24 triangles per opening — 4.8k across ~200 openings,
+      // submitted five times. The hood absorbs their job by oversailing 60 mm
+      // further and gaining a second, thinner drip band under its front edge,
+      // which is the member that actually reads: a horizontal line of shadow
+      // across the elevation instead of two dots nobody resolves.
       tb.at(k.x, head + 0.20, -(T / 2 + 0.17 * relief))
-        .box(k.w + 0.52, 0.10, 0.34 * relief + 0.06, 0, 0);
-      for (const sx of [-1, 1]) {
-        tb.at(k.x + sx * (k.w / 2 + 0.13), head + 0.115, -(T / 2 + 0.14 * relief))
-          .box(0.11, 0.14, 0.28 * relief, 0, 0);
-      }
+        .box(k.w + 0.52, 0.10, 0.40 * relief + 0.06, 0, 0);
+      tb.at(k.x, head + 0.125, -(T / 2 + 0.30 * relief))
+        .box(k.w + 0.44, 0.06, 0.10, 0, 0);
       // Keystone. One box, dead centre, standing proud of the hood: it breaks
       // the head into two shorter runs and gives the elevation a vertical
       // accent per opening instead of a ladder of horizontals.
@@ -334,11 +361,14 @@ export function windowFill(kit, frame, k, T, opts = {}) {
   sh.clearFrame();
 
   if (opts.bars) {
-    // `ironThin` is the same steel material as `ironwork`, on a mesh that does
-    // not cast: a 35 mm bar is under half a shadow-map texel at this cascade
-    // resolution, so all it can produce is a crawling dotted line across the
-    // reveal it is already sitting inside the shadow of.
-    const mb = batch.at(opts.barBucket || 'ironThin', p.x, p.z);
+    // `ironwork`, NOT `ironThin`. Both are the same steel and neither casts —
+    // a 35 mm bar is under half a shadow-map texel, so all it could produce is
+    // a crawling dotted line across a reveal it already sits inside the shadow
+    // of. But `ironThin` is a SKY bucket now, and a grille is the one piece of
+    // ironwork on this map that lives at the back of a 350 mm hole in a wall:
+    // take its shadow term away and it renders in full sun inside a black
+    // window, at arm's length, on every ground-floor opening. It receives.
+    const mb = batch.at(opts.barBucket || 'ironwork', p.x, p.z);
     mb.frame(frame);
     const n = Math.max(2, Math.round(k.w / 0.34));
     for (let i = 0; i < n; i++) {
@@ -370,6 +400,13 @@ export function roof(kit, o) {
   const y = o.y;
   const bucket = o.bucket || 'concrete';
   const trim = o.trim || 'plaster';
+  // The parapet is two materials' worth of geometry in one place, split by
+  // WHAT CAN SHADE IT rather than by what it is made of. The bay walls and the
+  // piers still take the sun on one side and their own building's shade on the
+  // other, so they stay in the shadow pass. Everything from the coping up is
+  // the top edge of the map: nothing on this compound is above it, so it goes
+  // into a `SKY` bucket and costs a fifth as much. See `_defineBuckets`.
+  const cap = o.capBucket || trim;
   const cx = (x0 + x1) / 2, cz = (z0 + z1) / 2;
   const w = Math.abs(x1 - x0), d = Math.abs(z1 - z0);
   const th = o.thickness ?? 0.30;
@@ -379,7 +416,7 @@ export function roof(kit, o) {
   // quads per face; five of those six faces are the underside and the four
   // 300 mm edge bands, none of which has a weathering gradient worth
   // resolving. Top-face-only turns 640 triangles a roof into 330.
-  b.at(cx, y - th / 2, cz).box(w + 0.34, th, d + 0.34, 0.05, 1.6, FACE_TOP);
+  b.at(cx, y - th / 2, cz).box(w + 0.34, th, d + 0.34, 0.05, 3.2, FACE_TOP);
 
   if (o.parapet !== 0) {
     const ph = o.parapet ?? SCALE.parapet;
@@ -387,6 +424,7 @@ export function roof(kit, o) {
     const tb = batch.at(trim, cx, cz);
     // `sides` omits a run where a stair landing or a plank bridge arrives —
     // a roof you can reach but not step onto is worse than no roof at all.
+    const cb = batch.at(cap, cx, cz);
     const sides = o.sides ?? 'nsew';
     const rails = [];
     if (sides.includes('s')) rails.push([x0, z0, x1, z0]);
@@ -405,6 +443,7 @@ export function roof(kit, o) {
       const f = wallFrame(ax, az, bx, bz, y);
       const L = f.len;
       tb.frame(f.m);
+      cb.frame(f.m);
       const bays = Math.max(1, Math.round(L / 3.4));
       const bw = L / bays;
       let maxH = ph;
@@ -416,11 +455,23 @@ export function roof(kit, o) {
         const k = vary === 0 ? 1 : roll < 0.30 ? 1.34 : roll < 0.52 ? 0.62 : 1.0;
         const bh = ph * (1 + (k - 1) * vary);
         maxH = Math.max(maxH, bh);
-        tb.at(cxL, bh / 2, 0).box(bw + 0.02, bh, pt, 0.03, [3.0, 1.0]);
-        tb.at(cxL, bh + 0.045, 0).box(bw + 0.06, 0.10, pt + 0.14, 0.028, 0);  // coping
-        // Weep slot, one per bay: a parapet with no drainage reads as an
-        // extruded band.
-        if (bh > 0.7) tb.at(cxL, bh - 0.30, 0).box(0.24, 0.24, pt + 0.05, 0.012, 0);
+        // No bevel on the bay wall. It is 260 mm thick, its top edge is
+        // covered by a coping that oversails it 70 mm each side, its ends are
+        // covered by piers, and its foot dies into the roof slab: there is no
+        // edge left for a 30 mm chamfer to catch the sun on. 32 of its 44
+        // triangles were buying nothing, 293 times over, at 5x.
+        tb.at(cxL, bh / 2, 0).box(bw + 0.02, bh, pt, 0, 0);
+        // Coping and everything above it: SKY.
+        cb.at(cxL, bh + 0.045, 0).box(bw + 0.06, 0.10, pt + 0.14, 0.028, 0);
+        // Drainage. The weep used to be a 240 mm box standing 25 mm proud of a
+        // 260 mm parapet, which reads as a smudge from anywhere. A scupper
+        // that actually oversails — a throat through the coping and a spout
+        // 260 mm clear of the face — is the same triangle count and puts a
+        // hard notch in the roofline plus a shadow down the elevation.
+        if (bh > 0.7) {
+          cb.at(cxL, bh + 0.045, -(pt / 2 + 0.02)).box(0.26, 0.12, 0.12, 0, 0);
+          cb.at(cxL, bh - 0.02, -(pt / 2 + 0.16)).box(0.20, 0.07, 0.34, 0, 0);
+        }
       }
       // Piers standing above the tallest bay. Every *other* joint plus both
       // ends: a pier at every joint turns the run back into an even rhythm,
@@ -430,11 +481,21 @@ export function roof(kit, o) {
           if (i > 0 && i < bays && (i & 1)) continue;
           const cxL = -L / 2 + bw * i;
           const hh = ph * 1.42;
-          tb.at(cxL, hh / 2, 0).box(0.34, hh, pt + 0.10, 0.03, [3.0, 1.2]);
-          tb.at(cxL, hh + 0.055, 0).box(0.44, 0.10, pt + 0.20, 0.02, 0);
+          // The pier shaft is LIT — it is the vertical that a neighbouring
+          // roofline shadows across — but unbevelled: a 30 mm arris on a
+          // 340 mm shaft is under a pixel past 8 m, and the two SKY blocks
+          // stacked on top of it do the reading instead. 252 piers x 32
+          // triangles x 5 submissions is 40k for an edge nobody resolves.
+          tb.at(cxL, hh / 2, 0).box(0.34, hh, pt + 0.10, 0, 0, FACE_ALL, FACE_NY);
+          cb.at(cxL, hh + 0.055, 0).box(0.44, 0.10, pt + 0.20, 0.02, 0);
+          // Pier finial: a second, smaller block on the cap. Two steps instead
+          // of one at every pier is what turns a flat coping line into a
+          // profile you can read at 40 m — and at 1x it is nearly free.
+          cb.at(cxL, hh + 0.155, 0).box(0.26, 0.11, pt + 0.10, 0.02, 0);
         }
       }
       tb.clearFrame();
+      cb.clearFrame();
       if (o.collide !== false) {
         localToWorld(f.m, 0, maxH / 2, 0, _v);
         proxy.box(_v.x, _v.y, _v.z, L, maxH, pt, f.yaw);
@@ -471,7 +532,18 @@ export function stairs(kit, o) {
   for (let i = 0; i < steps; i++) {
     const z = -len / 2 + going * (i + 0.5);
     const h = r * (i + 1);
-    b.at(0, h / 2, z).box(w, h, going, 0.02, 1.2);
+    // No grid: the weathering field is a function of height and a tread is
+    // 290 mm deep, so every extra row across it samples the same value. The
+    // flight already changes value once per step.
+    //
+    // No chamfer either. Each step is a full-height block standing on the
+    // ground, so consecutive steps bury each other: the only faces of this box
+    // that any camera resolves are the tread and the riser, and both of their
+    // arrises are covered by the nosing lip below, which is a proud member with
+    // its own bevel. The chamfer was 32 of the box's 42 triangles, on 123 steps,
+    // submitted once per cascade — 15.7k for an edge that is inside another
+    // piece of geometry.
+    b.at(0, h / 2, z).box(w, h, going, 0, 0, FACE_ALL, FACE_NY);
     // Nosing: a 30 mm lip that throws a shadow line and stops the flight
     // reading as a smooth wedge at distance.
     b.at(0, h - 0.018, z - going / 2 - 0.015).box(w - 0.06, 0.05, 0.06, 0.012, 0);
@@ -641,7 +713,14 @@ export function awning(kit, o) {
   const C = [w / 2, yLow, d / 2], D = [-w / 2, yLow, d / 2];
   // One sheet only — the cloth material is double sided, so the underside is
   // free and its normals are flipped by the rasteriser.
-  cloth.quad(A, B, C, D, 0.3, warp);
+  //
+  // The droop is a product of two half-sines, so the sheet is a single smooth
+  // arch in each direction: five or six segments resolve it to well under a
+  // millimetre of chord error at this span, and the 300 mm step it used to ask
+  // for was giving a 2.6 x 1.8 m awning nine columns by six rows for a curve
+  // with one inflection. Anisotropic and coarser — the awnings are LIT, so
+  // every triangle here is submitted five times.
+  cloth.quad(A, B, C, D, [Math.max(0.44, w / 6), Math.max(0.42, d / 4)], warp);
   // Scalloped valance along the low edge.
   const scal = Math.max(2, Math.round(w / 0.5));
   for (let i = 0; i < scal; i++) {
@@ -813,6 +892,7 @@ export function building(kit, o) {
     const f = wall(kit, {
       x0: ax, z0: az, x1: bx, z1: bz,
       height: H, thickness: T, bucket, trim,
+      sealed: !interior,
       openings, plinth: o.plinth ?? 0.34,
       cornice: o.cornice ?? 0.24,
       collide: !interior ? false : true,
@@ -843,6 +923,7 @@ export function building(kit, o) {
   roof(kit, {
     x0: x0 + 0.04, z0: z0 + 0.04, x1: x1 - 0.04, z1: z1 - 0.04,
     y: H, bucket: o.roofBucket || 'concrete', trim,
+    capBucket: o.capBucket || 'rooflinePale',
     parapet: o.parapet, sides: o.parapetSides, thickness: 0.28,
     parapetVary: o.parapetVary ?? 1, seed: o.seed,
     collide: true,

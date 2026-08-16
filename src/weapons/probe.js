@@ -29,6 +29,44 @@ import { WEAPONS } from './WeaponDefs.js';
 const canvas = document.getElementById('view');
 const errEl = document.getElementById('err');
 
+/* --- flat stand-in maps for `__probe.isolate` --------------------------- */
+function solid(r, g, b, srgb = false) {
+  const t = new THREE.DataTexture(new Uint8Array([r, g, b, 255]), 1, 1, THREE.RGBAFormat);
+  if (srgb) t.colorSpace = THREE.SRGBColorSpace;
+  t.needsUpdate = true;
+  return t;
+}
+const FLAT_GREY = solid(128, 128, 128, true);
+const FLAT_NORMAL = solid(128, 128, 255);
+const FLAT_ARM = solid(255, 160, 0);          // AO 1, roughness 0.63, metal 0
+
+/**
+ * UV reference grid: 8 checks per tile with the origin quadrant tinted, so a
+ * frame shows tile size, tile orientation, seams and any shear directly on the
+ * part. A texel-scale complaint that survives this image is not a UV problem.
+ */
+const CHECKER = (() => {
+  const N = 256, d = new Uint8Array(N * N * 4);
+  for (let y = 0; y < N; y++) {
+    for (let x = 0; x < N; x++) {
+      const i = (y * N + x) * 4;
+      const c = ((x >> 5) + (y >> 5)) & 1 ? 210 : 40;
+      const edge = (x & 31) === 0 || (y & 31) === 0;
+      d[i] = edge ? 255 : c;
+      d[i + 1] = edge ? 40 : c;
+      d[i + 2] = edge ? 40 : (x < N / 2 && y < N / 2 ? Math.min(255, c + 90) : c);
+      d[i + 3] = 255;
+    }
+  }
+  const t = new THREE.DataTexture(d, N, N, THREE.RGBAFormat);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.minFilter = THREE.LinearMipmapLinearFilter;
+  t.generateMipmaps = true;
+  t.needsUpdate = true;
+  return t;
+})();
+
 function fail(e) {
   errEl.style.display = 'block';
   errEl.textContent = `probe failure\n\n${e?.stack || e}`;
@@ -163,7 +201,64 @@ async function boot() {
     weapons: [...builds.keys()],
     setWeapon(id) { if (builds.has(id)) current = id; },
     setAds(t) { ads = THREE.MathUtils.clamp(t, 0, 1); },
+    /** Hide the hands, so a complaint about the weapon is about the weapon. */
+    setArms(on) { for (const b of builds.values()) b.arms.root.visible = !!on; },
     async flush() { flushMaterialBakes(); await materialsReady(); },
+    /**
+     * Replace one PBR layer on every viewmodel material and re-render.
+     *
+     * "The receiver looks like digital camouflage" is a claim about *which map*
+     * is misbehaving, and there are only four candidates. Turning them off one
+     * at a time answers it in four frames; reasoning about it from a screenshot
+     * of a city does not answer it at all.
+     *
+     * A layer may not simply be set to `null`. `applySurfaceShader` injects
+     * chunks that sample `map` and `roughnessMap` unconditionally, so dropping
+     * either one fails to compile and the mesh silently renders nothing — which
+     * is a diagnostic that answers a different question than the one asked.
+     * Each layer is therefore *replaced* with a flat stand-in of the same type,
+     * and 'checker' swaps the albedo for a UV reference grid so the projection
+     * itself can be read off the surface.
+     */
+    isolate(layer) {
+      for (const m of [...gunMats, ...armMats]) {
+        if (!m.isMeshStandardMaterial) continue;
+        const u = m.userData;
+        if (!u.__orig) u.__orig = { map: m.map, normalMap: m.normalMap, aoMap: m.aoMap };
+        const o = u.__orig;
+        // Clone the STAND-IN and copy the original's tiling onto it. Cloning
+        // the original and reassigning `.image` would look equivalent and is
+        // not: `Texture#image` proxies `source.data`, and `clone()` shares the
+        // source, so that writes the stand-in into the real baked texture and
+        // every later 'full' render is quietly still showing the stand-in.
+        const sub = (t, flat) => {
+          if (!t) return t;
+          const c = flat.clone();
+          c.repeat.copy(t.repeat);
+          c.wrapS = t.wrapS; c.wrapT = t.wrapT;
+          c.needsUpdate = true;
+          return c;
+        };
+        m.map = layer === 'flatalbedo' ? sub(o.map, FLAT_GREY)
+          : layer === 'checker' ? sub(o.map, CHECKER) : o.map;
+        m.normalMap = layer === 'flatnormal' ? sub(o.normalMap, FLAT_NORMAL) : o.normalMap;
+        m.aoMap = m.roughnessMap = m.metalnessMap =
+          layer === 'flatarm' ? sub(o.aoMap, FLAT_ARM) : o.aoMap;
+        // The ARM map packs three unrelated fields into one texture, so
+        // "it is the ARM map" is not yet an answer. AO is separable without a
+        // second texture, because its strength is a plain material scalar.
+        m.aoMapIntensity = layer === 'noao' ? 0 : 1;
+        m.needsUpdate = true;
+      }
+      // The optic's lenses are alpha-blended with depth writes off, so anything
+      // odd on the bell rim has to be shown to be the housing before the
+      // housing is modified.
+      for (const m of [gunMats[5], gunMats[6]]) {
+        if (m) m.visible = layer !== 'noglass';
+      }
+      return layer;
+    },
+
     /** Bake resolution actually reached, per material slot. */
     bakeState() {
       return gunMats.map((m, i) => ({
@@ -212,6 +307,51 @@ async function boot() {
                     * (Math.min(1, box.y1) - Math.max(-1, box.y0))) / 4;
       return box;
     },
+    /**
+     * Screen coverage broken down by the part that produced it.
+     *
+     * The merged body is one buffer, so "the buttstock is too big" is not
+     * checkable against the scene graph — there is no buttstock node. `Kit`
+     * stamps a provenance range per part into `geometry.userData.parts`, and
+     * this walks those ranges, which turns a framing argument into a table.
+     */
+    silhouetteByPart() {
+      const b = builds.get(current);
+      frame();
+      b.root.updateMatrixWorld(true);
+      const v = new THREE.Vector3();
+      const acc = new Map();
+      b.root.traverse((o) => {
+        if (!o.isMesh || o === b.reticle) return;
+        const parts = o.geometry.userData.parts
+          || [{ label: o.name || 'mesh', start: 0, count: o.geometry.attributes.position.count }];
+        const pos = o.geometry.attributes.position;
+        for (const p of parts) {
+          let a = acc.get(p.label);
+          if (!a) { a = { x0: 1e9, x1: -1e9, y0: 1e9, y1: -1e9, n: 0 }; acc.set(p.label, a); }
+          for (let i = p.start; i < p.start + p.count; i++) {
+            v.fromBufferAttribute(pos, i).applyMatrix4(o.matrixWorld);
+            if (-v.z < cam.near) continue;
+            v.applyMatrix4(cam.projectionMatrix);
+            a.x0 = Math.min(a.x0, v.x); a.x1 = Math.max(a.x1, v.x);
+            a.y0 = Math.min(a.y0, v.y); a.y1 = Math.max(a.y1, v.y);
+            a.n++;
+          }
+        }
+      });
+      const out = {};
+      for (const [k, a] of acc) {
+        if (!a.n) continue;
+        const w = Math.min(1, a.x1) - Math.max(-1, a.x0);
+        const h = Math.min(1, a.y1) - Math.max(-1, a.y0);
+        out[k] = {
+          areaFrac: +Math.max(0, w * h / 4).toFixed(4),
+          ndc: [+a.x0.toFixed(2), +a.y0.toFixed(2), +a.x1.toFixed(2), +a.y1.toFixed(2)],
+        };
+      }
+      return out;
+    },
+
     /** Mean linear luminance of a centred NDC window — proves the dot is lit. */
     centrePatch(px = 24) {
       frame();

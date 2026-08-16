@@ -192,16 +192,20 @@ export class InstancePool {
    * Realise the pool.
    *
    * INSTANCING IS NOT FREE, and round 2 proved it the expensive way. An
-   * InstancedMesh is one draw call *per pass* — main plus every shadow cascade
-   * it lands in, so five on this map. Sixteen kinds therefore cost 80 draw
-   * calls before a single triangle is considered, and half of those kinds had
-   * fewer than 25 placements of a 150-triangle prototype. Five pipe bundles
-   * across a 3,700 m² compound is 2,700 triangles: welding them into the
-   * `metal` bucket that already exists costs nothing at all in triangles or in
-   * culling granularity, and removes five draw calls.
+   * InstancedMesh is one draw call *per pass* — main plus every shadow pass it
+   * lands in. Under VSM a mesh enters the shadow passes if it casts OR
+   * receives (see `LevelModule._budget`), so an ordinary prop kind costs five
+   * draw calls, not one. Sixteen kinds therefore cost 80 draw calls before a
+   * single triangle is considered, and half of those kinds had fewer than 25
+   * placements of a 150-triangle prototype. Five pipe bundles across a
+   * 3,700 m² compound is 2,700 triangles: welding them into the `metal` bucket
+   * that already exists costs nothing at all in triangles or in culling
+   * granularity, and removes five draw calls.
    *
    * So a kind is instanced when the placement count is high enough that the
    * duplicated vertex data would actually matter, and merged when it is not.
+   * A kind flagged `castShadow: false, receiveShadow: false` costs ONE draw
+   * call, which is why the rooftop kinds are instanced at any count.
    * `mergeTo` names the bucket; `batcher` must be supplied and must still be
    * open (call this before `Batcher.flush`).
    */

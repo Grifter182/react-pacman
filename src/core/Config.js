@@ -52,8 +52,32 @@ export const QualityPresets = {
   [QualityTier.HIGH]: {
     renderScale: 1.0,
     shadowMapSize: 2048,
-    shadowCascades: 4,
-    shadowDistance: 140,
+    // THREE CASCADES, NOT FOUR — and the range pulled in to pay for it.
+    //
+    // Under VSM three.js renders a mesh into every cascade if it casts OR
+    // receives (see `LevelModule._budget`), and `receiveShadow` is true on
+    // essentially the whole map. The cascade count is therefore a direct
+    // multiplier on the submitted triangle count: at 4 cascades the level's
+    // 244k unique triangles were submitted 5 times for 1,341k, which is most
+    // of the frame's whole budget and the reason round 2 measured 2.94M.
+    //
+    // Dropping a cascade normally costs near-field shadow resolution, because
+    // the practical split scheme (Zhang et al., lambda 0.65, as implemented in
+    // CascadedShadows._updateSplits) hands the first cascade a bigger slice
+    // when there are fewer of them. At 140 m that would have taken cascade 0
+    // from 0.6-13.9 m to 0.6-18.9 m — a 35% coarser contact shadow, which is
+    // exactly the shadow the player sees at their own feet.
+    //
+    // Pulling `shadowDistance` to 110 m gives it back: at 3 cascades over
+    // 110 m the first split lands at 15.2 m, within 9% of the 4-cascade
+    // 13.9 m, so the near field is effectively unchanged. The range still
+    // covers the compound, which is 80 x 92 m, and geometry past 110 m is
+    // backdrop that lives in `SKY` buckets and casts nothing anyway.
+    //
+    // Net: -244k submitted triangles for a shadow that measures the same
+    // where anyone can see it.
+    shadowCascades: 3,
+    shadowDistance: 110,
     ssao: true,
     ssaoSamples: 20,
     ssr: true,

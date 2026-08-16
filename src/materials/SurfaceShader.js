@@ -204,11 +204,14 @@ const PARS_FRAGMENT = /* glsl */`
   uniform sampler2D sfDetailMap;
   uniform vec4 sfDetail;      // x tiles/base-tile, y normal gain, z rough gain, w fade start
   uniform float sfDetailEnd;  // fade end, metres
+  uniform float sfDetailAlb;  // albedo gain from the detail map's cavity channel
 #endif
 #ifdef SF_MACRO
   uniform sampler2D sfMacroMap;
   uniform vec4 sfMacro;       // x 1/period mid (1/m), y albedo amt mid, z rough amt mid, w 1/period low
   uniform vec2 sfMacroLo;     // x albedo amt low, y rough amt low
+  uniform vec4 sfMacroPhase;  // xy mid-band offset, zw low-band offset (per material)
+  uniform vec2 sfMacroHue;    // x warm/cool swing tied to the value term, y UV warp in tiles
 #endif
 #ifdef SF_TRIPLANAR
   uniform vec2 sfTri;         // x tiles per metre, y blend sharpness
@@ -228,12 +231,53 @@ float sfFade() {
 
 void sfSampleSurface() {
 
+  // The macro fields are sampled FIRST, because one of the things they drive is
+  // a world-space warp of the base projection itself. Two bands, and they do
+  // different jobs.
+  //
+  // MID (~7-10 m) is the one that used to wreck everything: crank it and every
+  // surface in the frame wears the same blob field. It is capped by the factory,
+  // and — new in round 3 — every material gets its own phase offset, so two
+  // different materials no longer put their blobs in the same world position.
+  // That decorrelation is what makes a usable amount of it safe: a shared field
+  // reads as camouflage, an independent one per material reads as weathering.
+  //
+  // LOW (~15-30 m) is the band a 30 m facade actually needs so it does not read
+  // as one flat pass of paint. It is allowed to be several times stronger
+  // precisely because it is too large to be read as a pattern.
+  //
+  // Both use a skewed world projection — continuous across every face
+  // orientation, so a single tap works where triplanar would need three.
+  vec2 sfWarp = vec2( 0.0 );
+  #ifdef SF_MACRO
+    vec3 sfWP = vSfWPos;
+    vec2 muv = ( sfWP.xz + sfWP.y * vec2( 0.71, 0.37 ) ) * sfMacro.x + sfMacroPhase.xy;
+    vec3 sfMid = texture2D( sfMacroMap, muv ).rgb - 0.5;
+
+    // Rotated, offset, channel-swizzled so the low band never correlates with
+    // the mid one and the two cannot beat into a visible lattice.
+    vec2 luv = ( sfWP.xz * mat2( 0.83, -0.56, 0.56, 0.83 )
+               + sfWP.y * vec2( -0.29, 0.53 ) ) * sfMacro.w + sfMacroPhase.zw;
+    vec3 sfLow = texture2D( sfMacroMap, luv ).gbr - 0.5;
+
+    // Base-projection warp, in TILES, from the low band only. Its job is to
+    // stop a ground plane laying down an exact lattice of the same tile: a
+    // smooth sub-tile displacement makes the repeat land in a different phase
+    // every few metres, which is what kills the lattice the eye locks onto.
+    // Only the low band drives it, because the shear a warp introduces is
+    // amplitude/period — a 7 m field would visibly skew anything with a
+    // straight line in it. It is opt-in per recipe (warpTiles) and off by
+    // default: masonry wants its courses straight.
+    sfWarp = vec2( sfLow.r + sfMid.b * 0.30, sfLow.b - sfMid.r * 0.30 ) * sfMacroHue.y;
+  #endif
+
   #ifdef SF_TRIPLANAR
 
     vec3 wn = normalize( vSfWNrm );
     vec3 bw = pow( abs( wn ), vec3( sfTri.y ) );
     bw /= max( bw.x + bw.y + bw.z, 1e-5 );
     vec3 p = vSfWPos * sfTri.x;
+    p.xz += sfWarp;
     float sx = wn.x >= 0.0 ? 1.0 : -1.0;
     float sy = wn.y >= 0.0 ? 1.0 : -1.0;
     float sz = wn.z >= 0.0 ? 1.0 : -1.0;
@@ -255,9 +299,21 @@ void sfSampleSurface() {
     #ifdef SF_DETAIL
       float fade = sfFade();
       float ds = sfDetail.y * fade;
-      nX.xy += ( texture2D( sfDetailMap, uvX * sfDetail.x ).xy * 2.0 - 1.0 ) * ds;
-      nY.xy += ( texture2D( sfDetailMap, uvY * sfDetail.x ).xy * 2.0 - 1.0 ) * ds;
-      nZ.xy += ( texture2D( sfDetailMap, uvZ * sfDetail.x ).xy * 2.0 - 1.0 ) * ds;
+      // Keep the whole texel: .xy is the micro normal, .a is the cavity term,
+      // and the triplanar path was previously throwing the cavity away. That
+      // mattered more than it sounds — the ground is the only large triplanar
+      // surface in the level, so the surface with the most screen area was the
+      // one getting no detail-scale roughness or AO break-up at all.
+      vec4 dX = texture2D( sfDetailMap, uvX * sfDetail.x );
+      vec4 dY = texture2D( sfDetailMap, uvY * sfDetail.x );
+      vec4 dZ = texture2D( sfDetailMap, uvZ * sfDetail.x );
+      nX.xy += ( dX.xy * 2.0 - 1.0 ) * ds;
+      nY.xy += ( dY.xy * 2.0 - 1.0 ) * ds;
+      nZ.xy += ( dZ.xy * 2.0 - 1.0 ) * ds;
+      float dCav = dX.a * bw.x + dY.a * bw.y + dZ.a * bw.z;
+      sfAlbedo *= 1.0 + ( dCav - 0.5 ) * sfDetailAlb * fade;
+      sfArm.g = clamp( sfArm.g + ( 0.5 - dCav ) * sfDetail.z * fade, 0.02, 1.0 );
+      sfArm.r *= 1.0 - ( 1.0 - dCav ) * 0.22 * fade;
     #endif
 
     nX.xy *= normalScale;
@@ -274,16 +330,25 @@ void sfSampleSurface() {
 
   #else
 
-    sfAlbedo = texture2D( map, vMapUv ).rgb;
-    sfArm = texture2D( roughnessMap, vRoughnessMapUv ).rgb;
-    sfNrm = texture2D( normalMap, vNormalMapUv ).xyz * 2.0 - 1.0;
+    vec2 sfUv = vMapUv + sfWarp;
+    sfAlbedo = texture2D( map, sfUv ).rgb;
+    sfArm = texture2D( roughnessMap, vRoughnessMapUv + sfWarp ).rgb;
+    sfNrm = texture2D( normalMap, vNormalMapUv + sfWarp ).xyz * 2.0 - 1.0;
 
     #ifdef SF_DETAIL
       float fade = sfFade();
-      vec4 dt = texture2D( sfDetailMap, vMapUv * sfDetail.x );
+      vec4 dt = texture2D( sfDetailMap, sfUv * sfDetail.x );
       // UDN blend: perturb the base normal's tangent components and keep its
       // z. Cheap, never flips the base normal, and stays stable under mips.
       sfNrm = normalize( vec3( sfNrm.xy + ( dt.xy * 2.0 - 1.0 ) * sfDetail.y * fade, sfNrm.z ) );
+      // A 512 px bake over a 2 m tile is 4 mm per texel, so at the 1 m the
+      // player's own feet occupy the base albedo is MAGNIFIED four times and
+      // has nothing left to say. The detail map is the only thing running at a
+      // frequency the eye can still resolve there, so it drives albedo as well
+      // as relief: micro-cavity reads darker, micro-crest reads lighter, which
+      // is true of every mineral surface and is what stops a close-up reading
+      // as a blurred photograph of a material rather than the material.
+      sfAlbedo *= 1.0 + ( dt.a - 0.5 ) * sfDetailAlb * fade;
       sfArm.g = clamp( sfArm.g + ( 0.5 - dt.a ) * sfDetail.z * fade, 0.02, 1.0 );
       sfArm.r *= 1.0 - ( 1.0 - dt.a ) * 0.22 * fade;
     #endif
@@ -291,29 +356,22 @@ void sfSampleSurface() {
   #endif
 
   #ifdef SF_MACRO
-    // Two bands, and they do different jobs.
-    //
-    // MID (~4-8 m) is the one that used to wreck everything: crank it and every
-    // surface in the frame wears the same blob field. It is capped hard by the
-    // factory and kept subtle here — just enough to break the base tile.
-    //
-    // LOW (~15-30 m) is the band a 30 m facade actually needs so it does not
-    // read as one flat pass of paint. It is allowed to be several times
-    // stronger precisely because it is too large to be read as a pattern.
-    //
-    // Both use a skewed world projection — continuous across every face
-    // orientation, so a single tap works where triplanar would need three.
-    vec3 sfWP = vSfWPos;
-    vec2 muv = ( sfWP.xz + sfWP.y * vec2( 0.71, 0.37 ) ) * sfMacro.x;
-    vec3 sfMid = texture2D( sfMacroMap, muv ).rgb - 0.5;
+    float sfMv = sfMid.r * sfMacro.y + sfLow.r * sfMacroLo.x;
 
-    // Rotated, offset, channel-swizzled so the low band never correlates with
-    // the mid one and the two cannot beat into a visible lattice.
-    vec2 luv = ( sfWP.xz * mat2( 0.83, -0.56, 0.56, 0.83 )
-               + sfWP.y * vec2( -0.29, 0.53 ) ) * sfMacro.w + vec2( 0.37, 0.61 );
-    vec3 sfLow = texture2D( sfMacroMap, luv ).gbr - 0.5;
+    // The macro used to be a scalar multiply, which means it could only ever
+    // move a surface up and down its OWN hue — ten materials all getting
+    // brighter and darker together in one warm register is a large part of why
+    // the frame read as a single colour at two brightnesses.
+    //
+    // Weathering does not work that way. Where a surface is sun-bleached and
+    // dust-loaded it goes paler AND warmer; where it is damp, shaded or
+    // soot-loaded it goes darker AND cooler, because what is lighting it there
+    // is sky rather than sun. Tying a warm/cool swing to the value term costs
+    // one madd and gives the frame chroma variation that survives at range,
+    // which is exactly what the base maps lose to mip collapse.
+    vec3 sfTint = vec3( 1.0 + sfMv * sfMacroHue.x, 1.0, 1.0 - sfMv * sfMacroHue.x * 1.35 );
+    sfAlbedo *= clamp( vec3( 1.0 + sfMv ) * sfTint, vec3( 0.50 ), vec3( 1.60 ) );
 
-    sfAlbedo *= clamp( 1.0 + sfMid.r * sfMacro.y + sfLow.r * sfMacroLo.x, 0.55, 1.55 );
     sfArm.g = clamp( sfArm.g * ( 1.0 + sfMid.g * sfMacro.z + sfLow.g * sfMacroLo.y ), 0.02, 1.0 );
     sfArm.r *= clamp( 1.0 + sfMid.b * sfMacro.z * 0.5 + sfLow.b * sfMacroLo.y * 0.35, 0.72, 1.12 );
   #endif
@@ -343,11 +401,41 @@ const VERTEX_WORLD = /* glsl */`
 /**
  * Hard ceilings on the world-space macro term, enforced here so no call site
  * can reintroduce the camouflage look by passing a large `macro`.
- *   MID  ~4-8 m  — the pattern-forming band. Kept small on purpose.
+ *   MID  ~7-10 m  — the pattern-forming band.
  *   LOW  ~15-30 m — genuine large-scale variation. Allowed to be stronger.
+ *
+ * The mid cap went up from 0.18 in round 3 and the reason is the phase offset
+ * below, not a change of heart. What made this band read as camouflage was
+ * never its amplitude on any one surface — it was that every material sampled
+ * the SAME field at the SAME world position, so a blob ran across a wall, the
+ * ground and a crate as one continuous shape and announced itself as a texture
+ * laid over the world. Give each material its own phase and the same amplitude
+ * reads as that material weathering independently, which is what it is.
  */
-const MACRO_MID_CAP = 0.18;
-const MACRO_LOW_CAP = 0.30;
+const MACRO_MID_CAP = 0.26;
+const MACRO_LOW_CAP = 0.32;
+
+/** Warp is a strong tool with a sharp edge; nothing may exceed a third of a tile. */
+const WARP_CAP = 0.34;
+
+/**
+ * Deterministic per-material phase. Any two materials with different keys land
+ * their macro blobs in different places; the same key always reproduces, so a
+ * rebuild is bit-identical.
+ */
+function phaseFor(key) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < key.length; i++) {
+    h ^= key.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  const f = (n) => {
+    let x = Math.imul(h ^ n, 0x27d4eb2d);
+    x ^= x >>> 15;
+    return ((x >>> 0) / 4294967296) * 8;
+  };
+  return [f(1), f(2), f(3), f(4)];
+}
 
 /**
  * Wire the detail / macro / triplanar path into a standard-family material.
@@ -355,12 +443,18 @@ const MACRO_LOW_CAP = 0.30;
  * `cfg` fields (all optional):
  *   detail        'grain' | 'brushed' | 'weave' | 'pit'
  *   detailScale   detail tiles per base tile
- *   detailStrength / detailRough
+ *   detailStrength / detailRough / detailAlbedo
  *   detailFade    [ start, end ] in metres
  *   macro         0..1 breakup strength (0 disables). Split internally into a
  *                 capped mid band and a stronger low band — see MACRO_*_CAP.
- *   macroPeriod   metres per macro cycle, mid band (default 7)
+ *   macroPeriod   metres per macro cycle, mid band (default 9)
  *   macroPeriodLow  metres per macro cycle, low band (default 30)
+ *   macroHue      warm/cool swing carried by the macro value term (default 0.40)
+ *   warpTiles     world-space warp of the base projection, in tiles. Breaks the
+ *                 exact repeat of a tiled surface. ORGANIC SURFACES ONLY — it
+ *                 shears whatever it is applied to, and a sheared brick course
+ *                 is worse than a repeated one.
+ *   phaseKey      string identifying this material; decides its macro phase
  *   triplanar     boolean
  *   worldScale    metres per base tile (drives the triplanar frequency)
  *   triSharp      triplanar blend exponent
@@ -388,6 +482,7 @@ export function applySurfaceShader(material, cfg = {}) {
       ),
     };
     uniforms.sfDetailEnd = { value: fade[1] };
+    uniforms.sfDetailAlb = { value: Math.min(1.2, cfg.detailAlbedo ?? 0.55) };
   }
   if (useMacro) {
     defines.SF_MACRO = '';
@@ -401,14 +496,22 @@ export function applySurfaceShader(material, cfg = {}) {
     uniforms.sfMacroMap = { value: getMacroMap() };
     uniforms.sfMacro = {
       value: new THREE.Vector4(
-        1 / Math.max(0.5, cfg.macroPeriod ?? 7),
-        mid * 1.10,                       // albedo, mid band
+        1 / Math.max(0.5, cfg.macroPeriod ?? 9),
+        mid * 1.25,                       // albedo, mid band
         mid * 0.95,                       // roughness, mid band
         1 / Math.max(4, cfg.macroPeriodLow ?? 30),
       ),
     };
     uniforms.sfMacroLo = {
-      value: new THREE.Vector2(low * 2.20, low * 1.40),
+      value: new THREE.Vector2(low * 2.40, low * 1.40),
+    };
+    const ph = phaseFor(cfg.phaseKey || 'default');
+    uniforms.sfMacroPhase = { value: new THREE.Vector4(ph[0], ph[1], ph[2], ph[3]) };
+    uniforms.sfMacroHue = {
+      value: new THREE.Vector2(
+        Math.min(0.75, cfg.macroHue ?? 0.40),
+        Math.min(WARP_CAP, Math.max(0, cfg.warpTiles ?? 0)),
+      ),
     };
   }
   if (useTri) {

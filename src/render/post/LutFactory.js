@@ -77,7 +77,7 @@ function luma(c) { return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]; }
 
 /** Power-law contrast pivot, in ACES output (linear display-referred) units. */
 const PIVOT = 0.18;
-const CONTRAST = 1.16;
+const CONTRAST = 1.20;
 /** Toe knee. Larger = deeper crush. */
 const TOE = 0.0055;
 /** Shoulder onset, and the value the rolloff is asymptotic to. */
@@ -91,14 +91,36 @@ const SHOULDER = 0.56;
  */
 const SHOULDER_TOP = 1.045;
 
-/** Multiplicative split tone. Cool shadows against warm highlights. */
-const SHADOW_GAIN = [0.865, 0.968, 1.185];
-const HIGH_GAIN = [1.115, 1.015, 0.858];
-const TONE_STRENGTH = 0.90;
+/**
+ * Multiplicative split tone. Cool shadows against warm highlights.
+ *
+ * WHERE THE WEIGHTS SIT MATTERS MORE THAN HOW BIG THE GAINS ARE. The previous
+ * version weighted the shadow tone by (1 - l)^3.2, which is 0.39 at l = 0.25 —
+ * and l = 0.25 is exactly where sky-lit shade lands on this map. So the cooling
+ * was spent on near-black, where there is no signal to colour, while every
+ * surface actually in shade kept the sun's hue at a lower level. Measured over
+ * the round-2 captures the whole frame ran R-B = +20 to +29 with the *shade*
+ * as warm as the light: one hue at two brightnesses, which is the note the
+ * review made.
+ *
+ * The exponent is now 1.9, which puts real weight across the whole shadow half
+ * of the ramp, and the warm end is pushed up off the midtones (see the
+ * highlight weight in `gradeLinear`) so widening the split does not simply make
+ * the frame more orange overall. The gains stay multiplicative — a gain, unlike
+ * an offset, cannot lift a black off zero no matter how large it gets.
+ */
+const SHADOW_GAIN = [0.815, 0.948, 1.265];
+const HIGH_GAIN = [1.108, 1.008, 0.848];
+const TONE_STRENGTH = 0.95;
 
-/** Saturation at the bottom and the top of the ramp. */
-const SAT_SHADOW = 1.08;
-const SAT_HIGH = 0.86;
+/**
+ * Saturation at the bottom and the top of the ramp. The shadow end is boosted
+ * harder than before for the same reason as the split tone: in shade the sky
+ * bounce is the only colour information in the frame, and it was being averaged
+ * away into the sun's hue.
+ */
+const SAT_SHADOW = 1.22;
+const SAT_HIGH = 0.88;
 
 const CROSSTALK = 0.030;
 
@@ -124,8 +146,13 @@ export function gradeLinear(input) {
   // --- 3. split tone, multiplicative ---------------------------------------
   {
     const l = luma(c);
-    const ws = Math.pow(Math.max(0, 1 - l), 3.2);
-    const wh = Math.pow(saturate(l / 0.88), 1.5);
+    // Broad across the shadow half (see SHADOW_GAIN) ...
+    const ws = Math.pow(Math.max(0, 1 - l), 1.9);
+    // ... and deliberately narrow at the top. The warm gain belongs to surfaces
+    // the sun is actually hitting; letting it start at l = 0 (which `l / 0.88`
+    // effectively did, at 1.5 power) laid a thin orange over the midtones as
+    // well and is half the reason the frame read monochrome-warm.
+    const wh = Math.pow(saturate((l - 0.20) / 0.68), 1.25);
     for (let i = 0; i < 3; i++) {
       const gs = 1 + (SHADOW_GAIN[i] - 1) * ws * TONE_STRENGTH;
       const gh = 1 + (HIGH_GAIN[i] - 1) * wh * TONE_STRENGTH;

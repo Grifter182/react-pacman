@@ -373,6 +373,16 @@ export class Kit {
     this.uvScale = uvScale;
     this.slots = new Map();
     this._pending = [];
+    /**
+     * Provenance tag stamped onto every part added from here on. It costs one
+     * string per part and it is what makes the merged buffer auditable: the
+     * whole point of merging is that the finished weapon is one geometry with
+     * no part boundaries left in it, which also means a UV defect on the
+     * ejection port is indistinguishable from one on the buffer tube by the
+     * time anything can measure it. `build()` writes the ranges out to
+     * `geometry.userData.parts`, and `src/weapons/uv-audit.mjs` reads them.
+     */
+    this.label = 'unlabelled';
   }
 
   /**
@@ -386,14 +396,14 @@ export class Kit {
     if (!list) { list = []; this.slots.set(slot, list); }
     // The unwrap hint rides on the geometry (set by lathe/tube/cyl) unless the
     // caller overrides it, and it is evaluated in the part's own local space.
-    list.push({ geo, m, uv: t.uv ?? geo.userData?.uv ?? null });
+    list.push({ geo, m, uv: t.uv ?? geo.userData?.uv ?? null, label: t.label ?? this.label });
     return this;
   }
 
   /** Add a list of `{ geo, m }` produced by the composite helpers. */
   addParts(parts, slot, t = {}) {
     const base = t.m ? t.m.clone() : _compose(t);
-    for (const p of parts) this.add(p.geo, slot, { m: base.clone().multiply(p.m), uv: t.uv });
+    for (const p of parts) this.add(p.geo, slot, { m: base.clone().multiply(p.m), uv: t.uv, label: t.label });
     return this;
   }
 
@@ -406,7 +416,7 @@ export class Kit {
     for (const [k, list] of this.slots) {
       const start = before.get(k) ?? 0;
       const added = list.slice(start);
-      for (const item of added) list.push({ geo: item.geo, m: flip.clone().multiply(item.m), uv: item.uv });
+      for (const item of added) list.push({ geo: item.geo, m: flip.clone().multiply(item.m), uv: item.uv, label: item.label });
     }
     return this;
   }
@@ -418,10 +428,10 @@ export class Kit {
     for (const s of slots) {
       let count = 0;
       const items = [];
-      for (const { geo, m, uv } of this.slots.get(s)) {
+      for (const { geo, m, uv, label } of this.slots.get(s)) {
         const g = geo.index ? geo.toNonIndexed() : geo;
         const n = g.attributes.position.count;
-        items.push({ g, m, n, uv });
+        items.push({ g, m, n, uv, label });
         count += n;
       }
       baked.push({ slot: s, items, count, start: total });
@@ -433,8 +443,10 @@ export class Kit {
     const uv = new Float32Array(total * 2);
     let o = 0;
     const planar = [];
+    const provenance = [];
     for (const b of baked) {
-      for (const { g, m, n, uv: hint } of b.items) {
+      for (const { g, m, n, uv: hint, label } of b.items) {
+        provenance.push({ label, slot: b.slot, start: o, count: n, uv: hint ? hint.mode : 'planar' });
         const sp = g.attributes.position.array;
         const sn = g.attributes.normal ? g.attributes.normal.array : null;
         _n3.getNormalMatrix(m);
@@ -465,6 +477,7 @@ export class Kit {
     geo.setAttribute('normal', new THREE.BufferAttribute(nrm, 3));
     geo.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
     for (const b of baked) geo.addGroup(b.start, b.count, b.slot);
+    geo.userData.parts = provenance;
     geo.computeBoundingSphere();
     geo.computeBoundingBox();
     return geo;

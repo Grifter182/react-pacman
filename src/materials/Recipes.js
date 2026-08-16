@@ -1,5 +1,5 @@
 import {
-  fbm, fbm01, ridged, worley, warped, Cell, lattice,
+  fbm, fbm01, worley, warped, Cell, lattice,
   hash2f, clamp, clamp01, mix, smoothstep, tri,
 } from './Noise.js';
 
@@ -115,6 +115,30 @@ const C_BRICK_BLUE = srgb(0.33, 0.24, 0.24);     // overfired header
 const C_MORTAR = srgb(0.57, 0.56, 0.52);
 const C_STEEL = srgb(0.75, 0.755, 0.76);         // bare mild steel, conductor F0
 const C_PARKER = srgb(0.255, 0.253, 0.26);       // manganese phosphate: DIELECTRIC
+/**
+ * Phosphate that has been worn back — the DIFFUSE colour of it.
+ *
+ * This is the constant the "blue digital camouflage" turned out to be. The
+ * receiver recipe used to blend its wear mask straight to `C_STEEL`, which is
+ * correct only if the surface is then shaded as a CONDUCTOR: a conductor has
+ * essentially no diffuse reflectance, and 0.75 is its *specular* F0, delivered
+ * through the metalness channel the recipe also writes (`out[4] = bare`).
+ *
+ * The viewmodel forces `metalness: 0` on the whole receiver — deliberately, see
+ * `DIELECTRIC` in Gunsmith.js, because writing 1 there turned the gun into a
+ * sky mirror. That override throws away the conductor mask but keeps the
+ * conductor's albedo, so every worn speckle was being rendered as a 0.75-albedo
+ * DIELECTRIC. That is the reflectance of white paint. Scattered in ~90 mm
+ * contact zones over a 0.26 coating and lit by a blue sky, a field of white
+ * speckles on dark blue-grey is, precisely, a digital camouflage print — which
+ * is what two reviews in a row called it.
+ *
+ * Worn parkerising is burnished, not stripped: it goes a little lighter and a
+ * lot glossier. The lightness lives here and stays modest; the gloss lives in
+ * the roughness channel, which is where a real receiver's wear actually reads
+ * and which costs no albedo contrast at all.
+ */
+const C_WORN = srgb(0.40, 0.398, 0.412);
 const C_RUST = srgb(0.46, 0.22, 0.10);
 const C_RUST_DARK = srgb(0.27, 0.13, 0.07);
 const C_PAINT = srgb(0.34, 0.35, 0.28);          // olive drab
@@ -133,7 +157,16 @@ const C_GROUT = srgb(0.52, 0.50, 0.47);
 const C_RUBBER = srgb(0.175, 0.175, 0.185);
 const C_CANVAS = srgb(0.39, 0.38, 0.29);
 const C_POLYMER = srgb(0.205, 0.203, 0.205);     // 0.034 linear — glass-filled nylon
-const C_DIRT = srgb(0.24, 0.20, 0.15);
+/**
+ * Urban grime. This used to be srgb(0.24, 0.20, 0.15) — a warm brown, and it is
+ * mixed into the cavity of nearly every architectural recipe, so every recess,
+ * every rain streak and every soot bed in the level was pulling toward the same
+ * hue as the sunlight. The frame was reviewed as "warm-dominant to the point of
+ * monochrome" and this constant is one of the reasons: the shade had no colour
+ * of its own to be separated by. Real soot and road film are a neutral-to-cool
+ * grey-brown; the warmth in a dirty wall comes from the wall, not the dirt.
+ */
+const C_DIRT = srgb(0.215, 0.202, 0.192);
 
 /* ---------------------------------------------------------------- recipes */
 
@@ -306,7 +339,23 @@ export const RECIPES = {
       const trowel = fbm(seed + 21, M.per(0.55, 8), 3, 0.55);
       const skim = fbm(seed + 22, M.per(0.16, 6), 3, 0.5);
       const grit = fbm(seed + 23, M.per(0.006, 8), 2, 0.5);
-      const blown = warped(fbm01(seed + 24, M.per(0.65, 8), 4, 0.58), seed + 25, M.f(0.09), 3, 2);
+      // WHY THIS IS 1.25 m AND NOT 0.65 m, AND WHY THE THRESHOLD MOVED.
+      //
+      // The blown-render mask switches between lime coat (0.59 linear) and bare
+      // brick (0.10 linear) — a 6:1 step, the largest single contrast in the
+      // whole library. At a 0.65 m period thresholded at the median it covered
+      // half the wall in patches small enough that six or seven of them fitted
+      // inside one 2 m tile. Measured off the bake, that left the albedo with a
+      // standard deviation of 25 out of 255 STILL PRESENT at 250 mm per texel:
+      // low-frequency, high-contrast, and repeating on a 2 m lattice. That is
+      // precisely the "repeating blocky pattern at mid distance" in the review,
+      // and no amount of macro breakup can hide a signal that strong.
+      //
+      // A render sheet blows off in one or two big pieces per bay, not in a
+      // dither. Bigger patches, far fewer of them: the tile now holds one or
+      // two events instead of half a dozen, so the repeat has much less to
+      // announce, and what is left the world-space macro can actually cover.
+      const blown = warped(fbm01(seed + 24, M.per(1.25, 8), 4, 0.58), seed + 25, M.f(0.10), 3, 2);
       const mapC = worley(seed + 26, M.per(0.11, 6), 0.9);
       const brickN = fbm(seed + 27, M.per(0.05, 6), 2, 0.5);
       const streak = fbm(seed + 28, M.per(0.30, 8), 3, 0.62);
@@ -328,8 +377,11 @@ export const RECIPES = {
           const brickH = face * (0.26 + (bTone - 0.5) * 0.09) + brickN(u, v) * 0.04;
 
           // Render survives where the field is high; the boundary is hard —
-          // lime render sheets off in flakes, it does not fade out.
-          const p = smoothstep(0.455, 0.535, blown(u, v));
+          // lime render sheets off in flakes, it does not fade out. The
+          // threshold sits well below the median so the coat is the rule and
+          // the bare patch is the exception: about a fifth of the wall, which
+          // is what a neglected but still-standing building looks like.
+          const p = smoothstep(0.375, 0.455, blown(u, v));
 
           /* Human-scale band 1: trowel sweeps. Broad, shallow, anisotropic
              arcs at half a metre — the mark of a float held at an angle. */
@@ -358,6 +410,18 @@ export const RECIPES = {
           let r = mix(br, C_MORTAR[0] * 0.92, mortar);
           let g = mix(bg, C_MORTAR[1] * 0.92, mortar);
           let b = mix(bb, C_MORTAR[2] * 0.92, mortar);
+          // What is exposed when a render sheet lets go is not clean brick: the
+          // scratch coat stays keyed to the masonry and the whole patch is
+          // powdered with the lime that came off it. Left as bare brick the
+          // step from coat to substrate was 4-5x in reflectance — the single
+          // biggest low-frequency contrast in the library, sitting on a 2 m
+          // lattice. Residue takes it to about 2.5x, which is both what the
+          // wall actually looks like and enough for the world-space macro to
+          // finish hiding the repeat.
+          const residue = 0.46 + bTone * 0.16;
+          r = mix(r, C_PLASTER_2[0] * 0.80, residue);
+          g = mix(g, C_PLASTER_2[1] * 0.79, residue);
+          b = mix(b, C_PLASTER_2[2] * 0.78, residue);
           let rough = mix(0.90, 0.96, mortar);
 
           /* the coat itself — bright, warm, and very low variance. The only
@@ -386,8 +450,14 @@ export const RECIPES = {
           const bloom = c.edge * p * 0.30;
           r = mix(r, 0.50, bloom); g = mix(g, 0.49, bloom); b = mix(b, 0.46, bloom);
 
+          // Cavity dirt, and it goes COOLER as it goes darker rather than
+          // warmer. The old weights (r 0.34, g 0.36, b 0.37) took blue down
+          // fastest, which warmed every recess on every wall in the level and
+          // left the frame with a single hue at two brightnesses. A recess is
+          // filled by sky, not by sun; taking red down fastest is both what the
+          // light does and what gives the image somewhere cool to sit.
           const dirt = c.cavity * 0.55;
-          r *= 1 - dirt * 0.34; g *= 1 - dirt * 0.36; b *= 1 - dirt * 0.37;
+          r *= 1 - dirt * 0.40; g *= 1 - dirt * 0.36; b *= 1 - dirt * 0.30;
 
           out[0] = r; out[1] = g; out[2] = b;
           out[3] = clamp(rough + c.cavity * 0.05 - c.edge * 0.10 + craze * 0.04, 0.40, 1.0);
@@ -467,8 +537,11 @@ export const RECIPES = {
 
           const bloom = c.edge * 0.34 * face;
           r = mix(r, 0.44, bloom); g = mix(g, 0.43, bloom); b = mix(b, 0.41, bloom);
+          // Soot in the beds. Red-first, for the same reason as plaster's
+          // cavity dirt: a shaded joint is lit by sky and has no business
+          // being the warmest thing on the wall.
           const soot = c.cavity * 0.7;
-          r *= 1 - soot * 0.42; g *= 1 - soot * 0.44; b *= 1 - soot * 0.44;
+          r *= 1 - soot * 0.48; g *= 1 - soot * 0.44; b *= 1 - soot * 0.37;
 
           out[0] = r; out[1] = g; out[2] = b;
           out[3] = clamp(mix(0.86, 0.96, mortar) + chipped * 0.05 - c.edge * 0.08, 0.45, 1.0);
@@ -633,64 +706,154 @@ export const RECIPES = {
   },
 
   /* ================================================================== sand */
+  /* ==================================================================== sand
+   *
+   * This recipe is a third of almost every frame on this map, and through two
+   * rounds of review it was the flattest thing in the image. Measured off its
+   * own bake, the previous version delivered an 8-bit albedo standard deviation
+   * of 7 out of 255 — a 3% surface — and the frame agreed with it: a 540x260
+   * crop of near ground in the round-2 capture came back at sd 7.2 with a mean
+   * horizontal gradient of 1.4 code values. That is not a soft material, it is
+   * no material.
+   *
+   * Two separate causes, both fixed here.
+   *
+   * 1. THE RELIEF BUDGET WAS SPENT ON THE WRONG BAND. `reliefM` is a total, and
+   *    the dune/crest terms took 0.55 + 0.95 of the height field against the
+   *    ripple train's 0.16. So 90 mm of the 90 mm went into features with a
+   *    1.1-1.6 m period — which at a 2 m tile is one and a half bumps, i.e. a
+   *    gentle undulation with no shading contrast at all — and the band a
+   *    player standing on it actually reads was left with a couple of
+   *    millimetres. Broad drift is the terrain mesh's job, not the normal
+   *    map's. The dune term is now a fifth of what it was, the ripple train and
+   *    the gravel lag own the budget, and reliefM comes down to 60 mm to match
+   *    a real 90 mm-pitch ripple.
+   *
+   * 2. THE ALBEDO HAD NOTHING IN IT. "The only real variable is moisture" is
+   *    true of a laboratory sand sample and false of ground people walk on.
+   *    What is actually there, in ascending scale: individual coarse grains and
+   *    chips, a gravel lag left behind where the fines have blown out, wind
+   *    sorting into alternating coarse and fine patches at a third of a metre,
+   *    and damp scour hollows. Four bands, all of them inside the range a
+   *    single 2 m tile can hold, and every one of them carries VALUE, not just
+   *    a nudge of the same tan.
+   *
+   * The damp end is also pulled toward a cool grey rather than a darker tan.
+   * Wet sand in shade is lit by sky, and the frame was criticised for being one
+   * hue at two brightnesses; the ground is the largest single surface available
+   * to fix that with.
+   */
   sand: {
-    label: 'Wind-rippled sand',
-    description: '90 mm ripple train over metre-scale drift, scattered gravel lag and damp compaction in the troughs.',
+    label: 'Wind-rippled sand over gravel lag',
+    description: '90 mm ripple train, deflation lag of 20-50 mm gravel, wind sorting into coarse and fine patches at a third of a metre, damp scour hollows.',
     tags: ['ground', 'terrain'],
-    minSize: 512, reliefM: 0.090, masks: 3,
-    aoStrength: 0.85, curvGain: 0.8,
-    detail: 'grain', detailMetres: 0.07, detailStrength: 0.60,
-    macro: 0.16, triplanar: true, worldScale: 2.0,
+    minSize: 512, reliefM: 0.060, masks: 5,
+    aoStrength: 1.05, curvGain: 0.95,
+    detail: 'grain', detailMetres: 0.06, detailStrength: 0.72, detailAlbedo: 0.80,
+    // Ground has no straight lines in it, so it is the one family that can take
+    // a projection warp — and it is the family that needs it most, because a
+    // flat plane shows a tile lattice from further away than a facade does.
+    macro: 0.30, macroHue: 0.55, warpTiles: 0.26,
+    triplanar: true, worldScale: 2.0,
     build(seed, opts = {}) {
       const M = metrics(opts, 2.0);
-      const RIPPLES = M.count(0.090, 3);          // 90 mm wind ripples
-      const dune = fbm(seed + 61, M.per(1.6, 8), 4, 0.55);
-      const crest = ridged(seed + 66, M.per(1.1, 8), 3, 0.5, 2.6);
-      const warp = fbm(seed + 62, M.per(0.6, 8), 2, 0.5);
+      const RIPPLES = M.count(0.090, 3);           // 90 mm wind ripples
+      const dune = fbm(seed + 61, M.per(1.6, 8), 3, 0.55);
+      const warp = fbm(seed + 62, M.per(0.50, 8), 2, 0.5);
       const grain = fbm(seed + 63, M.per(0.004, 8), 2, 0.5);
-      const peb = worley(seed + 64, M.per(0.065, 6), 1.0);
-      const drift = fbm01(seed + 65, M.per(0.9, 8), 3, 0.6);
-      const cA = new Cell();
+      const lag = worley(seed + 64, M.per(0.045, 6), 1.0);   // deflation gravel
+      const chip = worley(seed + 68, M.per(0.014, 4), 1.0);  // coarse grains/chips
+      const drift = fbm01(seed + 65, M.per(0.85, 8), 3, 0.6);
+      // Wind sorting: the single most useful band on this surface. Alternating
+      // coarse (dark, grey, matt) and fine (pale, warm) patches at 0.3 m is
+      // what a sand sheet actually looks like from standing height.
+      const sort = fbm01(seed + 69, M.per(0.30, 8), 3, 0.58);
+      const scour = fbm01(seed + 70, M.per(0.45, 8), 3, 0.55);
+      const cA = new Cell(), cB = new Cell();
       return {
         sample(u, v, out) {
           // Ripples are a phase-modulated train, not a sine: crests are sharp
-          // and troughs broad because that is how saltation piles it. Dune
-          // crests are ridges — the slip face is a discontinuity in transport,
-          // so a ridged multifractal is the correct primitive.
-          const dn = dune(u, v) * 0.60 + (crest(u, v) - 0.42) * 0.95;
-          const ph = v * RIPPLES + warp(u, v) * 2.4 + dn * 1.6;
+          // and troughs broad because that is how saltation piles it.
+          const dn = dune(u, v) * 0.12;
+          const ph = v * RIPPLES + warp(u, v) * 2.2 + dn * 6.0;
           const s = 0.5 + 0.5 * Math.cos(ph * Math.PI * 2);
           const ripple = s * s * Math.sqrt(s) * 0.5 + s * s * 0.5;   // ~pow(s,1.7)
-          const cover = smoothstep(0.35, 0.65, drift(u, v));
+          const cover = smoothstep(0.30, 0.62, drift(u, v));
+          const sorted = sort(u, v);
+          // Coarse patches are where the lag sits; the ripple train needs fines
+          // to exist at all, so the two are mutually exclusive by construction.
+          const coarse = smoothstep(0.44, 0.72, sorted);
+          const hollow = smoothstep(0.42, 0.78, scour(u, v));
 
-          peb(u, v, cA);
-          const stone = smoothstep(0.34, 0.12, cA.f1) * (cA.rand(4) > 0.86 ? 1 : 0) * (1 - cover * 0.6);
+          lag(u, v, cA);
+          chip(u, v, cB);
+          // Ellipsoid caps, not gaussians: a real edge for the curvature pass.
+          const stone = Math.sqrt(clamp01(1 - cA.f1 / (0.30 + cA.rand(4) * 0.16)))
+            * (cA.rand(5) > 0.46 ? 1 : 0) * (0.35 + coarse * 0.65);
+          const grit = Math.sqrt(clamp01(1 - cB.f1 / 0.34)) * (cB.rand(6) > 0.55 ? 1 : 0);
 
-          out[0] = dn * 0.55 + ripple * 0.16 * cover + grain(u, v) * 0.05 + stone * 0.22;
-          out[1] = stone; out[2] = ripple * cover; out[3] = cover;
+          out[0] = dn
+            + ripple * 0.40 * cover * (1 - coarse * 0.55)
+            + stone * 0.34
+            + grit * 0.11
+            + grain(u, v) * 0.05
+            - hollow * 0.10;
+          out[1] = stone;
+          out[2] = ripple * cover;
+          out[3] = coarse;
+          out[4] = hollow;
+          out[5] = cB.rand(7);
         },
         shade(u, v, c, m, out) {
-          const stone = m[0], ripple = m[1];
-          // Sand's signature: warm, bright, and a very tight distribution —
-          // the only real variable is moisture.
-          const t = 0.86 + c.h * 0.26;
-          let r = C_SAND[0] * t, g = C_SAND[1] * t, b = C_SAND[2] * t;
-          const damp = c.cavity * 0.75;
-          r = mix(r, C_SAND_DARK[0], damp * 0.68);
-          g = mix(g, C_SAND_DARK[1], damp * 0.68);
-          b = mix(b, C_SAND_DARK[2], damp * 0.70);
-          const dry = c.edge * 0.35 + ripple * 0.22;
-          r = mix(r, r * 1.14 + 0.010, dry);
-          g = mix(g, g * 1.13 + 0.009, dry);
-          b = mix(b, b * 1.11 + 0.007, dry);
+          const stone = m[0], ripple = m[1], coarse = m[2], hollow = m[3], chipRnd = m[4];
 
-          const st = 0.7 + hash2f((u * 4096) | 0, (v * 4096) | 0, 7) * 0.6;
-          r = mix(r, C_STONE[0] * st, stone);
-          g = mix(g, C_STONE[1] * st, stone);
-          b = mix(b, C_STONE[2] * st, stone);
+          // Base tone. `c.h` is the normalised height field, so this alone
+          // already reads the ripple train and the lag as value.
+          const t = 0.78 + c.h * 0.42;
+          let r = C_SAND[0] * t, g = C_SAND[1] * t, b = C_SAND[2] * t;
+
+          // Wind sorting. Coarse patches have lost their fines and sit a good
+          // 25% darker and markedly greyer; fine patches are the pale warm
+          // blown sand that drifted in on top.
+          r = mix(r, mix(r, C_STONE[0] * 0.92, 0.55), coarse);
+          g = mix(g, mix(g, C_STONE[1] * 0.92, 0.55), coarse);
+          b = mix(b, mix(b, C_STONE[2] * 0.94, 0.58), coarse);
+          const fine = (1 - coarse) * (0.45 + ripple * 0.55);
+          r = mix(r, r * 1.20 + 0.014, fine * 0.5);
+          g = mix(g, g * 1.17 + 0.012, fine * 0.5);
+          b = mix(b, b * 1.11 + 0.008, fine * 0.5);
+
+          // Damp. Wet sand is roughly 45% of its dry reflectance and it goes
+          // COOL, not simply dark — in shade the only thing lighting it is the
+          // sky. This is the ground's contribution to getting some colour
+          // separation into a frame that reads as one hue at two brightnesses.
+          const damp = clamp01(hollow * 0.85 + c.cavity * 0.55);
+          r = mix(r, C_SAND_DARK[0] * 0.80, damp * 0.72);
+          g = mix(g, C_SAND_DARK[1] * 0.86, damp * 0.72);
+          b = mix(b, C_SAND_DARK[2] * 1.14, damp * 0.74);
+
+          // Sun-baked crust on the crests.
+          const dry = c.edge * 0.40;
+          r = mix(r, r * 1.16 + 0.012, dry);
+          g = mix(g, g * 1.14 + 0.010, dry);
+          b = mix(b, b * 1.10 + 0.007, dry);
+
+          // Lag gravel. A real spread of stone types, not one grey: some
+          // ironstone-dark, some pale limestone. This is the band that gives
+          // the ground something to read at 1-3 m.
+          const st = 0.48 + hash2f((u * 4096) | 0, (v * 4096) | 0, 7) * 0.95;
+          const sr = st > 1.0 ? C_STONE[0] * st : mix(C_DIRT[0], C_STONE[0], st);
+          const sg = st > 1.0 ? C_STONE[1] * st : mix(C_DIRT[1], C_STONE[1], st);
+          const sb = st > 1.0 ? C_STONE[2] * st * 1.04 : mix(C_DIRT[2], C_STONE[2] * 1.04, st);
+          r = mix(r, sr, stone); g = mix(g, sg, stone); b = mix(b, sb, stone);
+
+          // Individual coarse grains, half a pixel across at 512 — they read as
+          // grit rather than as resolvable stones, which is the point.
+          const gk = (chipRnd - 0.5) * 0.30 * (0.35 + coarse * 0.65);
+          r *= 1 + gk; g *= 1 + gk * 0.96; b *= 1 + gk * 0.88;
 
           out[0] = r; out[1] = g; out[2] = b;
-          out[3] = clamp(0.95 - stone * 0.20 - damp * 0.08, 0.45, 1.0);
+          out[3] = clamp(0.95 - stone * 0.24 - damp * 0.16 + coarse * 0.03, 0.42, 1.0);
           out[4] = 0;
           out[5] = 1;
         },
@@ -732,8 +895,17 @@ export const RECIPES = {
         },
         shade(u, v, c, m, out) {
           const stone = m[0], tint = m[1], dust = m[2];
-          const t = 0.62 + tint * 0.75;
-          let r = C_STONE[0] * t, g = C_STONE[1] * t, b = C_STONE[2] * t;
+          // Crushed stone is not one grey at a range of exposures — a bed of it
+          // is a mix of rock types, and the value spread between them is the
+          // whole reason gravel reads as gravel from six feet away. Scaling one
+          // colour gave an 8-bit albedo sigma of 9; a bimodal split between a
+          // dark basaltic fraction and a pale limestone one roughly doubles it
+          // for the cost of one extra mix.
+          const dark = tint < 0.38 ? 1 : 0;
+          const t = dark ? (0.42 + tint * 0.55) : (0.78 + (tint - 0.38) * 1.05);
+          let r = mix(C_STONE[0], C_DIRT[0] * 1.5, dark * 0.55) * t;
+          let g = mix(C_STONE[1], C_DIRT[1] * 1.5, dark * 0.55) * t;
+          let b = mix(C_STONE[2], C_DIRT[2] * 1.6, dark * 0.52) * t;
           r = mix(r, r * 1.3 + 0.015, c.edge * 0.45);
           g = mix(g, g * 1.28 + 0.014, c.edge * 0.45);
           b = mix(b, b * 1.26 + 0.013, c.edge * 0.45);
@@ -1212,7 +1384,13 @@ export const RECIPES = {
           const mach = Math.cos(v * MACH * Math.PI * 2 + forge(u, v) * 3.0) * 0.5 + 0.5;
           dings(u, v, cA);
           const ding = smoothstep(0.10, 0.02, cA.f1) * (cA.rand(15) > 0.88 ? 1 : 0);
-          out[0] = forge(u, v) * 0.62 + mach * 0.07 - ding * 0.55;
+          // Shallower dings. `ding` feeds the height field, the height field
+          // drives curvature, and curvature drives BOTH the wear mask and the
+          // cavity term that darkens the albedo. At 0.55 a ding was a crater
+          // more than half as deep as the entire forging relief, so it printed
+          // a hard dark disc into the albedo. A holster ding is a bruise in a
+          // conversion coating, not a hole.
+          out[0] = forge(u, v) * 0.62 + mach * 0.07 - ding * 0.26;
           out[1] = clamp01(smoothstep(0.44, 0.76, zoneN(u, v)) * (0.40 + wearN(u, v) * 0.95));
           out[2] = ding;
         },
@@ -1231,14 +1409,35 @@ export const RECIPES = {
           const bare = clamp01(Math.max(bright, smoothstep(0.55, 0.9, ding)));
 
           // Phosphate is a dark matte DIELECTRIC. Its diffuse albedo is ~0.05.
-          const t = 0.90 + c.h * 0.18;
-          let r = mix(C_PARKER[0] * t, C_STEEL[0], bare);
-          let g = mix(C_PARKER[1] * t, C_STEEL[1], bare);
-          let b = mix(C_PARKER[2] * t, C_STEEL[2], bare);
+          //
+          // THE ALBEDO IS ALMOST FLAT, AND THAT IS THE POINT. This is the fix
+          // for the "blue digital camo" the last two reviews named, and it is
+          // an albedo defect, not a lighting one — measured off the bake, the
+          // previous version had a standard deviation of 21 code values out of
+          // 255 on a mean of 67. That is a 46-88 swing, near enough 4x in
+          // linear reflectance, laid down in ~20 mm patches by the height
+          // field's forging and ding terms. Multiply a patchwork like that by
+          // a blue sky IBL — which is most of what a matte black dielectric
+          // shows — and you get blue-grey blobs at roughly 15 px on a receiver
+          // held 500 mm from the eye. That is a camouflage print, and no amount
+          // of retiling or AO scaling removes it, because it is IN the colour.
+          //
+          // A phosphate conversion coating is one of the most uniform surfaces
+          // on a rifle: it is a chemical film, not paint, and its variation is
+          // sheen, not value. So the height tint drops from +-9% to +-4% and
+          // the fouling from 34% to 15%. What still separates this from flat
+          // grey is the roughness channel and the polished arrises, which is
+          // where a real receiver's read comes from anyway.
+          const t = 0.95 + c.h * 0.08;
+          let r = mix(C_PARKER[0] * t, C_WORN[0], bare);
+          let g = mix(C_PARKER[1] * t, C_WORN[1], bare);
+          let b = mix(C_PARKER[2] * t, C_WORN[2], bare);
 
           // Carbon fouling in the recesses; keeps it from reading as clean CAD.
+          // Warm-biased: soot on gunmetal kills the blue first, which also
+          // stops the recesses reading as sky-coloured holes.
           const foul = c.cavity * 0.7;
-          r *= 1 - foul * 0.34; g *= 1 - foul * 0.35; b *= 1 - foul * 0.35;
+          r *= 1 - foul * 0.13; g *= 1 - foul * 0.15; b *= 1 - foul * 0.17;
 
           out[0] = r; out[1] = g; out[2] = b;
           // Unworn phosphate floors at 0.55 — it is a matte coating, not a

@@ -100,8 +100,21 @@ async function main() {
   await page.goto(target, { waitUntil: 'load', timeout: 60000 });
 
   // Wait for the engine to present its first frame.
-  await page.waitForFunction(() => document.body.dataset.ready === '1' || document.querySelector('pre'), { timeout: 90000 })
-    .catch(() => logs.push('[harness] timed out waiting for first frame'));
+  //
+  // The options object MUST be the third argument. `waitForFunction` is
+  // `(pageFunction, arg, options)` — passing `{ timeout }` second hands it to
+  // the page function as its argument and leaves the timeout at Playwright's
+  // 30 s default. Boot on SwiftShader takes ~44 s (level build plus the
+  // material bakes), so the intended 90 s wait was silently a 30 s one and
+  // every capture since round 1 logged "timed out waiting for first frame"
+  // while carrying on regardless. The shots were taken after boot finished, so
+  // the images were fine — but the log was never clean and the one signal that
+  // would have reported a real boot hang was already crying wolf.
+  await page.waitForFunction(
+    () => document.body.dataset.ready === '1' || document.querySelector('pre'),
+    null,
+    { timeout: 90000 },
+  ).catch(() => logs.push('[harness] timed out waiting for first frame'));
 
   const boot = await page.evaluate(() => {
     const pre = document.querySelector('pre');
