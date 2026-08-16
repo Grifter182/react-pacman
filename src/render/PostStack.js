@@ -111,8 +111,21 @@ export class PostStack {
     if (this._material) this._material.uniforms.uResolution.value.set(w, h);
   }
 
-  render(engine, renderer) {
+  /**
+   * NOTE: deliberately NOT named `render` — the engine calls `render(engine)`
+   * on every registered module, and this pass must only ever be driven by
+   * RenderModule, which owns frame composition and supplies the renderer.
+   */
+  composite(engine, renderer) {
     if (!this.enabled || !this.hdr) { renderer.render(engine.scene, engine.camera); return; }
+
+    // The world is rendered to an HDR buffer in *linear* light. Tone mapping
+    // happens exactly once, in the composite shader below — letting the
+    // renderer also tone map here would crush the image twice.
+    const prevTM = renderer.toneMapping;
+    const prevCS = renderer.outputColorSpace;
+    renderer.toneMapping = THREE.NoToneMapping;
+    renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
 
     renderer.setRenderTarget(this.hdr);
     renderer.clear(true, true, true);
@@ -122,11 +135,10 @@ export class PostStack {
     this._material.uniforms.tDiffuse.value = this.hdr.texture;
     this._material.uniforms.uTime.value = engine.elapsed;
     this._material.uniforms.uExposure.value = renderer.toneMappingExposure;
-    // tone mapping is applied in the post shader, not by the renderer
-    const prevTM = renderer.toneMapping;
-    renderer.toneMapping = THREE.NoToneMapping;
     renderer.render(this._quadScene, this._quadCamera);
+
     renderer.toneMapping = prevTM;
+    renderer.outputColorSpace = prevCS;
   }
 
   dispose() {

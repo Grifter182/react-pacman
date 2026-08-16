@@ -41,7 +41,10 @@ export class RenderModule {
     renderer.shadowMap.type = THREE.VSMShadowMap;
     renderer.shadowMap.autoUpdate = true;
     renderer.autoClear = false;
-    renderer.info.autoReset = true;
+    // We issue several render() calls per frame (world, post, viewmodel).
+    // Auto-reset would zero the counters between them and report only the
+    // last pass, so we reset once per frame ourselves in render().
+    renderer.info.autoReset = false;
 
     this.renderer = renderer;
     engine.renderer = renderer;
@@ -70,10 +73,11 @@ export class RenderModule {
 
   render(engine) {
     const r = this.renderer;
+    r.info.reset();
     r.clear(true, true, true);
 
-    if (this.postStack?.render) {
-      this.postStack.render(engine, r);
+    if (this.postStack?.composite) {
+      this.postStack.composite(engine, r);
     } else {
       r.render(engine.scene, engine.camera);
     }

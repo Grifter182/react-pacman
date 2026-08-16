@@ -111,7 +111,11 @@ export class WeaponModule {
     body.traverse((o) => { o.castShadow = false; o.receiveShadow = false; });
     this.body = body;
     this.rig.add(body);
-    engine.viewmodelScene.add(this.rig);
+    // The rig is parented to the viewmodel camera so all viewmodel poses are
+    // authored in camera space; the camera itself must be in the scene graph
+    // for those transforms to resolve.
+    engine.viewmodelCamera.add(this.rig);
+    engine.viewmodelScene.add(engine.viewmodelCamera);
 
     // Hip and ADS reference poses; the animation blends between them.
     this.hipPose = { pos: new THREE.Vector3(0.155, -0.135, -0.24), rot: new THREE.Euler(0.02, 0.05, 0.01) };

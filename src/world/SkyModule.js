@@ -58,47 +58,66 @@ export class SkyModule {
     this.skyMesh = new THREE.Mesh(geo, mat);
     this.skyMesh.name = 'SkyDome';
     this.skyMesh.frustumCulled = false;
-    this.skyMesh.renderOrder = -1000;
-    this.skyMesh.scale.setScalar(1);
-    engine.scene.add(this.skyMesh);
 
     this._buildEnvironment(engine);
   }
 
-  /** Render the sky dome once into a cubemap and use it as scene.environment. */
+  /**
+   * Bake the sky dome into a cubemap once, then use that cubemap BOTH as the
+   * scene background and (via PMREM) as the IBL environment.
+   *
+   * Baking rather than drawing a dome mesh every frame is what a real engine
+   * does: it costs zero draw calls per frame, guarantees the background can
+   * never be depth-sorted incorrectly against world geometry, and keeps the
+   * visible sky and the lighting environment perfectly consistent — they are
+   * literally the same pixels.
+   */
   _buildEnvironment(engine) {
     const renderer = engine.get('render').renderer;
-    const pmrem = new THREE.PMREMGenerator(renderer);
-    pmrem.compileEquirectangularShader();
 
-    const cubeRT = new THREE.WebGLCubeRenderTarget(256, { type: THREE.HalfFloatType });
-    const cubeCam = new THREE.CubeCamera(0.1, 10, cubeRT);
     const tmp = new THREE.Scene();
-    const clone = this.skyMesh.clone();
-    clone.material = this.skyMesh.material;
-    tmp.add(clone);
+    tmp.add(this.skyMesh);
+
+    // High enough that the sun disc stays crisp when used as a background.
+    const cubeRT = new THREE.WebGLCubeRenderTarget(1024, {
+      type: THREE.HalfFloatType,
+      minFilter: THREE.LinearFilter,
+      magFilter: THREE.LinearFilter,
+      generateMipmaps: false,
+    });
+    const cubeCam = new THREE.CubeCamera(0.1, 10, cubeRT);
+
     const prevTarget = renderer.getRenderTarget();
+    const prevTM = renderer.toneMapping;
+    const prevCS = renderer.outputColorSpace;
+    // Bake in linear light — tone mapping happens once, at composite time.
+    renderer.toneMapping = THREE.NoToneMapping;
+    renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
     cubeCam.update(renderer, tmp);
+    renderer.toneMapping = prevTM;
+    renderer.outputColorSpace = prevCS;
     renderer.setRenderTarget(prevTarget);
 
+    this.cubeRT = cubeRT;
+    engine.scene.background = cubeRT.texture;
+    engine.scene.backgroundIntensity = 1.0;
+
+    const pmrem = new THREE.PMREMGenerator(renderer);
     const env = pmrem.fromCubemap(cubeRT.texture);
     this.envMap = env.texture;
     engine.scene.environment = this.envMap;
     engine.scene.environmentIntensity = 1.0;
     engine.viewmodelScene.environment = this.envMap;
-
-    cubeRT.dispose();
     pmrem.dispose();
-  }
 
-  update(dt, engine) {
-    // Keep the dome centred on the camera so it never clips.
-    if (this.skyMesh) this.skyMesh.position.copy(engine.camera.position);
+    // The dome mesh has served its purpose; it is never rendered again.
+    tmp.remove(this.skyMesh);
   }
 
   dispose() {
     this.skyMesh?.geometry.dispose();
     this.skyMesh?.material.dispose();
+    this.cubeRT?.dispose();
     this.envMap?.dispose();
   }
 }
