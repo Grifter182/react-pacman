@@ -53,6 +53,11 @@ function bakeFrond(N = 256) {
       const t = i / (nLeaf - 1);
       leaves.push({ t, side: i % 2 ? 1 : -1, len: 0.30 * Math.sin(Math.PI * clamp01(t * 1.15)) * (0.75 + r() * 0.5), sweep: 0.42 + r() * 0.16 });
     }
+    // Coverage, in texels, over which a leaflet edge fades out. A hard
+    // in/out test bakes a binary matte, and a binary matte under an alphaTest
+    // is the "hole punched in the sky" the review saw: no partial coverage
+    // anywhere, so every edge aliases and the mips dissolve into speckle.
+    const soft = 1.6 / N;
     for (let y = 0; y < N; y++) {
       const v = (y + 0.5) / N - 0.5;          // -0.5 .. 0.5 across the frond
       for (let x = 0; x < N; x++) {
@@ -62,7 +67,7 @@ function bakeFrond(N = 256) {
 
         // Rachis: a thin spine that tapers to nothing.
         const spine = 0.016 * (1 - u * 0.85);
-        if (Math.abs(v) < spine && u < 0.99) a = 1;
+        if (u < 0.99) a = clamp01((spine - Math.abs(v)) / soft + 0.5);
 
         for (const lf of leaves) {
           if (u < lf.t) continue;
@@ -71,22 +76,32 @@ function bakeFrond(N = 256) {
           // Leaflet centre-line: sweeps outward from the rachis and back.
           const centre = lf.side * (du / lf.sweep) * lf.len;
           const halfW = (0.012 + 0.010 * Math.sin((du / lf.sweep) * Math.PI)) * (1 - du / lf.sweep * 0.55);
-          if (Math.abs(v - centre) < halfW) {
-            a = 1;
+          // Signed coverage instead of a binary test, tapered at the leaflet
+          // tip as well as across it.
+          const cov = clamp01((halfW - Math.abs(v - centre)) / soft + 0.5)
+            * clamp01((lf.sweep - du) / (soft * 3) + 0.5);
+          if (cov > 0) {
+            a = Math.max(a, cov);
             dry = Math.max(dry, clamp01((u - 0.55) / 0.5) * 0.9 + (du / lf.sweep) * 0.25);
           }
         }
-        if (a > 0) {
-          // Green through to sun-bleached straw at the tips, with a darker
-          // midrib on every leaflet.
-          const shade = 0.82 + 0.18 * Math.sin(v * 420.0);
-          const g = lerp(0.30, 0.62, dry) * shade;
-          d[i] = (lerp(0.13, 0.55, dry) * 255) | 0;
+        if (a > 0.004) {
+          // Green through to sun-bleached straw at the tips, with a midrib
+          // that darkens rather than a high-frequency stripe (the old
+          // sin(v*420) term aliased into noise the moment it mipped).
+          const midrib = 0.86 + 0.14 * Math.cos(v * 96.0);
+          const g = lerp(0.47, 0.72, dry) * midrib;
+          // Albedo lifted well off black: a frond is a mid-value surface, and
+          // baking it at 0.30 guaranteed the crown read as a silhouette hole
+          // no matter what the lighting did.
+          d[i] = (lerp(0.26, 0.66, dry) * midrib * 255) | 0;
           d[i + 1] = (g * 255) | 0;
-          d[i + 2] = (lerp(0.05, 0.26, dry) * 255) | 0;
-          d[i + 3] = 255;
+          d[i + 2] = (lerp(0.14, 0.36, dry) * midrib * 255) | 0;
+          d[i + 3] = (a * 255) | 0;
         } else {
-          d[i] = 0; d[i + 1] = 0; d[i + 2] = 0; d[i + 3] = 0;
+          // Premultiply-safe: an RGB of zero in a transparent texel bleeds
+          // black into the mip chain and darkens every silhouette edge.
+          d[i] = 90; d[i + 1] = 120; d[i + 2] = 50; d[i + 3] = 0;
         }
       }
     }
@@ -127,16 +142,35 @@ function bakeScrub(N = 128) {
         }
       }
     }
+    // One box-blur pass turns the binary stamp into partial coverage, which is
+    // what lets the alphaTest cut a soft edge instead of a staircase.
+    const blur = new Float32Array(S * S);
+    for (let y = 0; y < S; y++) {
+      for (let x = 0; x < S; x++) {
+        let sum = 0, n = 0;
+        for (let oy = -1; oy <= 1; oy++) {
+          for (let ox = -1; ox <= 1; ox++) {
+            const px = x + ox, py = y + oy;
+            if (px < 0 || px >= S || py < 0 || py >= S) continue;
+            sum += Math.min(1, alpha[py * S + px]); n++;
+          }
+        }
+        blur[y * S + x] = sum / n;
+      }
+    }
     for (let i = 0; i < S * S; i++) {
       const j = i * 4;
       const a = alpha[i];
-      if (a === 0) { d[j] = d[j + 1] = d[j + 2] = d[j + 3] = 0; continue; }
+      const cov = Math.min(1, Math.max(a > 0 ? 0.82 : 0, blur[i] * 1.25));
+      if (cov <= 0.004) { d[j] = 78; d[j + 1] = 84; d[j + 2] = 44; d[j + 3] = 0; continue; }
       const leaf = a > 1;
       const n = 0.85 + 0.3 * ((i * 2654435761) % 97) / 97;
-      d[j] = ((leaf ? 0.34 : 0.30) * n * 255) | 0;
-      d[j + 1] = ((leaf ? 0.40 : 0.26) * n * 255) | 0;
-      d[j + 2] = ((leaf ? 0.16 : 0.14) * n * 255) | 0;
-      d[j + 3] = 255;
+      // Dry scrub is a pale olive, not a dark one. At 0.30/0.26/0.14 it was
+      // darker than the shadowed ground it stood on.
+      d[j] = ((leaf ? 0.50 : 0.46) * n * 255) | 0;
+      d[j + 1] = ((leaf ? 0.55 : 0.41) * n * 255) | 0;
+      d[j + 2] = ((leaf ? 0.26 : 0.23) * n * 255) | 0;
+      d[j + 3] = (cov * 255) | 0;
     }
   });
 }
@@ -170,19 +204,49 @@ const WIND_BODY = /* glsl */`
   transformed.y -= abs( sway ) * uWind.z * f * 0.22;
 `;
 
+/**
+ * Backlit translucency. A frond is one cell thick and the sun goes through it;
+ * without this term a palm between the camera and the sun is a black cutout,
+ * which is precisely how the crowns were reading. `uLeaf.x` is the forward
+ * scatter gain, `uLeaf.y` its lobe tightness, `uLeaf.z` a flat ambient wrap so
+ * a frond in full shadow keeps sky colour instead of going to zero.
+ */
+const TRANS_PARS = /* glsl */`
+uniform vec3 uLeaf;
+`;
+
+const TRANS_BODY = /* glsl */`
+  #if ( NUM_DIR_LIGHTS > 0 )
+  {
+    vec3 lvV = normalize( vViewPosition );
+    for ( int lvI = 0; lvI < NUM_DIR_LIGHTS; lvI ++ ) {
+      vec3 lvL = directionalLights[ lvI ].direction;
+      // Forward scatter: brightest when the light is directly behind the leaf
+      // and the camera is looking into it.
+      float lvT = pow( max( dot( lvV, -lvL ), 0.0 ), uLeaf.y );
+      // Plus a wrap term so the shaded side never reaches black.
+      float lvW = max( dot( normal, lvL ) * 0.5 + 0.5, 0.0 );
+      reflectedLight.directDiffuse += directionalLights[ lvI ].color * diffuseColor.rgb
+        * ( lvT * uLeaf.x + lvW * lvW * uLeaf.z );
+    }
+  }
+  #endif
+`;
+
 function makeFoliageMaterial(map, opts = {}) {
   const mat = new THREE.MeshStandardMaterial({
     map,
     alphaTest: opts.alphaTest ?? 0.45,
     side: THREE.DoubleSide,
-    roughness: 0.82,
+    roughness: 0.72,
     metalness: 0.0,
-    envMapIntensity: 0.9,
+    envMapIntensity: 1.15,
     dithering: true,
   });
   const uniforms = {
     uWindTime: { value: 0 },
     uWind: { value: new THREE.Vector3(opts.dirX ?? 0.85, opts.dirZ ?? 0.35, opts.amp ?? 0.16) },
+    uLeaf: { value: new THREE.Vector3(opts.scatter ?? 0.85, opts.lobe ?? 3.2, opts.wrap ?? 0.16) },
   };
   mat.userData.windUniforms = uniforms;
   mat.onBeforeCompile = (shader) => {
@@ -190,8 +254,32 @@ function makeFoliageMaterial(map, opts = {}) {
     shader.vertexShader = shader.vertexShader
       .replace('#include <common>', '#include <common>\n' + WIND_PARS)
       .replace('#include <begin_vertex>', '#include <begin_vertex>\n' + WIND_BODY);
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', '#include <common>\n' + TRANS_PARS)
+      .replace('#include <lights_fragment_end>', '#include <lights_fragment_end>\n' + TRANS_BODY);
   };
   mat.customProgramCacheKey = () => 'lvfoliage';
+
+  // Shadow pass. Three's stock depth material has neither the alpha map nor the
+  // wind displacement, so a cutout crown left on `castShadow` casts a solid
+  // swimming rectangle — which is why the crowns had shadows switched off, and
+  // why a palm looked pasted onto the scene rather than standing in it. A
+  // matching depth material fixes the cause instead of the symptom.
+  const depth = new THREE.MeshDepthMaterial({
+    depthPacking: THREE.RGBADepthPacking,
+    map,
+    alphaTest: mat.alphaTest,
+    side: THREE.DoubleSide,
+  });
+  depth.onBeforeCompile = (shader) => {
+    Object.assign(shader.uniforms, uniforms);
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\n' + WIND_PARS)
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\n' + WIND_BODY);
+  };
+  depth.customProgramCacheKey = () => 'lvfoliageDepth';
+  mat.userData.depthMaterial = depth;
+
   return mat;
 }
 
@@ -256,18 +344,35 @@ function buildCrown(seed = 4) {
   return g;
 }
 
-/** Crossed cards for low scrub. */
+/**
+ * Crossed cards for low scrub. Four uprights on a rosette plus two cards laid
+ * back at ~35° — the tilted pair is what gives the bush a top surface for the
+ * sun to catch, so it reads as a volume rather than as three planes stood on
+ * end and viewed edge-on from half the map.
+ */
 function buildScrub(seed = 9) {
   const b = new GeoBuilder({ uvScale: 1, weather: null });
   const flex = [];
   const r = rng(seed);
-  const blades = 3;
+  const blades = 4;
   for (let i = 0; i < blades; i++) {
     const a = (i / blades) * Math.PI + r() * 0.4;
     const w = 0.62 + r() * 0.3, h = 0.72 + r() * 0.35;
     const ca = Math.cos(a) * w * 0.5, sa = Math.sin(a) * w * 0.5;
     card(b, flex,
       [[-ca, 0, -sa], [ca, 0, sa], [ca, h, sa], [-ca, h, -sa]],
+      [[0, 1], [1, 1], [1, 0], [0, 0]],
+      [0, 0, 1, 1]);
+  }
+  for (let i = 0; i < 2; i++) {
+    const a = i * Math.PI * 0.5 + 0.7 + r() * 0.3;
+    const w = 0.66 + r() * 0.24, h = 0.6 + r() * 0.2;
+    const ca = Math.cos(a), sa = Math.sin(a);
+    const tilt = 0.62;                       // fraction of h that becomes reach
+    card(b, flex,
+      [[-ca * w * 0.5, 0.10, -sa * w * 0.5], [ca * w * 0.5, 0.10, sa * w * 0.5],
+        [ca * w * 0.5 + sa * h * tilt, h * 0.72, sa * w * 0.5 - ca * h * tilt],
+        [-ca * w * 0.5 + sa * h * tilt, h * 0.72, -sa * w * 0.5 - ca * h * tilt]],
       [[0, 1], [1, 1], [1, 0], [0, 0]],
       [0, 0, 1, 1]);
   }
@@ -322,8 +427,14 @@ export class Foliage {
   build(trunkMaterial, opts = {}) {
     const frondTex = bakeFrond(opts.frondSize ?? 256);
     const scrubTex = bakeScrub(128);
-    const frondMat = makeFoliageMaterial(frondTex, { alphaTest: 0.42, amp: opts.windAmp ?? 0.17 });
-    const scrubMat = makeFoliageMaterial(scrubTex, { alphaTest: 0.5, amp: (opts.windAmp ?? 0.17) * 0.45 });
+    const frondMat = makeFoliageMaterial(frondTex, {
+      alphaTest: 0.36, amp: opts.windAmp ?? 0.17,
+      scatter: 1.05, lobe: 3.0, wrap: 0.20,
+    });
+    const scrubMat = makeFoliageMaterial(scrubTex, {
+      alphaTest: 0.40, amp: (opts.windAmp ?? 0.17) * 0.45,
+      scatter: 0.55, lobe: 4.5, wrap: 0.14,
+    });
     this._mats.push(frondMat, scrubMat);
 
     // Trunk: a tapered, gently leaning stack of chamfered drums — palm trunks
@@ -396,10 +507,11 @@ export class Foliage {
       trunks.instanceMatrix.needsUpdate = true;
       crowns.instanceMatrix.needsUpdate = true;
       trunks.castShadow = true; trunks.receiveShadow = true;
-      // Cutout foliage is skipped by the shadow pass: three would render it
-      // with a depth material that has neither the alpha map nor the wind
-      // displacement, so it would cast a solid rectangle that swims.
-      crowns.castShadow = false; crowns.receiveShadow = true;
+      // Crowns now cast through the matching cutout depth material built in
+      // makeFoliageMaterial: dappled frond shadow on the ground under a palm is
+      // one of the few things on this map that reads instantly as outdoors.
+      crowns.customDepthMaterial = this._frondMat.userData.depthMaterial;
+      crowns.castShadow = true; crowns.receiveShadow = true;
       trunks.computeBoundingSphere(); crowns.computeBoundingSphere();
       this.group.add(trunks, crowns);
     } else {
@@ -417,7 +529,8 @@ export class Foliage {
         im.setMatrixAt(i, m);
       });
       im.instanceMatrix.needsUpdate = true;
-      im.castShadow = false;
+      im.customDepthMaterial = this._scrubMat.userData.depthMaterial;
+      im.castShadow = true;
       im.receiveShadow = true;
       im.computeBoundingSphere();
       this.group.add(im);
@@ -433,7 +546,11 @@ export class Foliage {
   }
 
   dispose() {
-    for (const m of this._mats) { m.map?.dispose(); m.dispose(); }
+    for (const m of this._mats) {
+      m.userData.depthMaterial?.dispose();
+      m.map?.dispose();
+      m.dispose();
+    }
     this.group.traverse((o) => o.geometry?.dispose?.());
   }
 }

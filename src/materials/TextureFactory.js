@@ -32,8 +32,28 @@ import { mulberry32, fbm, clamp, clamp01, smoothstep } from './Noise.js';
 const _materialCache = new Map();
 const _surfaceCache = new Map();
 
-/** How much coarser the instant preview pass is than the final bake. */
-const COARSE_DIVISOR = 16;
+/**
+ * Two-part answer to "the preview is a 32px splat".
+ *
+ * `PREVIEW_TEXELS` is the only pass that runs synchronously, and it exists
+ * purely so the texture is never uninitialised garbage on the frame the
+ * material is created. It is deliberately tiny — a full recipe bake is ~0.5 s
+ * of CPU at 512px, so anything larger than this is a visible boot hitch.
+ *
+ * `FIRST_REFINE_TEXELS` is where the refinement ladder *starts*, and it is the
+ * number that actually matters: the scheduler is round-robin, so every material
+ * in the world reaches 128px before any single one goes to 256. At a 2.4 m
+ * world scale 32px is a 75 mm blob per texel — genuinely the "same camouflage
+ * field at the same wrong scale" the surfaces were accused of — while 128px
+ * resolves the form-board lines and the brick courses. The old ladder started
+ * at N/2, so the whole world sat at 32px until an entire half-resolution bake
+ * had completed for every material.
+ */
+const PREVIEW_TEXELS = 32;
+const FIRST_REFINE_TEXELS = 128;
+
+/** Largest number of recipe-private masks `bakePass` will carry per texel. */
+const MAX_MASKS = 6;
 
 /* ------------------------------------------------------------------ tiers */
 
@@ -85,7 +105,7 @@ function splat(src, dst, M, N) {
  * the finished field, then shading — the shading pass needs to know whether a
  * texel is on an edge or in a cavity, which is not knowable one texel at a time.
  */
-function* bakePass(impl, recipe, N, M, dstAlbedo, dstNormal, dstArm, sliced) {
+function* bakePass(impl, recipe, N, M, dstAlbedo, dstNormal, dstArm, sliced, relief) {
   // Target roughly a millisecond per slice at the sampling cost these recipes
   // actually run at, independent of which stage's resolution we are on.
   const chunkRows = sliced ? Math.max(1, Math.round(384 / M)) : 0;
@@ -94,10 +114,10 @@ function* bakePass(impl, recipe, N, M, dstAlbedo, dstNormal, dstArm, sliced) {
   const Nb = direct ? dstNormal : new Uint8Array(M * M * 4);
   const R = direct ? dstArm : new Uint8Array(M * M * 4);
 
-  const masks = recipe.masks ?? 0;
+  const masks = Math.min(recipe.masks ?? 0, MAX_MASKS);
   const H = new Float32Array(M * M);
   const MK = masks ? new Float32Array(M * M * masks) : null;
-  const out = new Float32Array(8);
+  const out = new Float32Array(MAX_MASKS + 4);
 
   for (let y = 0; y < M; y++) {
     const v = (y + 0.5) / M;
@@ -119,12 +139,12 @@ function* bakePass(impl, recipe, N, M, dstAlbedo, dstNormal, dstArm, sliced) {
   });
   if (chunkRows) yield;
 
-  encodeNormals(H, M, Nb, recipe.relief ?? 0.02);
+  encodeNormals(H, M, Nb, relief);
   if (chunkRows) yield;
 
   const curv = derived.curv, ao = derived.ao;
   const ctx = { h: 0, curv: 0, edge: 0, cavity: 0, ao: 1 };
-  const mv = new Float32Array(4);
+  const mv = new Float32Array(MAX_MASKS);
   const sh = new Float32Array(6);
 
   for (let y = 0; y < M; y++) {
@@ -176,8 +196,11 @@ function runToCompletion(gen) { let r = gen.next(); while (!r.done) r = gen.next
  * The set is cached independently of the material, so two materials that differ
  * only by tiling share one GPU upload.
  */
-function getSurfaceSet(id, recipe, size, seed, recipeOpts) {
-  const key = `${id}|${size}|${seed}|${recipeOpts ? JSON.stringify(recipeOpts) : ''}`;
+function getSurfaceSet(id, recipe, size, seed, worldScale, recipeOpts) {
+  // worldScale is part of the *bake* now, not just the projection: every
+  // recipe derives its lattice counts and noise periods from it so features
+  // land at their real physical size. Two tile sizes are two different bakes.
+  const key = `${id}|${size}|${seed}|${worldScale}|${recipeOpts ? JSON.stringify(recipeOpts) : ''}`;
   const hit = _surfaceCache.get(key);
   if (hit) return hit;
 
@@ -187,12 +210,20 @@ function getSurfaceSet(id, recipe, size, seed, recipeOpts) {
   const normal = new Uint8Array(N * N * 4);
   const arm = new Uint8Array(N * N * 4);
 
-  const impl = recipe.build(seed, recipeOpts || {});
+  const impl = recipe.build(seed, Object.assign({ worldScale, size: N }, recipeOpts || {}));
 
-  // Instant pass: 1/256 of the work, splatted into the full-size buffers so
-  // the texture never changes dimensions and nothing has to be re-linked.
-  const coarse = Math.max(32, N / COARSE_DIVISOR);
-  runToCompletion(bakePass(impl, recipe, N, coarse, albedo, normal, arm, false));
+  // `reliefM` is the peak-to-peak height range in METRES; the normal encoder
+  // wants it as a fraction of the tile. Authoring it as a fraction (the old
+  // contract) meant a 2.4 m concrete tile carried 53 mm of relief and a 2 m
+  // brick tile carried 60 mm mortar joints — both read as rubble, not masonry.
+  const relief = recipe.reliefM != null
+    ? recipe.reliefM / Math.max(0.05, worldScale)
+    : (recipe.relief ?? 0.02);
+
+  // Instant pass, splatted into the full-size buffers so the texture never
+  // changes dimensions and nothing has to be re-linked.
+  const coarse = Math.min(PREVIEW_TEXELS, N);
+  runToCompletion(bakePass(impl, recipe, N, coarse, albedo, normal, arm, false, relief));
 
   const set = {
     map: makeDataTexture(albedo, N, true, aniso),
@@ -203,13 +234,15 @@ function getSurfaceSet(id, recipe, size, seed, recipeOpts) {
   };
   _surfaceCache.set(key, set);
 
-  // Refine in slices, half resolution first. The half pass costs a quarter of
-  // the full one, so the surface reaches "sharp enough to stop noticing" about
-  // four times sooner, for a 25% increase in total work.
-  const stages = N >= 256 ? [N >> 1, N] : [N];
+  // Refine progressively from 128px up. Each stage costs a quarter of the next,
+  // so the whole world reaches a legible resolution for ~6% of the work of one
+  // full bake, and the ladder totals only ~1.33x a single full-resolution pass.
+  const stages = [];
+  for (let M = Math.min(FIRST_REFINE_TEXELS, N); M < N; M <<= 1) stages.push(M);
+  stages.push(N);
   const refine = (function* () {
     for (const M of stages) {
-      yield* bakePass(impl, recipe, N, M, albedo, normal, arm, true);
+      yield* bakePass(impl, recipe, N, M, albedo, normal, arm, true, relief);
       // Bumping the Source is enough: every clone that shares it re-uploads,
       // and no material or program is touched.
       set.map.source.needsUpdate = true;
@@ -244,9 +277,16 @@ function tiled(tex, repeat) {
  *   seed        deterministic variation
  *   repeat      UV tiling (ignored when the material is triplanar)
  *   triplanar   force world-space projection on/off (default: recipe's choice)
- *   worldScale  metres per texture tile for the triplanar path
+ *   worldScale  metres per texture tile. Drives the triplanar projection AND
+ *               the bake itself — recipes author their feature sizes in metres
+ *               and derive their lattices from this, so changing it re-bakes
+ *               rather than just re-projecting. For UV-mapped surfaces the
+ *               caller must set its UV scale to the same number.
  *   detail      override the detail-normal family, or `false` to disable
- *   macro       override macro-breakup strength, 0 disables
+ *   detailMetres  size of one detail-normal tile in metres
+ *   macro       macro-breakup strength. Internally split into a hard-capped
+ *               mid band (~4-8 m) and a stronger low band (~15-30 m); values
+ *               above the caps in SurfaceShader.js have no additional effect.
  *   envMapIntensity
  *   material    raw property overrides applied last
  *   recipe      recipe-specific parameters (e.g. asphalt_line's lineWidth)
@@ -261,11 +301,15 @@ export function makeMaterial(preset, opts = {}) {
   const seed = opts.seed ?? 1337;
   const repeat = opts.repeat ?? 1;
 
-  const set = getSurfaceSet(id, recipe, size, seed, opts.recipe);
-
   const shaderOk = tierAllowsShaderDetail();
   const triplanar = shaderOk && (opts.triplanar ?? recipe.triplanar ?? false);
+  // Metres per tile. For triplanar surfaces this is the projection frequency;
+  // for UV-mapped ones the caller sets its UV scale to match. Either way it is
+  // the unit the recipe authors its feature sizes in, so it must be resolved
+  // before the bake, not after.
   const worldScale = opts.worldScale ?? recipe.worldScale ?? 2;
+
+  const set = getSurfaceSet(id, recipe, size, seed, worldScale, opts.recipe);
 
   const props = {
     map: tiled(set.map, repeat),
@@ -289,13 +333,22 @@ export function makeMaterial(preset, opts = {}) {
 
   if (shaderOk) {
     const detail = opts.detail === false ? null : (opts.detail ?? recipe.detail);
+    // The detail normal is authored in metres too (`detailMetres` = size of one
+    // detail tile). Tying it to the base tile instead meant a wall re-scaled
+    // from 2.4 m to 1.0 m silently pulled its micro-relief down to 140 mm and
+    // shimmered. Clamp so it never lands below ~2 cm.
+    const detailMetres = opts.detailMetres ?? recipe.detailMetres ?? null;
+    const detailScale = opts.detailScale ?? (detailMetres
+      ? clamp(worldScale / detailMetres, 1, 24)
+      : (recipe.detailScale ?? 6));
     applySurfaceShader(mat, {
       detail,
-      detailScale: opts.detailScale ?? recipe.detailScale ?? 6,
+      detailScale,
       detailStrength: opts.detailStrength ?? recipe.detailStrength ?? 0.5,
       detailFade: opts.detailFade || [8, 26],
       macro: opts.macro ?? recipe.macro ?? 0,
-      macroPeriod: opts.macroPeriod ?? 26,
+      macroPeriod: opts.macroPeriod ?? 7,
+      macroPeriodLow: opts.macroPeriodLow ?? 30,
       triplanar,
       worldScale,
       triSharp: opts.triSharp ?? 6,
@@ -407,6 +460,11 @@ export function generateSurface({
 export { mulberry32, fbm, RECIPES };
 
 // Automated capture (the screenshot harness) renders a handful of frames and
-// exits, so the default trickle would photograph the coarse pass. Widen the
-// slice budget when a WebDriver is attached; interactive play is untouched.
-if (typeof navigator !== 'undefined' && navigator.webdriver) bakeScheduler.budgetMs = 24;
+// exits, so the default trickle would photograph the preview pass. Lift the
+// ceiling — and the floor — when a WebDriver is attached; interactive play is
+// untouched and keeps the adaptive behaviour.
+if (typeof navigator !== 'undefined' && navigator.webdriver) {
+  bakeScheduler.minMs = 24;
+  bakeScheduler.maxMs = 60;
+  bakeScheduler.budgetMs = 40;
+}

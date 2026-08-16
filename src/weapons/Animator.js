@@ -151,10 +151,23 @@ export class ViewmodelAnimator {
     let ry = THREE.MathUtils.lerp(w.hipPose.rot.y, w.adsPose.rot.y, cur.r);
     let rz = THREE.MathUtils.lerp(w.hipPose.rot.z, w.adsPose.rot.z, cur.r);
 
-    // Everything additive is scaled down while aiming — but never to zero, or
-    // the ADS view reads as a static image pasted over the world.
     const free = 1 - a;
+
+    /* Two different scales, and the split matters.
+     *
+     * Additive *rotation* of the weapon is cheap at ADS: it swings the muzzle
+     * and barely moves the optic, and the camera rig is already contributing
+     * its own aim wobble, so the sight picture stays alive.
+     *
+     * Additive *translation* is not cheap. At full ADS the optic sits ~105 mm
+     * from the eye, so 1.8 mm of residual breathing drift is a whole degree of
+     * angular error and walks the optic ring visibly off centre — the review
+     * measured the ring at 61% / 47% instead of 50% / 50%. The lateral budget
+     * is therefore squeezed hard as the blend closes, which puts the housing on
+     * the screen centre where the reticle already is, and leaves the *world*
+     * to do the moving. */
     const aimScale = THREE.MathUtils.lerp(1, def.adsSwayScale, a);
+    const aimShift = aimScale * THREE.MathUtils.lerp(1, 0.22, a * a);
 
     /* -- 2. breathing ---------------------------------------------------- */
     // Two-rate respiration (chest ~0.24 Hz, a faster shallow component) plus
@@ -164,7 +177,7 @@ export class ViewmodelAnimator {
     const driftX = Math.sin(t * 0.37) * 0.6 + Math.sin(t * 0.83 + 2.1) * 0.25;
     const driftY = Math.sin(t * 0.29 + 1.7) * 0.6 + Math.sin(t * 0.61 + 0.4) * 0.3;
     // Holding breath: aiming steadies the weapon, it does not freeze it.
-    const bScale = 0.0030 * aimScale;
+    const bScale = 0.0030 * aimShift;
     pos.x += driftX * bScale * 0.9;
     pos.y += (breath * 0.8 + driftY * 0.5) * bScale;
     rx += breath * 0.012 * aimScale;
@@ -190,8 +203,8 @@ export class ViewmodelAnimator {
     spring(this._swayY, syT, def.swaySpring, def.swayDamp, dt);
     spring(this._swayR, srT, def.swaySpring * 0.85, def.swayDamp * 0.9, dt);
 
-    pos.x += this._swayX.x * aimScale;
-    pos.y += this._swayY.x * aimScale;
+    pos.x += this._swayX.x * aimShift;
+    pos.y += this._swayY.x * aimShift;
     rx += -this._swayY.x * 3.6 * aimScale;
     ry += this._swayX.x * 3.2 * aimScale;
     rz += this._swayR.x * aimScale;
@@ -217,10 +230,11 @@ export class ViewmodelAnimator {
     const plantKick = this._plant * this._plant;
 
     const bobAmp = this._bobAmount * def.bobScale * aimScale;
+    const bobShift = this._bobAmount * def.bobScale * aimShift;
     // Figure eight: lateral at the stride rate, vertical at twice it.
-    pos.x += Math.sin(p) * 0.0165 * bobAmp;
-    pos.y += (-Math.abs(Math.cos(p)) * 0.011 + 0.004) * bobAmp - plantKick * 0.010 * def.bobScale;
-    pos.z += Math.sin(p * 2 + 0.6) * 0.0055 * bobAmp;
+    pos.x += Math.sin(p) * 0.0165 * bobShift;
+    pos.y += (-Math.abs(Math.cos(p)) * 0.011 + 0.004) * bobShift - plantKick * 0.010 * def.bobScale * (1 - a * 0.75);
+    pos.z += Math.sin(p * 2 + 0.6) * 0.0055 * bobShift;
     rz += Math.sin(p + 0.35) * 0.055 * bobAmp;
     rx += (Math.cos(p * 2) * 0.020 + plantKick * 0.055) * bobAmp;
     ry += Math.sin(p) * 0.030 * bobAmp;

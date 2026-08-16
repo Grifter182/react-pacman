@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { FullScreenPass, createRT } from './PassCore.js';
+import { GradeShared } from './GradeShared.js';
 
 /**
  * OWNER: rendering / post-processing agent.
@@ -13,9 +14,24 @@ import { FullScreenPass, createRT } from './PassCore.js';
  * Upsample uses a 3x3 tent and accumulates additively into the next-larger mip,
  * so the final result is a proper sum of octaves rather than one fat gaussian.
  *
- * The threshold is a soft knee applied only in the first downsample. It is
- * deliberately high and the final intensity deliberately low: bloom here is
- * lens scatter around genuinely bright things, not a glow filter.
+ * TWO THINGS THAT WERE WRONG AND ARE THE REASON NOTHING BLOOMED
+ * -------------------------------------------------------------
+ * 1. The threshold was in *raw scene* units (1.15) while the frame is exposed
+ *    afterwards. Nothing in this level's light rig except the sky and the sun
+ *    disc gets above 1.15 raw, so a sunlit wall, a muzzle flash reflection and
+ *    a hot specular all fell under the knee and produced literally zero. The
+ *    threshold is now exposure-relative — it is compared against the value the
+ *    pixel will actually tonemap at — so it means "things that are about to
+ *    blow out", which is what a lens scatters. The exposure arrives through
+ *    GradeShared because PostStack calls `render()` with a texture and a size.
+ *
+ * 2. The octave sum was unnormalised. Each mip contributes into the next with
+ *    unit gain, so the total energy scaled with the number of mips: the same
+ *    `bloomIntensity` was 4 octaves at LOW and 6 at ULTRA, i.e. a ~1.7x
+ *    difference in bloom between tiers, tuned on one of them. The prefilter now
+ *    carries a normalising scale derived from the octave weight and the mip
+ *    count, so `bloomIntensity` is a real fraction of the scattered energy and
+ *    means the same thing on every tier.
  */
 export class Bloom {
   constructor() {
@@ -27,19 +43,34 @@ export class Bloom {
     this.up = null;
     this.streak = null;
 
-    this.threshold = 1.15;
+    /** Exposure-relative. 1.0 = the value that tonemaps to display white. */
+    this.threshold = 0.85;
     this.knee = 0.6;
     this.radius = 0.85;      // upsample tent spread in texels
+    /** Per-octave gain in the progressive upsample. <1 tapers the widest halo. */
+    this.octaveWeight = 0.75;
   }
 
   init(mipCount) {
     this._mipCount = Math.max(2, Math.min(8, mipCount | 0));
 
+    // A sampler2D must always have something bound even on the frame before
+    // Exposure has published an adaptation result.
+    if (!this._fallback) {
+      this._fallback = new THREE.DataTexture(new Uint8Array([0, 0, 0, 255]), 1, 1, THREE.RGBAFormat);
+      this._fallback.needsUpdate = true;
+    }
+
     this.prefilter = new FullScreenPass('bloom-prefilter', PREFILTER_FRAG, {
       tSrc: { value: null },
+      tAdapt: { value: null },
       uTexel: { value: new THREE.Vector2() },
       uThreshold: { value: this.threshold },
       uKnee: { value: this.knee },
+      uNormalise: { value: 1.0 },
+      uKeyValue: { value: GradeShared.keyValue },
+      uStaticExposure: { value: 1.0 },
+      uHasAdapt: { value: 0 },
     });
     this.down = new FullScreenPass('bloom-down', DOWN_FRAG, {
       tSrc: { value: null },
@@ -49,6 +80,7 @@ export class Bloom {
       tSrc: { value: null },
       uTexel: { value: new THREE.Vector2() },
       uRadius: { value: this.radius },
+      uWeight: { value: this.octaveWeight },
     }, { blending: THREE.AdditiveBlending, transparent: true });
     this.streak = new FullScreenPass('bloom-streak', STREAK_FRAG, {
       tSrc: { value: null },
@@ -76,6 +108,19 @@ export class Bloom {
   }
 
   /**
+   * Mip k reaches mip 0 with gain octaveWeight^k, so the finished sum carries
+   * (1 - w^n) / (1 - w) times the prefiltered energy. Scaling it out in the
+   * prefilter (which every mip descends from) normalises the whole chain for
+   * one multiply.
+   */
+  _normalisation() {
+    const n = Math.max(1, this.mips.length);
+    const w = Math.min(0.999, Math.max(0, this.octaveWeight));
+    const total = (1 - Math.pow(w, n)) / (1 - w);
+    return 1 / Math.max(total, 1e-4);
+  }
+
+  /**
    * @returns {{bloom: THREE.Texture, streak: THREE.Texture}}
    */
   render(renderer, srcTexture, srcW, srcH) {
@@ -83,10 +128,16 @@ export class Bloom {
     if (mips.length === 0) return { bloom: null, streak: null };
 
     // --- prefilter + downsample chain --------------------------------------
-    this.prefilter.uniforms.tSrc.value = srcTexture;
-    this.prefilter.uniforms.uTexel.value.set(1 / srcW, 1 / srcH);
-    this.prefilter.uniforms.uThreshold.value = this.threshold;
-    this.prefilter.uniforms.uKnee.value = this.knee;
+    const p = this.prefilter.uniforms;
+    p.tSrc.value = srcTexture;
+    p.uTexel.value.set(1 / srcW, 1 / srcH);
+    p.uThreshold.value = this.threshold;
+    p.uKnee.value = this.knee;
+    p.uNormalise.value = this._normalisation();
+    p.uKeyValue.value = GradeShared.keyValue;
+    p.uStaticExposure.value = GradeShared.staticExposure;
+    p.tAdapt.value = GradeShared.adaptTexture || this._fallback;
+    p.uHasAdapt.value = GradeShared.adaptTexture ? 1 : 0;
     this.prefilter.render(renderer, mips[0]);
 
     for (let i = 1; i < mips.length; i++) {
@@ -112,6 +163,7 @@ export class Bloom {
       this.up.uniforms.tSrc.value = mips[i].texture;
       this.up.uniforms.uTexel.value.set(1 / mips[i].width, 1 / mips[i].height);
       this.up.uniforms.uRadius.value = this.radius;
+      this.up.uniforms.uWeight.value = this.octaveWeight;
       this.up.render(renderer, mips[i - 1]);
     }
 
@@ -130,14 +182,19 @@ export class Bloom {
   }
 }
 
-/** Karis-averaged 13-tap box + soft-knee threshold. */
+/** Karis-averaged 13-tap box + exposure-relative soft-knee threshold. */
 const PREFILTER_FRAG = /* glsl */`
 in vec2 vUv;
 layout(location = 0) out vec4 fragColor;
 uniform sampler2D tSrc;
+uniform sampler2D tAdapt;
 uniform vec2 uTexel;
 uniform float uThreshold;
 uniform float uKnee;
+uniform float uNormalise;
+uniform float uKeyValue;
+uniform float uStaticExposure;
+uniform int uHasAdapt;
 
 vec3 fetch(vec2 uv){ return min(texture(tSrc, uv).rgb, vec3(64.0)); }
 float karisWeight(vec3 c){ return 1.0 / (1.0 + luma(c)); }
@@ -172,14 +229,22 @@ void main(){
   vec3 colour = (g0 * w0 + g1 * w1 + g2 * w2 + g3 * w3 + g4 * w4)
               / max(w0 + w1 + w2 + w3 + w4, 1e-5);
 
+  // Threshold against what the pixel will be EXPOSED to, not its raw value:
+  // the same arithmetic ColorGrade does, so "1.0" here is display white there.
+  float exposure = uStaticExposure;
+  if (uHasAdapt == 1) exposure *= uKeyValue / max(texture(tAdapt, vec2(0.5)).r, 1e-4);
+  exposure = clamp(exposure, 0.02, 40.0);
+
   // Soft-knee threshold (Unity/Jimenez curve): quadratic ramp through the knee
   // so the bloom boundary is not a visible contour.
-  float br = max(colour.r, max(colour.g, colour.b));
+  float br = max(colour.r, max(colour.g, colour.b)) * exposure;
   float knee = uThreshold * uKnee;
   float soft = clamp(br - uThreshold + knee, 0.0, 2.0 * knee);
   soft = soft * soft / (4.0 * knee + 1e-5);
   float contrib = max(soft, br - uThreshold) / max(br, 1e-5);
-  fragColor = vec4(colour * contrib, 1.0);
+
+  // Output stays in SCENE units — ColorGrade adds bloom before it exposes.
+  fragColor = vec4(colour * contrib * uNormalise, 1.0);
 }
 `;
 
@@ -220,6 +285,7 @@ layout(location = 0) out vec4 fragColor;
 uniform sampler2D tSrc;
 uniform vec2 uTexel;
 uniform float uRadius;
+uniform float uWeight;
 void main(){
   vec2 t = uTexel * uRadius;
   vec3 o = texture(tSrc, vUv + vec2(-t.x,  t.y)).rgb * 1.0;
@@ -231,7 +297,7 @@ void main(){
   o += texture(tSrc, vUv + vec2(-t.x, -t.y)).rgb * 1.0;
   o += texture(tSrc, vUv + vec2( 0.0, -t.y)).rgb * 2.0;
   o += texture(tSrc, vUv + vec2( t.x, -t.y)).rgb * 1.0;
-  fragColor = vec4(o * (1.0 / 16.0), 1.0);
+  fragColor = vec4(o * (uWeight / 16.0), 1.0);
 }
 `;
 

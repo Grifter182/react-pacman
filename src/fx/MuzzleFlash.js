@@ -23,12 +23,19 @@ import { LAYER, P, resetP } from './ParticleSystem.js';
  * particles emitted at the muzzle's world position — the viewmodel camera
  * tracks the player camera exactly, so that position is directly usable.
  *
- * The dynamic light for a shot is spawned by LightingModule off the same
- * 'weapon:fire' event; duplicating it here would only evict a real light from
- * a six-slot pool.
+ * THE FLASH MUST SURVIVE AT LEAST ONE RENDERED FRAME
+ * ---------------------------------------------------
+ * A 45 ms flash decayed by `dt` is not a flash at all when `dt` is 160 ms: the
+ * envelope reaches zero inside the same frame it was triggered, so the star,
+ * the core and the gas cone are all drawn at opacity 0 and the shot leaves no
+ * trace on screen. That is not a hypothetical — it is why the captured firing
+ * frames had no muzzle flash. The envelope below is therefore driven by time
+ * *and* by a rendered-frame counter, and cannot complete before the flash has
+ * actually been photographed twice.
  */
 export class MuzzleFlash {
   constructor(engine) {
+    this.engine = engine;
     this.root = new THREE.Group();
     this.root.name = 'FxMuzzleFlash';
     this.root.frustumCulled = false;
@@ -98,8 +105,10 @@ export class MuzzleFlash {
     }
     this.cardGeo = cardGeo;
 
-    this.timer = 0;
-    this.duration = 0.045;
+    this.live = false;
+    this.age = 0;
+    this.frames = 0;
+    this.duration = 0.055;
     this.heat = 0;               // barrel heat, 0..1 — drives smoke
     this._scale = 1;
     this._coneScale = 1;
@@ -118,10 +127,12 @@ export class MuzzleFlash {
     // of the tells of a cheap gun effect.
     const bore = def && def.damage ? THREE.MathUtils.clamp(def.damage / 34, 0.7, 1.5) : 1;
     const v = 0.75 + Math.random() * 0.6;
-    this._scale = 0.085 * bore * v;
-    this._coneScale = 0.16 * bore * (0.7 + Math.random() * 0.7);
-    this.duration = 0.032 + Math.random() * 0.022;
-    this.timer = this.duration;
+    this._scale = 0.105 * bore * v;
+    this._coneScale = 0.19 * bore * (0.7 + Math.random() * 0.7);
+    this.duration = 0.052 + Math.random() * 0.030;
+    this.age = 0;
+    this.frames = 0;
+    this.live = true;
 
     this.star.material.rotation = Math.random() * Math.PI * 2;
     this.core.material.rotation = Math.random() * Math.PI * 2;
@@ -132,6 +143,34 @@ export class MuzzleFlash {
 
     this.heat = Math.min(1, this.heat + 0.13);
     this._emitWorld(worldPos, dir, particles);
+    this._light(worldPos, dir, bore);
+  }
+
+  /**
+   * The shot's own light on the world.
+   *
+   * LightingModule also spawns one off 'weapon:fire' — at 26 cd for 55 ms,
+   * which is under a tenth of the key's irradiance two metres out and expires
+   * inside a single slow frame. This one is sized against the sun (the key is
+   * ~19 in the same units) and lives long enough to be seen: a flash that does
+   * not touch the wall beside you is a decal on the lens, not a light.
+   */
+  _light(pos, dir, bore) {
+    const pool = this.engine && this.engine.dynamicLights;
+    if (!pool) return;
+    // Sat a little forward of the crown: the gas ball that emits the light is
+    // outside the barrel, and offsetting it stops the near clip of the
+    // viewmodel from being the brightest thing in the scene.
+    _lp.copy(pos).addScaledVector(dir, 0.22);
+    pool.spawn({
+      position: _lp,
+      color: 0xffc98a,
+      intensity: (52 + Math.random() * 22) * bore,
+      radius: 13 * bore,
+      // 0.055 s was both too short to read at 60 fps and too short to survive
+      // a capture. ~0.1 s with the pool's quadratic decay is one clear pulse.
+      life: 0.105,
+    });
   }
 
   /** Smoke, blow-by dust and shimmer — these live in the world, not the gun. */
@@ -151,10 +190,12 @@ export class MuzzleFlash {
       P.gravity = -0.04;
       P.turbulence = 0.35;
       P.lit = 1;
-      P.size0 = 0.035 + Math.random() * 0.03;
+      P.size0 = 0.065 + Math.random() * 0.055;
       P.size1 = P.size0 * (5 + this.heat * 4);
       P.spin = (Math.random() - 0.5) * 2.2;
-      P.alpha = 0.10 + this.heat * 0.16;
+      // Powder smoke off a rifle is thin but it is not invisible, and it is the
+      // only part of the shot that is still on screen a second later.
+      P.alpha = 0.20 + this.heat * 0.22;
       P.tile = Math.random() < 0.5 ? PT.SMOKE : PT.WISP;
       P.fade = 1.7;
       P.soft = 0.35;
@@ -164,7 +205,7 @@ export class MuzzleFlash {
     }
 
     // A few burning grains thrown clear of the crown.
-    const grains = 2 + (Math.random() * 4) | 0;
+    const grains = 4 + ((Math.random() * 5) | 0);
     for (let i = 0; i < grains; i++) {
       resetP();
       P.x = pos.x; P.y = pos.y; P.z = pos.z;
@@ -174,9 +215,9 @@ export class MuzzleFlash {
       P.vz = dir.z * sp + (Math.random() - 0.5) * 3;
       P.life = 0.12 + Math.random() * 0.22;
       P.drag = 2.2; P.gravity = 0.8;
-      P.size0 = 0.007 + Math.random() * 0.008;
+      P.size0 = 0.013 + Math.random() * 0.012;
       P.size1 = P.size0 * 0.4;
-      P.stretch = 0.02;
+      P.stretch = 0.038;
       P.alpha = 1; P.tile = PT.SPARK; P.fade = 1.2; P.soft = 0;
       P.r0 = 5.0; P.g0 = 2.6; P.b0 = 0.8;
       P.r1 = 1.2; P.g1 = 0.25; P.b1 = 0.05;
@@ -203,15 +244,14 @@ export class MuzzleFlash {
    */
   update(dt, engine) {
     this.heat = Math.max(0, this.heat - dt * 0.55);
-    if (this.timer <= 0) {
+    if (!this.live) {
       if (this.root.visible) this.root.visible = false;
       return;
     }
-    this.timer = Math.max(0, this.timer - dt);
 
     const weapons = engine.get('weapons');
     const muzzle = weapons && weapons.muzzle;
-    if (!muzzle) { this.root.visible = false; return; }
+    if (!muzzle) { this.root.visible = false; this.live = false; return; }
     muzzle.updateWorldMatrix(true, false);
     if (this.camera) {
       _m4.copy(this.camera.matrixWorld).invert().multiply(muzzle.matrixWorld);
@@ -222,11 +262,24 @@ export class MuzzleFlash {
 
     // Fast attack, fast decay. The star peaks a hair after the core, which is
     // what gives the flash a shape rather than a single pop.
-    const u = 1 - this.timer / this.duration;
+    //
+    // The envelope is clamped by the number of frames actually rendered until
+    // two have gone by, so the first photographed frame is always the peak and
+    // the second is always the mid-decay — no matter how long `dt` is. Past
+    // two frames the clamp is inert and the flash is purely time-driven again.
+    let u = this.age / this.duration;
+    if (this.frames < 2) u = Math.min(u, this.frames * 0.5);
+    u = u < 0 ? 0 : (u > 1 ? 1 : u);
+    this.frames++;
+    this.age += dt;
+    if (u >= 1) this.live = false;
+
     const core = Math.pow(1 - u, 1.5);
     // The star lags the core by a fraction of the flash: the powder outside the
     // crown ignites after the crown itself is already blown out.
-    const star = Math.min(u / 0.18, 1) * Math.pow(1 - u, 1.8);
+    // ...but it must not START at zero, or a frame captured at the peak shows
+    // a bare core and none of the shape.
+    const star = Math.min(0.55 + u / 0.18, 1) * Math.pow(1 - u, 1.8);
 
     this.core.material.opacity = core;
     this.core.scale.setScalar(this._scale * (0.65 + 0.5 * core));
@@ -255,3 +308,4 @@ export class MuzzleFlash {
 
 const _s = new THREE.Vector3();
 const _m4 = new THREE.Matrix4();
+const _lp = new THREE.Vector3();

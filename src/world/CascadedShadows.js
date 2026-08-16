@@ -253,8 +253,27 @@ export class CascadedShadows {
       const texelWorld = (2 * r) / this.mapSize;
       light.shadow.bias = -(1.4 * texelWorld + 0.015) / depthRange;
       light.shadow.normalBias = 1.35 * texelWorld + 0.008;
-      // Constant world-space penumbra where the resolution can afford it.
-      light.shadow.radius = Math.min(Math.max(this.worldBlur / texelWorld, 1.0), 3.0);
+
+      // PENUMBRA. The sun subtends 0.53 degrees, so a shadow's soft edge is
+      // 0.0093 * (occluder-to-receiver distance) wide — 4 cm under a kerb, 40 cm
+      // under a roofline. Two things carry that here:
+      //
+      //   - the contact-hardening estimate in the sampler, which opens the
+      //     filter when the blocker is high above the receiver, and
+      //   - this base radius, which sets the widest the filter is allowed to go
+      //     in a given cascade.
+      //
+      // The base is a constant WORLD blur converted into that cascade's texels,
+      // so a metre of penumbra is a metre in every cascade rather than a fixed
+      // texel count that shrinks to nothing up close. The old ceiling of 3
+      // texels defeated exactly this: at cascade 0 the requested blur wanted 89
+      // texels and got 3, i.e. 9 mm, so near shadows were razor sharp no matter
+      // how far above the ground their caster was, while the far cascades were
+      // running at the same 3 texels and therefore 26 cm — the penumbra was an
+      // artefact of the clamp rather than of the geometry. Raising the ceiling
+      // to 6 lets the near cascades soften, and the contact-hardening term is
+      // what pulls them tight again where a caster genuinely touches down.
+      light.shadow.radius = Math.min(Math.max(this.worldBlur / texelWorld, 1.2), 6.0);
     }
   }
 
@@ -269,8 +288,22 @@ export class CascadedShadows {
 #define CSM_CASCADES ${c}
 #endif
 #define CSM_PCF_TAPS ${this.pcfTaps}
-#define CSM_SEARCH_SCALE 3.2
+#define CSM_SEARCH_SCALE 4.6
+#define CSM_SEARCH_TAPS 6
 ${this.contactHardening ? '#define CSM_CONTACT_HARDENING' : ''}
+
+// The cascade collapse is only correct for a scene whose first CSM_CASCADES
+// directional lights ARE the cascades — i.e. one that has that many directional
+// shadows. Every other scene must keep three's stock path.
+//
+// This guard is not defensive tidiness, it was a live bug: the viewmodel scene
+// carries three ordinary directional lights (key, fill, rim) and no shadows, so
+// the unguarded patch treated all three as cascades and shaded ONLY index 0.
+// The first-person weapon has had no fill and no rim light since the patch
+// landed, which is most of why it read as a flat cut-out against the world.
+#if defined( USE_SHADOWMAP ) && ( NUM_DIR_LIGHT_SHADOWS >= CSM_CASCADES )
+	#define CSM_ACTIVE
+#endif
 `;
 
     for (let i = 0; i < c; i++) {
@@ -314,7 +347,7 @@ ${this.contactHardening ? '#define CSM_CONTACT_HARDENING' : ''}
 	// band rather than a visible seam where the filter radius jumps.
 	float csmShadow = 1.0;
 
-	#if defined( USE_SHADOWMAP ) && NUM_DIR_LIGHT_SHADOWS > 0
+	#if defined( CSM_ACTIVE )
 
 		float csmViewDepth = - geometryPosition.z;
 		float csmAccum = 0.0;
@@ -353,7 +386,7 @@ ${this.contactHardening ? '#define CSM_CONTACT_HARDENING' : ''}
 
 		getDirectionalLightInfo( directionalLight, directLight );
 
-		#if ( UNROLLED_LOOP_INDEX < CSM_CASCADES )
+		#if defined( CSM_ACTIVE ) && ( UNROLLED_LOOP_INDEX < CSM_CASCADES )
 
 			// Cascade slots 1..N-1 exist only to own a shadow map; slot 0 carries
 			// the sun's whole radiance and the resolved cascade shadow.
@@ -427,13 +460,23 @@ ${this._glslCascadeSupport()}
 				#else
 					float zProbe = shadowCoord.z - probeDelta;
 				#endif
-				for ( int s = 0; s < 4; s ++ ) {
-					vec2 o = vogelDiskSample( s, 4, phi ) * ( radius * CSM_SEARCH_SCALE ) * texelSize;
+				for ( int s = 0; s < CSM_SEARCH_TAPS; s ++ ) {
+					vec2 o = vogelDiskSample( s, CSM_SEARCH_TAPS, phi ) * ( radius * CSM_SEARCH_SCALE ) * texelSize;
 					o0 += 1.0 - texture( shadowMap, vec3( shadowCoord.xy + o, shadowCoord.z ) );
 					o1 += 1.0 - texture( shadowMap, vec3( shadowCoord.xy + o, zProbe ) );
 				}
+				// "hard" is 0 where the blocker sits on the receiver and 1 where
+				// it is a probe-depth or more above it. The span between the two
+				// ends has to be wide or the penumbra never visibly changes: at
+				// 0.5x..3.2x a contact edge and a roofline edge differed by a
+				// factor of six in filter width but both landed inside the same
+				// two or three texels, which is why every shadow in the game
+				// read as one uniform softness. 0.28x..4.6x is a 16x span, and
+				// combined with the raised base radius the near cascade can
+				// actually resolve the difference.
 				float hard = ( o0 > 0.02 ) ? clamp( o1 / o0, 0.0, 1.0 ) : 0.0;
-				radius = mix( radius * 0.5, radius * CSM_SEARCH_SCALE, hard );
+				hard = hard * hard * ( 3.0 - 2.0 * hard );
+				radius = mix( radius * 0.28, radius * CSM_SEARCH_SCALE, hard );
 
 			#endif
 

@@ -5,17 +5,28 @@
  *
  * Rules the whole sheet obeys:
  *   - One 8px grid. Every offset, gap and size is a multiple of `--u`.
- *   - Condensed type only, tracked wide for labels and tight for numerals,
- *     tabular figures everywhere a number changes at runtime so nothing jitters.
+ *   - THREE TYPE TIERS AND NO MORE. Everything on screen is exactly one of:
+ *       T1  the two numbers a player reads mid-firefight — health and rounds
+ *           in the magazine. Large, heavy, near-white, carrying a real drop
+ *           shadow so the digits survive over sunlit ground.
+ *       T2  the things checked between engagements — weapon, clock, score.
+ *           Two thirds the value of T1, one weight lighter, tracked open.
+ *       T3  structure and provenance — map name, fire mode, objective, tick
+ *           labels. A third of T1's value, small, wide-tracked, never bold.
+ *     A readout that cannot justify T1 or T2 is T3. There is no fourth tier
+ *     and there are no bespoke colours outside the semantic four.
+ *   - Nothing is pure white. `--t1` tops out at 92% of a warm off-white; the
+ *     HUD has to sit *in* the rendered image, not float in front of it as a
+ *     razor-crisp vector overlay.
  *   - Rules are 1px and low-contrast; weight comes from tracking and value, not
  *     from borders. Panels are dark glass with a single accent edge.
  *   - Nothing snaps. Every state change is eased on `--ease`, and the durations
  *     are quantised to three steps so unrelated elements move in sympathy.
  *   - Colour is semantic: friendly cyan, hostile red, caution amber, and a
  *     desaturated ink for everything that is only structure.
- *   - A hairline chromatic edge (one red and one cyan sub-pixel offset) sits on
- *     the primary readouts. It reads as an optical artefact of the display the
- *     numbers are supposedly rendered on, not as a drop shadow.
+ *   - No permanent instructional text. A control legend on the HUD is a tutorial
+ *     that never ends; state is shown by a glyph that appears when the state
+ *     changes and then gets out of the way.
  *
  * No web fonts: the stack is local condensed faces with a synthetic condense
  * fallback, so the layout holds on a machine that has none of them.
@@ -35,6 +46,19 @@ export const UI_CSS = /* css */`
   --fg: #dde7f1;
   --fg-dim: rgba(221,231,241,.52);
   --fg-mute: rgba(221,231,241,.30);
+
+  /* --- the three tiers. Nothing on the HUD picks a colour outside these. --- */
+  --t1: rgba(232,239,246,.93);      /* health, magazine                       */
+  --t2: rgba(216,228,240,.66);      /* weapon, clock, score                   */
+  --t3: rgba(205,219,234,.38);      /* labels, objective, provenance          */
+  /* Every tier carries a shadow, and the shadow is what buys the low tiers the
+     right to be dim. Contrast against the scene comes from the dark halo, not
+     from the fill value; without it a 33%-alpha off-white label over sunlit
+     ground is not subtle, it is simply gone. T1's is the only one heavy enough
+     to read as a cast shadow — the rest are haloes. */
+  --sh1: 0 1px 2px rgba(2,4,7,.95), 0 0 5px rgba(2,4,7,.85), 0 3px 16px rgba(2,4,7,.6);
+  --sh2: 0 1px 2px rgba(2,4,7,.9), 0 0 5px rgba(2,4,7,.72);
+  --sh3: 0 1px 2px rgba(2,4,7,.88), 0 0 4px rgba(2,4,7,.66);
 
   --friend: #63c8ff;
   --friend-dk: #1b5f86;
@@ -58,11 +82,16 @@ export const UI_CSS = /* css */`
   font-family: var(--font);
   font-stretch: 87.5%;
   color: var(--fg);
-  -webkit-font-smoothing: antialiased;
   user-select: none;
-  --hud-a: 1;                      /* master HUD fade, driven from JS */
+  /* Master HUD fade. It rests below 1 on purpose: a HUD at full opacity is the
+     sharpest, highest-contrast object in a rendered frame, which reads as an
+     overlay pasted on top of a game rather than a display inside one. */
+  --hud-a: .93;
 }
 .bl-root * { box-sizing: border-box; }
+/* Menus and the scoreboard are read at rest and want the crisp grey-scale
+   rasteriser; the gameplay HUD explicitly does not — see .bl-hud below. */
+.bl-menu, .bl-sb, .bl-load { -webkit-font-smoothing: antialiased; }
 
 /* Structural type roles. */
 .bl-lab {
@@ -71,7 +100,20 @@ export const UI_CSS = /* css */`
 }
 .bl-num { font-variant-numeric: tabular-nums; letter-spacing: .01em; font-weight: 700; }
 .bl-brk { opacity: .35; padding: 0 .35em; }
-.bl-chroma { text-shadow: .7px 0 0 rgba(255,64,40,.30), -.7px 0 0 rgba(64,190,255,.28), 0 2px 12px rgba(0,0,0,.85); }
+
+/* ---- the three tiers, as classes. Apply one; never mix two. -------------- */
+.bl-t1 {
+  color: var(--t1); font-weight: 700; letter-spacing: .005em;
+  text-shadow: var(--sh1);
+}
+.bl-t2 {
+  color: var(--t2); font-weight: 600; letter-spacing: .13em;
+  text-shadow: var(--sh2);
+}
+.bl-t3 {
+  color: var(--t3); font-weight: 500; font-size: 9px; letter-spacing: .22em;
+  text-transform: uppercase; text-shadow: var(--sh3);
+}
 
 /* A panel: dark glass, one hairline, corner ticks, accent edge on the left. */
 .bl-panel {
@@ -94,24 +136,42 @@ export const UI_CSS = /* css */`
 
 /* --- crosshair ------------------------------------------------------------ */
 /* --gap is the only property written per frame; it is the real cone radius
-   projected to pixels, so the reticle is a readout, not a decoration. */
+   projected to pixels, so the reticle is a readout, not a decoration.
+ *
+ * PIXEL GRID. Every number here is an even integer and --gap is rounded to a
+ * whole pixel in JS, because the reticle is the one element in the frame where
+ * a half-pixel is visible: a blade laid down on a .5 boundary is rasterised as
+ * two 50% rows instead of one solid row, and since the top blade's fractional
+ * part is the complement of the bottom blade's, the two ends of the same
+ * reticle land on different sub-pixel phases and the whole thing reads as
+ * lopsided. The container origin is also snapped to an integer by
+ * Crosshair.resize() rather than left on left:50%, which is a half pixel
+ * whenever the viewport has an odd dimension.
+ */
 .bl-xh {
-  --gap: 9px; --blade: 7px; --w: 2px; --a: 1;
+  --gap: 9px; --blade: 8px; --w: 2px; --a: 1;
   position: absolute; left: 50%; top: 50%; width: 0; height: 0;
   opacity: var(--a);
   will-change: opacity;
 }
+/* The blades are drawn as a light core inside a hard 1px dark ring. The ring is
+   what makes them survive over sunlit concrete; a blur-only shadow does not,
+   because it has no edge for the eye to lock onto. */
 .bl-xh b {
-  position: absolute; background: #eef5ff; display: block;
-  box-shadow: 0 0 2px rgba(0,0,0,.95), 0 0 6px rgba(0,0,0,.55);
+  position: absolute; display: block;
+  background: var(--t1);
+  box-shadow: 0 0 0 1px rgba(3,5,8,.78), 0 0 5px rgba(3,5,8,.6);
 }
 .bl-xh .t { width: var(--w); height: var(--blade); left: calc(var(--w) / -2); top: calc(0px - var(--gap) - var(--blade)); }
 .bl-xh .b { width: var(--w); height: var(--blade); left: calc(var(--w) / -2); top: var(--gap); }
 .bl-xh .l { height: var(--w); width: var(--blade); top: calc(var(--w) / -2); left: calc(0px - var(--gap) - var(--blade)); }
 .bl-xh .r { height: var(--w); width: var(--blade); top: calc(var(--w) / -2); left: var(--gap); }
-.bl-xh .dot { width: 2px; height: 2px; left: -1px; top: -1px; opacity: .6; border-radius: 50%; }
-/* Sprint/obstructed state: blades retract and the dot dims. */
+/* A real centre dot: 2px of core inside the same ring, which is 4px of total
+   mark. At 1px with 60% alpha it was invisible in every captured frame. */
+.bl-xh .dot { width: 2px; height: 2px; left: -1px; top: -1px; border-radius: 50%; }
+/* Sprint/obstructed state: blades retract and the reticle drops a tier. */
 .bl-xh.bl-idle { --blade: 4px; }
+.bl-xh.bl-idle b { background: var(--t2); }
 
 /* Hitmarker: three grades, differentiated by colour, spread and blade weight. */
 .bl-hm {
@@ -120,8 +180,8 @@ export const UI_CSS = /* css */`
   will-change: transform, opacity;
 }
 .bl-hm i {
-  position: absolute; width: 10px; height: 2px; background: #fff;
-  box-shadow: 0 0 3px rgba(0,0,0,.9);
+  position: absolute; width: 10px; height: 2px; background: var(--t1);
+  box-shadow: 0 0 0 1px rgba(3,5,8,.6), 0 0 3px rgba(0,0,0,.9);
 }
 .bl-hm i:nth-child(1) { top: 5px; left: 4px; transform: rotate(45deg); transform-origin: 0 50%; }
 .bl-hm i:nth-child(2) { top: 5px; right: 4px; transform: rotate(-45deg); transform-origin: 100% 50%; }
@@ -164,81 +224,147 @@ export const UI_CSS = /* css */`
 }
 
 /* --- bottom-left: vitals --------------------------------------------------- */
-.bl-bl { position: absolute; left: var(--safe); bottom: var(--safe); width: calc(var(--u) * 34); }
-.bl-hprow { display: flex; align-items: flex-end; gap: var(--u); margin-bottom: calc(var(--u) * .75); }
-.bl-hpval { font-size: 30px; line-height: .84; }
-.bl-hpmax { font-size: 12px; color: var(--fg-mute); padding-bottom: 3px; }
-.bl-hpstate { margin-left: auto; font-size: 10px; letter-spacing: .2em; color: var(--fg-mute); padding-bottom: 4px; }
-.bl-hpbar { position: relative; height: 5px; background: rgba(255,255,255,.10); overflow: hidden; }
-/* Ghost bar lags the real one, so the size of a hit is visible after it lands. */
-.bl-hpbar .ghost { position: absolute; inset: 0; width: 100%; background: rgba(255,90,65,.45); transition: width .55s .18s var(--ease-out); }
-.bl-hpbar .fill { position: absolute; inset: 0; width: 100%; background: var(--fg); transition: width var(--t-fast) linear, background var(--t-med) var(--ease); }
-.bl-hpbar .seg { position: absolute; top: 0; bottom: 0; width: 1px; background: rgba(5,7,10,.85); }
-.bl-bl.bl-hurt .fill { background: var(--warn); }
-.bl-bl.bl-crit .fill { background: var(--hostile); }
+/* ONE ENCODING. The block used to carry the number, the maximum, a bar, a ghost
+   bar and the word STABLE — five marks for one scalar, four of which the player
+   never looked at. What survives is the numeral: T1, and the only element on the
+   HUD that is allowed to change hue, because a health value going amber and then
+   red is the readout the low-health vignette is already reinforcing. */
+.bl-bl {
+  position: absolute; left: var(--safe); bottom: var(--safe);
+  display: flex; align-items: flex-end; gap: calc(var(--u) * 1.5);
+}
+.bl-hpval {
+  font-size: 34px; line-height: .8;
+  transition: color var(--t-med) var(--ease);
+}
+.bl-bl.bl-hurt .bl-hpval { color: var(--warn); }
 .bl-bl.bl-crit .bl-hpval { color: var(--hostile); }
-.bl-bl.bl-regen .bl-hpstate { color: var(--good); }
-.bl-stance { display: flex; gap: calc(var(--u) * 2); margin-top: calc(var(--u) * 1.25); }
-.bl-stance span { font-size: 10px; letter-spacing: .2em; color: var(--fg-mute); transition: color var(--t-fast) var(--ease); }
-.bl-stance span.on { color: var(--friend); }
+.bl-bl.bl-crit .bl-hpval { animation: bl-pulse 1.1s var(--ease) infinite; }
+.bl-bl.bl-regen .bl-hpval { color: var(--good); }
+
+/* Stance glyph: a 14px silhouette that fades up when the stance actually
+   changes and is gone two seconds later. It replaces the permanent
+   SPRINT / CROUCH / PRONE / AIM legend, which was a control reference pinned to
+   the screen — something no shipped shooter does past its tutorial. */
+.bl-stance {
+  flex: 0 0 auto; width: 17px; height: 25px; margin-bottom: 2px;
+  opacity: 0; transition: opacity var(--t-med) var(--ease);
+}
+.bl-stance.on { opacity: 1; }
+.bl-stance svg { display: block; width: 100%; height: 100%; overflow: visible; }
+.bl-stance path, .bl-stance circle {
+  fill: var(--t2);
+  stroke: rgba(3,5,8,.8); stroke-width: 1.4; paint-order: stroke fill;
+}
+.bl-stance.acc path, .bl-stance.acc circle { fill: var(--friend); }
 
 /* --- bottom-right: ammo ---------------------------------------------------- */
 .bl-br { position: absolute; right: var(--safe); bottom: var(--safe); text-align: right; }
-.bl-wname { font-size: 13px; letter-spacing: .22em; color: var(--fg-dim); }
-.bl-wmode { font-size: 10px; letter-spacing: .2em; color: var(--fg-mute); margin: 2px 0 calc(var(--u) * .75); }
+/* T2: the weapon name is checked between engagements, not during one. */
+.bl-wname { font-size: 12px; }
+/* T3: fire mode and class are provenance. */
+.bl-wmode { margin: 3px 0 calc(var(--u) * .75); }
 .bl-ammo { display: flex; align-items: baseline; justify-content: flex-end; gap: calc(var(--u) * .75); }
+/* T1: the largest, heaviest thing on the HUD, because it is the one number the
+   player reads without moving their eyes off the reticle. */
 .bl-mag { font-size: 46px; line-height: .82; transition: color var(--t-fast) var(--ease); }
-.bl-res { font-size: 16px; color: var(--fg-mute); }
+.bl-res { font-size: 14px; letter-spacing: .04em; }
 .bl-br.bl-low .bl-mag { color: var(--warn); }
 .bl-br.bl-empty .bl-mag { color: var(--hostile); animation: bl-pulse 1s var(--ease) infinite; }
 @keyframes bl-pulse { 0%,100% { opacity: 1 } 50% { opacity: .45 } }
-/* Magazine pips: a glanceable second read on the same number. */
-.bl-pips { display: flex; gap: 2px; justify-content: flex-end; margin-top: calc(var(--u) * .75); height: 4px; }
-.bl-pips i { width: 4px; height: 100%; background: var(--fg-mute); transition: background var(--t-fast) var(--ease); }
-.bl-pips i.on { background: var(--fg); }
+/* Magazine pips: the second read on the same number, kept because it is a shape
+   rather than a repeat of the digits — deliberately T3 in value. */
+.bl-pips { display: flex; gap: 2px; justify-content: flex-end; margin-top: calc(var(--u) * .75); height: 3px; }
+.bl-pips i { width: 4px; height: 100%; background: rgba(203,217,232,.16); transition: background var(--t-fast) var(--ease); }
+.bl-pips i.on { background: var(--t2); }
 .bl-pips i.warn { background: var(--warn); }
 .bl-reload { margin-top: calc(var(--u) * 1.25); width: calc(var(--u) * 18); height: 2px; background: rgba(255,255,255,.14); margin-left: auto; opacity: 0; transition: opacity var(--t-fast) var(--ease); }
 .bl-reload.on { opacity: 1; }
 .bl-reload i { display: block; height: 100%; width: 0%; background: var(--friend); }
 
-/* --- compass --------------------------------------------------------------- */
-.bl-compass {
-  position: absolute; left: 50%; top: calc(var(--u) * 3); transform: translateX(-50%);
-  width: calc(var(--u) * 54); height: calc(var(--u) * 4);
-  -webkit-mask-image: linear-gradient(90deg, transparent, #000 18%, #000 82%, transparent);
-          mask-image: linear-gradient(90deg, transparent, #000 18%, #000 82%, transparent);
-}
-.bl-compass .strip { position: absolute; left: 50%; top: 10px; height: 18px; white-space: nowrap; will-change: transform; }
-.bl-compass .strip u { position: absolute; top: 0; width: 1px; height: 5px; background: rgba(255,255,255,.3); }
-.bl-compass .strip u.maj { height: 9px; background: rgba(255,255,255,.55); }
-.bl-compass .strip s {
-  position: absolute; top: 10px; font-size: 11px; letter-spacing: .12em; font-weight: 700;
-  text-decoration: none; transform: translateX(-50%); color: var(--fg-dim);
-}
-.bl-compass .strip s.card { color: var(--fg); }
-.bl-compass .lead { position: absolute; left: 50%; top: 2px; width: 1px; height: 8px; background: var(--fg); transform: translateX(-50%); }
+/* --- top-centre column: heading chip, tape, scorebar, objective -------------
+ * These four are stacked on one axis and share one material so the top of the
+ * screen reads as a single instrument rather than four unrelated widgets. The
+ * order is fixed: heading (where I am pointing), tape, score, objective (why I
+ * am here) — most volatile at the top, most static at the bottom.
+ *
+ *   16 .. 32   heading chip
+ *   40 .. 72   compass tape
+ *   80 .. 114  score panel
+ *  122 ..      objective, when it is showing at all
+ */
+
+/* The chip is the same dark glass and the same hairline as the score panel; it
+   was previously an unstyled black box that belonged to nothing. */
 .bl-bearing {
-  position: absolute; left: 50%; top: calc(var(--u) * 7); transform: translateX(-50%);
-  font-size: 11px; letter-spacing: .1em; color: var(--fg-dim); padding: 1px 6px;
-  border: 1px solid var(--line); background: var(--ink-1);
+  position: absolute; left: 50%; top: calc(var(--u) * 2); transform: translateX(-50%);
+  min-width: calc(var(--u) * 6); text-align: center;
+  font-size: 11px; letter-spacing: .1em; font-weight: 600;
+  color: var(--t2); text-shadow: var(--sh2);
+  padding: 2px calc(var(--u) * .875) 1px;
+  border: 1px solid var(--line);
+  background: linear-gradient(180deg, var(--ink-1), var(--ink-2));
+  backdrop-filter: blur(6px) saturate(.9);
+}
+/* Its pointer is the tape's lead marker — one mark doing both jobs. */
+.bl-bearing::after {
+  content: ''; position: absolute; left: 50%; top: 100%;
+  width: 0; height: 0; margin-left: -3px;
+  border: 3px solid transparent; border-top: 4px solid rgba(150,172,194,.55);
 }
 
-/* --- match bar (top centre, above compass) ---------------------------------- */
+/* TICK BASELINE. Every tick, minor and major, ends on y=20 inside the strip;
+   majors grow upward from it. Previously both were top-anchored at y=0 with
+   different heights, so the majors hung four pixels below the minors and the
+   tape had no baseline at all. */
+.bl-compass {
+  position: absolute; left: 50%; top: calc(var(--u) * 5); transform: translateX(-50%);
+  width: calc(var(--u) * 54); height: calc(var(--u) * 4.5);
+  -webkit-mask-image: linear-gradient(90deg, transparent, #000 16%, #000 84%, transparent);
+          mask-image: linear-gradient(90deg, transparent, #000 16%, #000 84%, transparent);
+}
+.bl-compass .strip { position: absolute; left: 50%; top: 0; height: 36px; white-space: nowrap; will-change: transform; }
+/* A 1px hairline over bright sky is not a low-contrast mark, it is an absent
+   one. The ticks get the same dark halo the type does. */
+.bl-compass .strip u {
+  position: absolute; top: 12px; height: 6px; width: 1px;
+  background: rgba(203,217,232,.4);
+  box-shadow: 0 0 2px rgba(2,4,7,.85);
+}
+.bl-compass .strip u.maj { top: 8px; height: 10px; background: rgba(224,236,248,.72); }
+/* Cardinals only. The tape used to carry a numeric bearing every 15 degrees as
+   well, which put a three-digit label every 54 px — a continuous band of
+   numerals with no rhythm, and one that collided with the cardinals it was
+   supposed to sit between. The exact heading is in the chip above, to the
+   degree; the tape's job is orientation, not precision. */
+.bl-compass .strip s {
+  position: absolute; top: 22px; font-size: 10px; letter-spacing: .14em; font-weight: 600;
+  text-decoration: none; transform: translateX(-50%);
+  color: var(--t2); text-shadow: var(--sh2);
+}
+/* The lead line stops exactly on the tick baseline. */
+.bl-compass .lead {
+  position: absolute; left: 50%; top: 6px; width: 1px; height: 12px;
+  background: rgba(232,240,248,.85); transform: translateX(-50%);
+  box-shadow: 0 0 3px rgba(2,4,7,.9);
+}
+
+/* --- score panel ------------------------------------------------------------ */
 .bl-match {
-  position: absolute; left: 50%; top: calc(var(--u) * 12); transform: translateX(-50%);
+  position: absolute; left: 50%; top: calc(var(--u) * 10); transform: translateX(-50%);
   display: flex; align-items: center; gap: calc(var(--u) * 2);
   padding: calc(var(--u) * .75) calc(var(--u) * 2);
 }
-.bl-match .sc { font-size: 20px; line-height: 1; min-width: 42px; text-align: center; }
-.bl-match .sc.a { color: var(--friend); }
-.bl-match .sc.b { color: var(--hostile); }
-.bl-match .clk { font-size: 15px; color: var(--fg); letter-spacing: .06em; }
+/* Scores and clock are T2: read between engagements, never during one. */
+.bl-match .sc { font-size: 18px; line-height: 1; min-width: 38px; text-align: center; font-weight: 700; text-shadow: var(--sh2); }
+.bl-match .sc.a { color: rgba(99,200,255,.82); }
+.bl-match .sc.b { color: rgba(255,90,65,.82); }
+.bl-match .clk { font-size: 14px; color: var(--t2); letter-spacing: .06em; font-weight: 600; text-shadow: var(--sh2); }
 .bl-match .clk.warn { color: var(--warn); }
-.bl-match .rule { width: 1px; height: 16px; background: var(--line); }
-.bl-match .mode { font-size: 9px; letter-spacing: .24em; color: var(--fg-mute); }
-.bl-scorebar { position: absolute; left: 0; right: 0; bottom: -1px; height: 2px; background: rgba(255,255,255,.10); }
-.bl-scorebar i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--friend); transition: width var(--t-slow) var(--ease-out); }
-.bl-scorebar b { position: absolute; right: 0; top: 0; bottom: 0; background: var(--hostile); transition: width var(--t-slow) var(--ease-out); }
+.bl-match .rule { width: 1px; height: 14px; background: var(--line); }
+.bl-scorebar { position: absolute; left: 0; right: 0; bottom: -1px; height: 2px; background: rgba(255,255,255,.08); }
+.bl-scorebar i { position: absolute; left: 0; top: 0; bottom: 0; background: rgba(99,200,255,.72); transition: width var(--t-slow) var(--ease-out); }
+.bl-scorebar b { position: absolute; right: 0; top: 0; bottom: 0; background: rgba(255,90,65,.72); transition: width var(--t-slow) var(--ease-out); }
 
 /* --- minimap --------------------------------------------------------------- */
 .bl-map { position: absolute; left: var(--safe); top: var(--safe); width: calc(var(--u) * 21); }
@@ -247,30 +373,34 @@ export const UI_CSS = /* css */`
 .bl-map .rose { position: absolute; inset: 0; pointer-events: none; }
 .bl-map .rose b {
   position: absolute; left: 50%; top: 50%; transform: translate(-50%,-50%);
-  font-size: 9px; letter-spacing: .18em; color: var(--fg-dim);
-  text-shadow: 0 0 4px rgba(0,0,0,.9);
+  font-size: 9px; letter-spacing: .18em; font-weight: 600; color: var(--t2);
+  text-shadow: 0 0 4px rgba(0,0,0,.95), 0 1px 2px rgba(0,0,0,.9);
 }
 .bl-map .foot { display: flex; align-items: center; gap: var(--u); margin-top: calc(var(--u) * .75); }
-.bl-map .foot .nm { font-size: 10px; letter-spacing: .2em; color: var(--fg-mute); }
-.bl-map .foot .uav { margin-left: auto; font-size: 10px; letter-spacing: .18em; color: var(--friend); opacity: 0; transition: opacity var(--t-med) var(--ease); }
+.bl-map .foot .uav { margin-left: auto; color: var(--friend); opacity: 0; transition: opacity var(--t-med) var(--ease); }
 .bl-map .foot .uav.on { opacity: 1; }
 
 /* --- killfeed -------------------------------------------------------------- */
 .bl-kf { position: absolute; right: var(--safe); top: var(--safe); display: flex; flex-direction: column; align-items: flex-end; gap: 3px; }
 .bl-kfrow {
   display: flex; align-items: center; gap: calc(var(--u) * .75);
-  padding: 3px calc(var(--u) * 1.25); font-size: 12px; letter-spacing: .06em;
+  padding: 3px calc(var(--u) * 1.25); font-size: 11px; letter-spacing: .06em;
+  color: var(--t2); text-shadow: var(--sh2);
   background: rgba(6,9,13,.62); border-right: 2px solid transparent;
   transform: translateX(12px); opacity: 0;
   transition: opacity var(--t-med) var(--ease), transform var(--t-med) var(--ease-out);
 }
 .bl-kfrow.in { transform: none; opacity: 1; }
 .bl-kfrow.out { opacity: 0; transform: translateX(8px); }
-.bl-kfrow.me { background: rgba(16,26,36,.78); border-right-color: var(--friend); }
-.bl-kfrow .a { color: var(--friend); }
-.bl-kfrow .b { color: var(--hostile); }
-.bl-ico { width: 34px; height: 14px; fill: var(--fg-dim); flex: 0 0 auto; }
-.bl-kfrow .hs { width: 11px; height: 11px; fill: var(--warn); }
+.bl-kfrow.me { background: rgba(16,26,36,.72); border-right-color: rgba(99,200,255,.7); }
+/* Desaturated from the full semantic hues. The killfeed was the loudest thing
+   in the frame — six lines of maximum-chroma cyan and red at full value,
+   against a scene that has no such colours anywhere in it. Team identity
+   survives at three quarters of the value; the shouting does not. */
+.bl-kfrow .a { color: rgba(126,203,246,.82); }
+.bl-kfrow .b { color: rgba(255,116,92,.82); }
+.bl-ico { width: 30px; height: 13px; fill: rgba(203,217,232,.34); flex: 0 0 auto; }
+.bl-kfrow .hs { width: 11px; height: 11px; fill: rgba(255,181,69,.74); }
 
 /* --- callouts / toasts ------------------------------------------------------ */
 .bl-toasts {
@@ -286,14 +416,20 @@ export const UI_CSS = /* css */`
 .bl-toast.reward b { color: var(--friend); }
 .bl-toast.bad b { color: var(--hostile); }
 
-/* Objective strip, bottom centre — persistent, low weight. */
+/* OBJECTIVE. It used to be pinned to bottom centre, which is the one region of
+ * a first-person frame that is guaranteed to be occupied — the weapon is drawn
+ * there in every single shot. It now hangs off the bottom of the score panel,
+ * under the axis it belongs to, and it is a timed card: it announces itself on
+ * a state change and then leaves. A permanent restatement of the game mode is
+ * not information, it is furniture. */
 .bl-obj {
-  position: absolute; left: 50%; bottom: calc(var(--u) * 3); transform: translateX(-50%);
-  text-align: center; opacity: .0; transition: opacity var(--t-med) var(--ease);
+  position: absolute; left: 50%; top: calc(var(--u) * 15.25); transform: translateX(-50%);
+  text-align: center; white-space: nowrap;
+  opacity: 0; transition: opacity var(--t-slow) var(--ease);
 }
 .bl-obj.on { opacity: 1; }
-.bl-obj b { font-size: 12px; letter-spacing: .26em; color: var(--fg-dim); }
-.bl-obj span { display: block; font-size: 10px; letter-spacing: .16em; color: var(--fg-mute); margin-top: 3px; }
+.bl-obj b { font-size: 10px; letter-spacing: .28em; text-indent: .28em; font-weight: 600; color: var(--t2); text-shadow: var(--sh2); }
+.bl-obj span { display: block; font-size: 9px; letter-spacing: .2em; text-indent: .2em; color: var(--t3); text-shadow: var(--sh3); margin-top: 3px; }
 
 /* Respawn counter, centre screen. */
 .bl-respawn {
@@ -302,9 +438,9 @@ export const UI_CSS = /* css */`
   transition: opacity var(--t-med) var(--ease);
 }
 .bl-respawn.on { opacity: 1; }
-.bl-respawn b { font-size: 13px; letter-spacing: .34em; color: var(--hostile); }
-.bl-respawn .n { font-size: 64px; line-height: 1; }
-.bl-respawn span { font-size: 11px; letter-spacing: .2em; color: var(--fg-mute); }
+.bl-respawn b { font-size: 12px; letter-spacing: .34em; color: rgba(255,90,65,.82); text-shadow: var(--sh2); }
+.bl-respawn .n { font-size: 60px; line-height: 1; }
+.bl-respawn span { font-size: 10px; }
 
 /* Under the minimap, not in the bottom-left gutter: the vitals block owns that
    corner and a telemetry readout must never be what crowds it. */

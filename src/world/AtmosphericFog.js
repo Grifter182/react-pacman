@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { ATMO, DUST_MAX_PATH } from './Atmosphere.js';
 
 /**
  * OWNER: lighting / shadows agent.
@@ -103,10 +104,30 @@ export function installAtmosphericFog({ fit, sunDir, density, scaleHeight = 26, 
 	#define FOG_BASE_Y ${f(baseHeight)}
 	#define FOG_MIN_ELEV 0.004
 
+	// Elevated dust band. Not part of the fit — it is a 1/sin(elevation)
+	// profile, which a smooth five-term basis cannot represent without wrecking
+	// the rest of the hemisphere. It is analytic and identical to the closed
+	// form the sky bake uses (Atmosphere.js, ATMO.dust), so evaluating it here
+	// reproduces the band exactly rather than approximating it, and geometry at
+	// infinity still lands on the sky pixel behind it.
+	#define FOG_DUST_DENSITY ${ATMO.dust.density.toExponential(6)}
+	#define FOG_DUST_FALLOFF ${(1 / ATMO.dust.scaleHeight).toExponential(6)}
+	#define FOG_DUST_G ${f(ATMO.dust.phaseG)}
+	#define FOG_DUST_ISO ${f(ATMO.dust.iso)}
+	#define FOG_DUST_REACH ${DUST_MAX_PATH.toExponential(6)}
+	#define FOG_DUST_SUNLIT ${v3(ATMO.dust.sunlit)}
+	#define FOG_DUST_AMBIENT ${v3(ATMO.dust.ambient)}
+
+	float fogHG( const in float mu, const in float g ) {
+		float gg = g * g;
+		return ( 1.0 - gg ) / ( 12.566370614 * pow( max( 1.0 + gg - 2.0 * g * mu, 1e-4 ), 1.5 ) );
+	}
+
 	// Sky radiance in direction d — a five-term fit of the baked cubemap:
 	// horizon + elevation ramp + mid-elevation belt + narrow Mie lobe on the sun
-	// + broad hemispherical bias toward it. fogColor is the horizon term and
-	// stays a live uniform (scene.fog.color).
+	// + broad hemispherical bias toward it, with the analytic dust band mixed
+	// over the top. fogColor is the horizon term and stays a live uniform
+	// (scene.fog.color).
 	vec3 fogSkyColor( const in vec3 d ) {
 		// Per-channel elevation exponent: red falls off within 30 degrees of the
 		// horizon while blue is still climbing at 50. Clamped to the elevation of
@@ -114,12 +135,22 @@ export function installAtmosphericFog({ fit, sunDir, density, scaleHeight = 26, 
 		// is most of what a shooter's fog touches — evaluate to exactly the fitted
 		// horizon instead of running off the bottom of the curve, where the ramp
 		// and belt terms vanish and only the constant survives.
-		vec3 t = pow( vec3( clamp( d.y, FOG_MIN_ELEV, 1.0 ) ), FOG_GRADIENT_POW );
+		float elev = clamp( d.y, FOG_MIN_ELEV, 1.0 );
+		vec3 t = pow( vec3( elev ), FOG_GRADIENT_POW );
 		float mu = dot( d, FOG_SUN_DIR );
-		float gg = FOG_MIE_G * FOG_MIE_G;
-		float hg = ( 1.0 - gg ) / ( 12.566370614 * pow( max( 1.0 + gg - 2.0 * FOG_MIE_G * mu, 1e-4 ), 1.5 ) );
-		return max( fogColor + FOG_RAMP * t + FOG_BELT * ( t * ( 1.0 - t ) )
-			+ FOG_SUN_TINT * hg + FOG_BROAD * ( 0.5 + 0.5 * mu ), vec3( 0.0 ) );
+		vec3 clean = max( fogColor + FOG_RAMP * t + FOG_BELT * ( t * ( 1.0 - t ) )
+			+ FOG_SUN_TINT * fogHG( mu, FOG_MIE_G ) + FOG_BROAD * ( 0.5 + 0.5 * mu ), vec3( 0.0 ) );
+
+		// Same closed-form path integral as aDustFactor(), at the same reach the
+		// sky bake uses. Downward directions clamp to the horizon ring, so the
+		// ground under the player fogs toward the dust band rather than toward a
+		// colour that exists nowhere in the sky.
+		float dy = elev * FOG_DUST_FALLOFF;
+		float dustPath = ( 1.0 - exp( - dy * FOG_DUST_REACH ) ) / dy;
+		float dustF = 1.0 - exp( - FOG_DUST_DENSITY * dustPath );
+		vec3 dust = FOG_DUST_SUNLIT * ( fogHG( mu, FOG_DUST_G ) + FOG_DUST_ISO ) + FOG_DUST_AMBIENT;
+
+		return mix( clean, dust, dustF );
 	}
 
 #endif

@@ -32,7 +32,7 @@ import { StreakSystem } from './Streaks.js';
  *   match:state     { state }
  *   match:killfeed  { attacker, victim, weapon, headshot, attackerTeam, victimTeam, involvesPlayer }
  *   match:callout   { title, sub, kind, dwell }
- *   match:objective { text, sub }
+ *   match:objective { text, sub, dwell }   an announcement, not a pinned banner
  *   match:uav       { active }
  *   match:end       summary for the HUD's post-match screen
  * EVENTS IN
@@ -91,7 +91,7 @@ export class MatchModule {
       applyDamage: (actor, dmg, info) => this._damageActor(actor, dmg, info),
       restoreObjective: () => {
         if (this.state === MatchState.OVERTIME) {
-          this.engine.bus.emit('match:objective', { text: 'SUDDEN DEATH', sub: 'NEXT ELIMINATION WINS' });
+          this.engine.bus.emit('match:objective', { text: 'SUDDEN DEATH', sub: 'NEXT ELIMINATION WINS', dwell: 9 });
         } else if (this.state !== MatchState.POST) {
           this._announceObjective();
         }
@@ -429,7 +429,7 @@ export class MatchModule {
     this.engine.bus.emit('match:callout', {
       title: 'OVERTIME', sub: 'SUDDEN DEATH — NEXT ELIMINATION WINS', kind: 'bad', dwell: 3.4,
     });
-    this.engine.bus.emit('match:objective', { text: 'SUDDEN DEATH', sub: 'NEXT ELIMINATION WINS' });
+    this.engine.bus.emit('match:objective', { text: 'SUDDEN DEATH', sub: 'NEXT ELIMINATION WINS', dwell: 9 });
   }
 
   _end() {
@@ -466,10 +466,26 @@ export class MatchModule {
     if (player) { player.state.alive = true; this._respawnPlayer(player); }
   }
 
+  /**
+   * The objective is announced, not displayed.
+   *
+   * `match:objective` used to be a request to pin a banner up for the rest of
+   * the round. It is now an announcement with a dwell: the HUD shows it as a
+   * card on the top-centre axis and dismisses it. This matters here and not
+   * only in the HUD, because it changes when this module is allowed to speak —
+   * an announcement is only worth making on a real change of situation (round
+   * start, sudden death, a restart, a killstreak reward handing control back),
+   * which is exactly the set of callers below. Re-emitting the same text on a
+   * timer would put the banner straight back.
+   *
+   * `dwell` is the sender's call because the sender knows the weight: the
+   * opening brief can afford a long read, sudden death cannot be missed.
+   */
   _announceObjective() {
     this.engine.bus.emit('match:objective', {
       text: 'ELIMINATE HOSTILE FORCES',
       sub: `FIRST TO ${Config.match.scoreLimit} ELIMINATIONS`,
+      dwell: 7,
     });
   }
 

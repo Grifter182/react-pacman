@@ -33,6 +33,11 @@ export class DecalField {
    */
   constructor(budget, albedo, normal) {
     this.budget = Math.max(8, budget | 0);
+    // Instances [0, reserved) belong to level dressing and are never recycled;
+    // combat decals rotate through the remainder. Without the split, forty
+    // rounds downrange would quietly erase every stain and scorch mark placed
+    // at build time — the dressing would exist only until someone fired.
+    this.reserved = 0;
     this.index = 0;
     this.time = 0;
 
@@ -120,15 +125,42 @@ export class DecalField {
    * @param {number} o.size           footprint in metres
    * @param {THREE.Color} [o.tint]
    * @param {number} [o.life]         seconds before it has faded out entirely
+   * @param {THREE.Vector3} [o.alignY] world direction the decal's local +Y
+   *                                  should point along, projected into the
+   *                                  surface. Omit for a random roll (a bullet
+   *                                  hole has no up); required for anything
+   *                                  gravity authored — a run of rust that
+   *                                  flows sideways is worse than no run.
+   * @param {boolean} [o.permanent]   take a reserved slot that combat never
+   *                                  recycles — level dressing only.
    * @param {object} [collision]      CollisionModule, for the fit probes
    */
-  place({ point, normal, tile, size, tint = null, life = 60 }, collision = null) {
+  place({ point, normal, tile, size, tint = null, life = 60, alignY = null, permanent = false },
+    collision = null) {
     let s = size;
 
-    // --- orientation: +Z along the normal, random roll about it -------------
-    _q.setFromUnitVectors(_zAxis, _n.copy(normal).normalize());
-    _q2.setFromAxisAngle(_zAxis, Math.random() * Math.PI * 2);
-    _q.multiply(_q2);
+    // --- orientation: +Z along the normal, roll about it ---------------------
+    _n.copy(normal).normalize();
+    if (alignY) {
+      // Gram-Schmidt the requested up against the surface normal, then build
+      // the frame from it. Falls back to a random roll if the two are parallel
+      // (a "downward" stain on a ceiling has no meaningful direction).
+      _b.copy(alignY).addScaledVector(_n, -alignY.dot(_n));
+      if (_b.lengthSq() < 1e-6) {
+        _q.setFromUnitVectors(_zAxis, _n);
+        _q2.setFromAxisAngle(_zAxis, Math.random() * Math.PI * 2);
+        _q.multiply(_q2);
+      } else {
+        _b.normalize();
+        _t.crossVectors(_b, _n).normalize();
+        _m4b.makeBasis(_t, _b, _n);
+        _q.setFromRotationMatrix(_m4b);
+      }
+    } else {
+      _q.setFromUnitVectors(_zAxis, _n);
+      _q2.setFromAxisAngle(_zAxis, Math.random() * Math.PI * 2);
+      _q.multiply(_q2);
+    }
 
     if (collision && collision.collider) {
       _t.set(1, 0, 0).applyQuaternion(_q);
@@ -147,8 +179,15 @@ export class DecalField {
       if (solid < 4) s *= solid >= 2 ? 0.62 : 0.34;
     }
 
-    const i = this.index;
-    this.index = (this.index + 1) % this.budget;
+    let i;
+    if (permanent && this.reserved < this.budget - 8) {
+      i = this.reserved++;
+      if (this.index < this.reserved) this.index = this.reserved;
+    } else {
+      const span = Math.max(1, this.budget - this.reserved);
+      i = this.reserved + ((this.index - this.reserved + span) % span);
+      this.index = this.reserved + ((i - this.reserved + 1) % span);
+    }
 
     _p.copy(point).addScaledVector(_n, 0.010);
     _m4.compose(_p, _q, _scale.set(s, s, 1));
@@ -178,6 +217,7 @@ export class DecalField {
 }
 
 const _m4 = new THREE.Matrix4();
+const _m4b = new THREE.Matrix4();
 const _q = new THREE.Quaternion();
 const _q2 = new THREE.Quaternion();
 const _p = new THREE.Vector3();

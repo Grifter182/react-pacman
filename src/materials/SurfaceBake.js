@@ -60,27 +60,35 @@ export function blurWrap(src, dst, tmp, N, radius) {
   const w = r * 2 + 1;
   const inv = 1 / w;
 
+  // `r` is bounded by N/2 - 1 above, so every wrap here is at most one period
+  // out and a conditional add/subtract replaces the modulo. This runs
+  // 6 * N * N times per bake stage and the modulos were a measurable slice of
+  // the whole pipeline.
   // horizontal
   for (let y = 0; y < N; y++) {
     const row = y * N;
     let sum = 0;
-    for (let k = -r; k <= r; k++) sum += src[row + ((k % N) + N) % N];
+    for (let k = -r; k <= r; k++) sum += src[row + (k < 0 ? k + N : k)];
+    let outIdx = N - r;                       // (0 - r + N)
+    let inIdx = r + 1;
     for (let x = 0; x < N; x++) {
       tmp[row + x] = sum * inv;
-      const outIdx = (x - r + N) % N;
-      const inIdx = (x + r + 1) % N;
-      sum += src[row + inIdx] - src[row + outIdx];
+      sum += src[row + (inIdx >= N ? inIdx - N : inIdx)] - src[row + (outIdx >= N ? outIdx - N : outIdx)];
+      if (++outIdx >= N) outIdx -= N;
+      if (++inIdx >= N) inIdx -= N;
     }
   }
   // vertical
   for (let x = 0; x < N; x++) {
     let sum = 0;
-    for (let k = -r; k <= r; k++) sum += tmp[(((k % N) + N) % N) * N + x];
+    for (let k = -r; k <= r; k++) sum += tmp[(k < 0 ? k + N : k) * N + x];
+    let outIdx = N - r;
+    let inIdx = r + 1;
     for (let y = 0; y < N; y++) {
       dst[y * N + x] = sum * inv;
-      const outIdx = (y - r + N) % N;
-      const inIdx = (y + r + 1) % N;
-      sum += tmp[inIdx * N + x] - tmp[outIdx * N + x];
+      sum += tmp[(inIdx >= N ? inIdx - N : inIdx) * N + x] - tmp[(outIdx >= N ? outIdx - N : outIdx) * N + x];
+      if (++outIdx >= N) outIdx -= N;
+      if (++inIdx >= N) inIdx -= N;
     }
   }
   return dst;
@@ -227,18 +235,52 @@ export function makeDataTexture(data, N, srgb, anisotropy) {
 /**
  * Cooperative bake scheduler. Jobs are generators; the scheduler runs them
  * until a time budget for the current tick is exhausted, then hands the thread
- * back. Boot therefore costs one coarse pass per material (single-digit ms)
- * instead of a full-resolution bake.
+ * back. Boot therefore costs one coarse pass per material instead of a full
+ * resolution bake.
+ *
+ * The budget is **adaptive**, not a fixed 5 ms. A fixed budget is wrong in both
+ * directions: on a fast machine it leaves 10 ms of headroom unused every frame
+ * and the world stays soft for seconds longer than it needs to, and on a slow
+ * one it is 5 ms the frame could not spare. Instead the scheduler watches the
+ * interval between its own callbacks — which includes its own cost — and walks
+ * the budget up while frames are comfortably inside the target, backing off
+ * hard the moment they are not. On an idle machine that converges on `maxMs`
+ * within a few frames; under load it collapses to `minMs`.
  */
 class BakeScheduler {
-  constructor(budgetMs = 5) {
+  constructor(budgetMs = 4) {
     this.budgetMs = budgetMs;
+    this.minMs = 1.5;
+    this.maxMs = 14;
+    /** Frame time we are trying not to exceed. 60 Hz with a little slack. */
+    this.targetFrameMs = 16.7;
     this._jobs = [];
     this._pumping = false;
     this._idleWaiters = [];
+    this._lastPump = 0;
   }
 
   get pending() { return this._jobs.length; }
+
+  /**
+   * Fold the last observed callback interval into the budget.
+   * Growth is gentle and additive, retreat is multiplicative — the standard
+   * shape for anything that must not oscillate around a frame deadline.
+   */
+  _adapt(now) {
+    const prev = this._lastPump;
+    this._lastPump = now;
+    if (!prev) return;
+    const interval = now - prev;
+    // A gap far longer than a frame means we were backgrounded or the tab
+    // stalled; that says nothing about our own cost, so ignore it.
+    if (interval > this.targetFrameMs * 6) return;
+    if (interval < this.targetFrameMs * 1.02) {
+      this.budgetMs = Math.min(this.maxMs, this.budgetMs + 0.9);
+    } else if (interval > this.targetFrameMs * 1.25) {
+      this.budgetMs = Math.max(this.minMs, this.budgetMs * 0.55);
+    }
+  }
 
   add(gen, label = '') {
     this._jobs.push({ gen, label });
@@ -259,6 +301,7 @@ class BakeScheduler {
       while (!r.done) r = job.gen.next();
       this._jobs.shift();
     }
+    this._lastPump = 0;
     this._drain();
   }
 
@@ -271,8 +314,9 @@ class BakeScheduler {
   }
 
   _pump() {
-    const t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
     const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+    const t0 = now();
+    this._adapt(t0);
     // Boot queues every material at once; a one-off bake later (a new prop, a
     // debug preset) should not steal the same slice. Widen the budget only
     // while the queue is actually deep.
@@ -287,7 +331,7 @@ class BakeScheduler {
       if (!r.done) this._jobs.push(job);
     }
     if (this._jobs.length) this._schedule();
-    else this._drain();
+    else { this._lastPump = 0; this._drain(); }
   }
 
   _drain() {
@@ -297,4 +341,4 @@ class BakeScheduler {
   }
 }
 
-export const bakeScheduler = new BakeScheduler(5);
+export const bakeScheduler = new BakeScheduler(4);

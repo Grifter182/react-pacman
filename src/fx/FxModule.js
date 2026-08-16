@@ -1,10 +1,10 @@
 import * as THREE from 'three';
 import { Config } from '../core/Config.js';
-import { buildParticleAtlas, buildDecalAtlas, PT } from './FxTextures.js';
+import { buildParticleAtlas, buildDecalAtlas, PT, DT } from './FxTextures.js';
 import { ParticleSystem, LAYER, P, resetP } from './ParticleSystem.js';
 import { DecalField } from './Decals.js';
 import { DebrisPool, makeCasingGeometry, makeChunkGeometry } from './Debris.js';
-import { spawnImpact, recipeFor, emitBurst } from './Impacts.js';
+import { spawnImpact, recipeFor, emitBurst, classifySurface } from './Impacts.js';
 import { MuzzleFlash } from './MuzzleFlash.js';
 import { Explosions } from './Explosions.js';
 import { Ambience } from './Ambience.js';
@@ -55,6 +55,7 @@ export class FxModule {
     this._pending = [];
     this._smokers = [];
     this._tracerCounter = 0;
+    this._lastFireAt = -1e9;
   }
 
   async init(engine) {
@@ -150,8 +151,212 @@ export class FxModule {
     this._offs.push(bus.on('actor:killed', (e) => this.onActorKilled(e, engine)));
     this._offs.push(bus.on('fx:explosion', (e) => this.onExplosion(e, engine)));
     this._offs.push(bus.on('fx:smoke', (e) => this.smokeGrenade(e, engine)));
+    // Dressing needs the finished collision world, which is built by the level
+    // module's init. Binding to 'engine:ready' rather than calling it here
+    // makes that independent of registration order.
+    this._offs.push(bus.on('engine:ready', () => this.dressLevel(engine)));
 
     engine.fx = this;
+    // Provable-in-one-call debug surface. See `debugSpawnAll`.
+    if (typeof window !== 'undefined') window.__fx = this;
+  }
+
+  /* --------------------------------------------------------------- debug */
+
+  /**
+   * Spawn one of everything at a world position and report what was emitted.
+   *
+   * This exists because "no effect appeared on screen" is otherwise only ever
+   * inferred from a screenshot, and a screenshot cannot tell you whether the
+   * event never arrived, the emitter never ran, the particle was written with
+   * zero alpha, or the mesh was culled. Call it from the console or a harness:
+   *
+   *   __fx.debugSpawnAll()                  // 6 m in front of the camera
+   *   __fx.debugSpawnAll(new THREE.Vector3(0, 1, 10))
+   *
+   * The returned object gives live instance counts per layer immediately after
+   * the spawn, so a zero there is a wiring bug and a non-zero there with an
+   * empty screen is a shading or blending bug. That is the whole point: it
+   * splits the failure in half.
+   *
+   * @param {THREE.Vector3} [position]
+   * @returns {object} counts and the state of every subsystem
+   */
+  debugSpawnAll(position = null) {
+    const engine = this.engine;
+    const p = _dbgP;
+    if (position) p.copy(position);
+    else engine.camera.getWorldDirection(p).multiplyScalar(6).add(engine.camera.position);
+
+    const before = this.particles.liveEstimate;
+
+    // One impact of every material, fanned out around the point so they do not
+    // overlap, each oriented to its own surface normal.
+    const mats = ['concrete', 'metal', 'wood', 'sand', 'glass', 'brick', 'plaster', 'flesh'];
+    for (let i = 0; i < mats.length; i++) {
+      const a = (i / mats.length) * Math.PI * 2;
+      _dbgN.set(Math.cos(a), 0.35, Math.sin(a)).normalize();
+      _dbgQ.copy(p).addScaledVector(_dbgN, 1.2);
+      spawnImpact(this, _dbgQ, _dbgN, mats[i], 1, engine);
+    }
+
+    // Muzzle flash + its light + world blast products, aimed away from camera.
+    engine.camera.getWorldDirection(_dbgN);
+    this.flash.fire(p, _dbgN, this.particles, null);
+
+    // A tracer that actually travels.
+    resetP();
+    P.x = p.x; P.y = p.y; P.z = p.z;
+    P.vx = _dbgN.x * 460; P.vy = _dbgN.y * 460; P.vz = _dbgN.z * 460;
+    P.life = 0.25; P.size0 = 0.038; P.size1 = 0.02; P.stretch = 0.0075;
+    P.alpha = 1; P.tile = PT.SPARK; P.fade = 0.55;
+    P.r0 = 9; P.g0 = 3; P.b0 = 0.7; P.r1 = 2.6; P.g1 = 0.45; P.b1 = 0.1;
+    this.particles.spawn(LAYER.ADDITIVE, 0);
+
+    // Casing, chunk, lingering smoke source, explosion.
+    _dbgV.set(2.2, 1.6, 0.4);
+    this.casings.spawn(p, _dbgV, { life: 6, spin: 18 });
+    _dbgV.set(-1.5, 3.0, 1.0);
+    _dbgS.set(0.09, 0.06, 0.07);
+    this.chunks.spawn(p, _dbgV, { life: 6, spin: 12, scale: _dbgS });
+    this.smokeGrenade({ position: p, radius: 1.6, duration: 6 });
+    _dbgQ.copy(p).addScaledVector(_dbgN, 5);
+    this.explosions.trigger(_dbgQ, 4, 1, engine);
+
+    // Decals on whatever real surface is under and beside the point.
+    let decalsPlaced = 0;
+    if (this.collision && this.collision.collider) {
+      const hit = this.collision.raycast(p, _down, 6);
+      if (hit) {
+        _dbgTint.setRGB(0.5, 0.47, 0.44);
+        this.decals.place({
+          point: hit.point, normal: hit.normal, tile: DT.SCORCH,
+          size: 1.4, tint: _dbgTint, life: 600,
+        }, this.collision);
+        decalsPlaced++;
+      }
+    }
+
+    // Flush now so the counts below reflect this call even when it is made
+    // from outside the frame loop.
+    this.particles.flush();
+
+    const report = {
+      position: p.toArray().map((n) => +n.toFixed(2)),
+      particlesBefore: before,
+      particlesAfter: this.particles.liveEstimate,
+      layers: this.particles.layers.map((l) => ({
+        name: l.name,
+        instances: l.geometry.instanceCount,
+        capacity: l.capacity,
+        visible: l.mesh.visible,
+        inScene: !!l.mesh.parent,
+      })),
+      flash: {
+        live: this.flash.live,
+        visible: this.flash.root.visible,
+        parented: this.flash.root.parent ? this.flash.root.parent.name || this.flash.root.parent.type : null,
+        starOpacity: this.flash.star.material.opacity,
+      },
+      decals: {
+        reserved: this.decals.reserved,
+        ringIndex: this.decals.index,
+        budget: this.decals.budget,
+        placedNow: decalsPlaced,
+        inScene: !!this.decals.mesh.parent,
+      },
+      casings: this.casings.bodies.filter((b) => b.active).length,
+      chunks: this.chunks.bodies.filter((b) => b.active).length,
+      dynamicLights: engine.dynamicLights
+        ? engine.dynamicLights.slots.filter((s) => s.active).length : 'none',
+      fxRootInScene: !!this.root.parent,
+    };
+    console.info('[fx] debugSpawnAll', report);
+    return report;
+  }
+
+  /* ------------------------------------------------------------ dressing */
+
+  /**
+   * Scatter permanent grime, staining and splash onto the built level.
+   *
+   * A grey-box reads as a grey-box mostly because nothing has ever happened to
+   * it. Streaks under sills, dirt banked into the base of walls and dried
+   * splash on kerbs cost one instanced draw call that already exists and are
+   * the cheapest available step toward a place someone lives in.
+   *
+   * Placement is by raycast against the real collision world, so nothing floats
+   * and nothing lands in mid air, and it is driven by a fixed seed so the map
+   * looks identical on every load.
+   */
+  dressLevel(engine) {
+    if (this._dressed) return 0;
+    const collision = this.collision || engine.get('collision');
+    if (!collision || !collision.collider || !this.decals) return 0;
+    this._dressed = true;
+
+    const total = Math.min(132, Math.max(16, Math.floor(this.decals.budget * 0.46)));
+    const rand = mulberry(0x5eed1a);
+    const R = 46;                    // the built-up part of the map
+    let placed = 0;
+    let guard = 0;
+
+    while (placed < total && guard++ < total * 14) {
+      const wall = rand() < 0.62;
+
+      if (wall) {
+        // Cast horizontally from a point in the open and dress whatever facade
+        // it lands on. Sampling rays rather than surfaces means dressing lands
+        // on faces the player can actually see from the street.
+        _dressO.set((rand() * 2 - 1) * R, 0.4 + rand() * 4.2, (rand() * 2 - 1) * R);
+        const a = rand() * Math.PI * 2;
+        _dressD.set(Math.cos(a), (rand() - 0.5) * 0.12, Math.sin(a)).normalize();
+        const hit = collision.raycast(_dressO, _dressD, 16);
+        if (!hit || Math.abs(hit.normal.y) > 0.42) continue;
+
+        const high = hit.point.y > 2.0;
+        const t = rand();
+        let tile; let size; let tint; let alignY = null;
+        if (high || t < 0.42) {
+          // Runs from a sill or a fixing, always downward.
+          tile = DT.STAIN;
+          size = 0.9 + rand() * 1.9;
+          tint = _dressTint.setRGB(0.55, 0.42, 0.28);
+          alignY = _down;                       // local +Y points down the wall
+        } else if (t < 0.78) {
+          tile = DT.GRIME;
+          size = 1.1 + rand() * 2.4;
+          tint = _dressTint.setRGB(0.48, 0.46, 0.42);
+        } else {
+          tile = DT.SPLASH;
+          size = 0.8 + rand() * 1.4;
+          tint = _dressTint.setRGB(0.62, 0.55, 0.40);
+          alignY = _up;                          // fan opens upward from grade
+        }
+        this.decals.place({
+          point: hit.point, normal: hit.normal, tile, size, tint,
+          life: 1e9, alignY, permanent: true,
+        }, collision);
+        placed++;
+      } else {
+        // Ground: traffic wear, oil, dried mud at the foot of things.
+        _dressO.set((rand() * 2 - 1) * R, 9, (rand() * 2 - 1) * R);
+        const hit = collision.raycast(_dressO, _down, 14);
+        if (!hit || hit.normal.y < 0.80) continue;
+        const t = rand();
+        const tile = t < 0.55 ? DT.GRIME : (t < 0.85 ? DT.SPLASH : DT.SCORCH);
+        _dressTint.setRGB(0.52, 0.49, 0.44);
+        this.decals.place({
+          point: hit.point, normal: hit.normal, tile,
+          size: 1.4 + rand() * 3.0, tint: _dressTint,
+          life: 1e9, permanent: true,
+        }, collision);
+        placed++;
+      }
+    }
+
+    console.info(`[fx] level dressing: ${placed} permanent decals`);
+    return placed;
   }
 
   /* ------------------------------------------------------------- weapons */
@@ -163,9 +368,17 @@ export class FxModule {
     // Tracers are loaded every fourth or fifth round in a real belt or mag, and
     // the muzzle end is deliberately started down range: a tracer born at the
     // crown is a bright blob over the sights, not a streak into the distance.
+    //
+    // The counter resets between bursts so the FIRST round of any burst is a
+    // tracer. Starting the cycle mid-way meant a two-round burst — which is all
+    // a slow capture ever gets — could contain no tracer at all, and the effect
+    // then simply does not exist as far as any reviewer is concerned.
+    const everyN = Math.max(1, (def && def.tracerEvery) || 4);
+    if (engine.elapsed - this._lastFireAt > 0.5) this._tracerCounter = 0;
+    this._lastFireAt = engine.elapsed;
+    const isTracer = (this._tracerCounter % everyN) === 0;
     this._tracerCounter++;
-    const everyN = def && def.tracerEvery ? def.tracerEvery : 4;
-    if (this._tracerCounter % everyN !== 0) return;
+    if (!isTracer) return;
 
     const dist = hit ? origin.distanceTo(hit.point) : 140;
     const speed = 460;
@@ -176,16 +389,20 @@ export class FxModule {
     P.y = origin.y + direction.y * start;
     P.z = origin.z + direction.z * start;
     P.vx = direction.x * speed; P.vy = direction.y * speed; P.vz = direction.z * speed;
-    // Dies exactly as it reaches the impact point.
-    P.life = Math.max(0.02, (dist - start) / speed);
+    // Dies as it reaches the impact point, with a floor: a 10 m shot has a
+    // 17 ms time of flight, and a round that lives for a quarter of a frame is
+    // a round nobody ever sees leave the barrel.
+    P.life = Math.max(0.085, (dist - start) / speed);
     P.drag = 0.0;
     P.gravity = 0.06;                 // enough droop to read at 100 m
-    P.size0 = 0.030; P.size1 = 0.016;
-    P.stretch = 0.0062;               // ~2.9 m of streak at muzzle velocity
+    P.size0 = 0.038; P.size1 = 0.020;
+    P.stretch = 0.0075;               // ~3.5 m of streak at muzzle velocity
     P.alpha = 1; P.tile = PT.SPARK; P.fade = 0.55; P.soft = 0.2;
-    P.r0 = 7.0; P.g0 = 2.2; P.b0 = 0.5;
-    P.r1 = 2.2; P.g1 = 0.35; P.b1 = 0.08;
-    this.particles.spawn(LAYER.ADDITIVE);
+    P.r0 = 9.0; P.g0 = 3.0; P.b0 = 0.7;
+    P.r1 = 2.6; P.g1 = 0.45; P.b1 = 0.10;
+    // Bias 0: a tracer's whole life can be shorter than one slow frame, so
+    // backdating its birth would bury it in the wall before it is ever drawn.
+    this.particles.spawn(LAYER.ADDITIVE, 0);
   }
 
   /** Shell ejection: a real body with a real bounce and a real ping. */
@@ -203,19 +420,30 @@ export class FxModule {
 
   onSurfaceHit({ point, normal, material, impulse = 1 }, engine) {
     if (!point || !normal) return;
+    const mat = classifySurface(point, normal, material);
+
     // Time of flight from the shooter's eye, so the impact lands with the round.
     const d = engine.camera.position.distanceTo(point);
     const delay = Math.min(d / 460, 0.35);
 
+    // Deferring by less than a frame does not delay anything — it just moves
+    // the effect one whole frame into the future, which at low frame rates is
+    // the difference between an impact that exists and one that does not. If
+    // the round would land before the next frame is drawn, land it now.
+    if (delay <= (engine.delta || 0.016)) {
+      spawnImpact(this, point, normal, mat, impulse, engine);
+      return;
+    }
+
     let slot = null;
     for (const s of this._pending) { if (!s.active) { slot = s; break; } }
-    if (!slot) { spawnImpact(this, point, normal, material, impulse, engine); return; }
+    if (!slot) { spawnImpact(this, point, normal, mat, impulse, engine); return; }
 
     slot.active = true;
     slot.t = delay;
     slot.point.copy(point);
     slot.normal.copy(normal);
-    slot.material = material || 'concrete';
+    slot.material = mat;
     slot.impulse = impulse;
   }
 
@@ -311,7 +539,14 @@ export class FxModule {
   }
 
   update(dt, engine) {
-    // Queued impacts first: they may spawn particles this frame.
+    // The clock first. Everything below spawns particles, and a particle
+    // written before `ParticleSystem.update` has advanced its clock is stamped
+    // with the *previous* frame's birth time — it arrives on screen already a
+    // frame old, which for a 0.2 s spark is most of its life.
+    this.particles.update(dt, engine);
+    this.decals.update(dt, engine);
+
+    // Queued impacts: they may spawn particles this frame.
     for (const s of this._pending) {
       if (!s.active) continue;
       s.t -= dt;
@@ -322,8 +557,6 @@ export class FxModule {
 
     this._updateSmokers(dt);
     this.explosions.update(dt, engine);
-    this.particles.update(dt, engine);
-    this.decals.update(dt, engine);
     this.ambience.update(dt, engine);
   }
 
@@ -382,3 +615,26 @@ export class FxModule {
 const _v = new THREE.Vector3();
 const _n = new THREE.Vector3();
 const _up = new THREE.Vector3(0, 1, 0);
+const _down = new THREE.Vector3(0, -1, 0);
+
+const _dbgP = new THREE.Vector3();
+const _dbgN = new THREE.Vector3();
+const _dbgQ = new THREE.Vector3();
+const _dbgV = new THREE.Vector3();
+const _dbgS = new THREE.Vector3();
+const _dbgTint = new THREE.Color();
+
+const _dressO = new THREE.Vector3();
+const _dressD = new THREE.Vector3();
+const _dressTint = new THREE.Color();
+
+/** Small deterministic PRNG so level dressing is identical on every load. */
+function mulberry(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}

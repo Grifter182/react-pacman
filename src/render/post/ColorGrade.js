@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { FullScreenPass } from './PassCore.js';
+import { GradeShared } from './GradeShared.js';
 
 /**
  * OWNER: rendering / post-processing agent.
@@ -16,30 +17,57 @@ import { FullScreenPass } from './PassCore.js';
  *   + bloom + anamorphic streak + lens dirt   (light scattered in the lens)
  *   x auto exposure                            (sensor sensitivity)
  *   -> ACES filmic tonemap                     (sensor response)
+ *   -> sRGB encode                             (into the display domain)
  *   -> 3D LUT creative grade                   (the colourist's pass)
  *   -> lift / gamma / gain, saturation         (final trim)
- *   + film grain, vignette                     (film/lens, display referred)
- *   -> sRGB encode
+ *   + film grain, vignette                     (film/lens)
  *
  * Doing the LUT before the tonemap would grade HDR values the LUT has no domain
  * for; doing the vignette before exposure would make it get auto-compensated
  * away. Lens artefacts are last and subtle by design.
+ *
+ * WHY THE ENCODE HAPPENS BEFORE THE LUT
+ * -------------------------------------
+ * The cube is 33^3 and 8-bit. Sampled in linear light its first two slices sit
+ * at 0.000 and 0.031, and 0.031 linear is 49/255 on screen: the entire toe of
+ * the image is a straight line between two samples, and the stored values are
+ * quantised to 1/255 *linear*, which is four display stops of banding down
+ * there. Encoding first spends the cube where the eye is. Everything after the
+ * lookup is therefore display-referred, including the grain and the vignette,
+ * which is where both of them belong physically anyway.
+ *
+ * There is no unconditional lift in this pass. The previous build added
+ * (0.004, 0.008, 0.018) on top of a LUT that was itself lifting, and the two
+ * together put the floor of every frame at RGB(32,56,74). If a look ever needs
+ * a lifted black again it belongs in the LUT's toe, once, where it can be seen.
  */
 export class ColorGrade {
   constructor() {
     this.pass = null;
-    this.bloomIntensity = 0.055;
-    this.streakIntensity = 0.030;
+    this.bloomIntensity = 0.16;
+    this.streakIntensity = 0.05;
     this.dirtIntensity = 1.6;
     this.chromatic = 0.0022;
-    this.grain = 0.030;
-    this.vignette = 0.34;
-    this.saturation = 1.02;
+    /**
+     * Grain was 0.030 across the whole midtone range, which on an image that
+     * had no real detail in it read as compression noise rather than as film
+     * stock — and once material detail lands, noise at that level eats it.
+     * A third of that, weighted into the shadows where silver halide actually
+     * clumps, and gated off entirely at the very bottom so it cannot lift a
+     * true black back off zero.
+     */
+    this.grain = 0.011;
+    this.vignette = 0.30;
+    this.saturation = 1.0;
     this.exposureCompensation = 1.0;
-    this.lift = new THREE.Vector3(0.004, 0.008, 0.018);
-    this.gamma = new THREE.Vector3(1.0, 1.0, 1.02);
-    this.gain = new THREE.Vector3(1.02, 1.0, 0.985);
+    this.lift = new THREE.Vector3(0, 0, 0);
+    this.gamma = new THREE.Vector3(1, 1, 1);
+    this.gain = new THREE.Vector3(1, 1, 1);
   }
+
+  /** The key the metering drives the frame's geometric mean to. */
+  get keyValue() { return GradeShared.keyValue; }
+  set keyValue(v) { GradeShared.keyValue = v; }
 
   init(lut, lutSize, dirt) {
     this.pass = new FullScreenPass('grade', GRADE_FRAG, {
@@ -51,7 +79,7 @@ export class ColorGrade {
       tAdapt: { value: null },
       uLutSize: { value: lutSize },
       uTexel: { value: new THREE.Vector2() },
-      uKeyValue: { value: 0.16 },
+      uKeyValue: { value: GradeShared.keyValue },
       uExposureComp: { value: this.exposureCompensation },
       uBloom: { value: this.bloomIntensity },
       uStreak: { value: this.streakIntensity },
@@ -82,6 +110,7 @@ export class ColorGrade {
     u.uHasBloom.value = bloomTexture ? 1 : 0;
     u.uHasAdapt.value = ctx.adaptTexture ? 1 : 0;
     u.uStaticExposure.value = ctx.staticExposure;
+    u.uKeyValue.value = GradeShared.keyValue;
     u.uExposureComp.value = this.exposureCompensation;
     u.uBloom.value = this.bloomIntensity;
     u.uStreak.value = this.streakIntensity;
@@ -144,6 +173,7 @@ vec3 rrt(vec3 v){
 }
 vec3 aces(vec3 c){ return clamp(ACESOutput * rrt(ACESInput * max(c, vec3(0.0))), 0.0, 1.0); }
 
+/* The cube's axes are sRGB-encoded — see the class comment. */
 vec3 applyLut(vec3 c){
   // Half-texel inset: without it the two end slices of the cube are clamped
   // and the extreme blacks/whites get pulled toward their neighbours.
@@ -194,30 +224,39 @@ void main(){
     exposure *= uKeyValue / avg;
   }
   exposure *= uExposureComp;
-  colour *= clamp(exposure, 0.05, 24.0);
+  colour *= clamp(exposure, 0.02, 40.0);
 
-  // --- tonemap + creative grade --------------------------------------------
+  // --- tonemap, then into the display domain --------------------------------
   colour = aces(colour);
-  colour = applyLut(colour);
+  vec3 disp = srgbEncode(colour);
 
-  // Lift / gamma / gain (ASC-CDL ordering: offset, then power, then slope).
-  colour = clamp(colour + uLift * (1.0 - colour), 0.0, 1.0);
-  colour = pow(max(colour, vec3(1e-5)), uGamma);
-  colour *= uGain;
+  // --- creative grade -------------------------------------------------------
+  disp = applyLut(disp);
 
-  float l = luma(colour);
-  colour = clamp(mix(vec3(l), colour, uSaturation), 0.0, 1.0);
+  // Final trim (ASC-CDL ordering: offset, then power, then slope). All three
+  // are identities by default — the look lives in the LUT, in one place.
+  disp = clamp(disp + uLift * (1.0 - disp), 0.0, 1.0);
+  disp = pow(max(disp, vec3(1e-5)), uGamma);
+  disp *= uGain;
 
-  // --- film grain: scaled by luminance so highlights stay clean and shadows
-  // carry the noise, which is how real film stock behaves -------------------
+  float l = luma(disp);
+  disp = clamp(mix(vec3(l), disp, uSaturation), 0.0, 1.0);
+
+  // --- film grain -----------------------------------------------------------
+  // Weighted into the shadows, where film grain actually lives, and gated to
+  // zero over the bottom few code values so it can never put a floor under a
+  // true black. Highlights keep about a fifth of it so they are not glassy.
   float g = hash12(gl_FragCoord.xy + fract(uTime) * 719.7) - 0.5;
-  float grainAmount = uGrain * (0.35 + 1.0 * (1.0 - smoothstep(0.0, 0.75, l))) * (0.4 + 0.6 * smoothstep(0.0, 0.12, l));
-  colour += g * grainAmount;
+  float shadowWeight = 1.0 - smoothstep(0.03, 0.55, l);
+  float grainAmount = uGrain * (0.22 + 1.05 * shadowWeight) * smoothstep(0.0, 0.030, l);
+  disp += g * grainAmount;
 
   // --- vignette: natural (cos^4-ish) falloff, not a black ring --------------
+  // Applied display-referred, so the exponent converts the linear-light falloff
+  // this constant was authored as into the same perceptual falloff.
   float v = 1.0 - uVignette * pow(clamp(r2 * 2.05, 0.0, 1.0), 1.45);
-  colour *= v;
+  disp *= pow(max(v, 0.0), 0.4545);
 
-  fragColor = vec4(srgbEncode(max(colour, vec3(0.0))), 1.0);
+  fragColor = vec4(clamp(disp, 0.0, 1.0), 1.0);
 }
 `;

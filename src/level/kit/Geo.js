@@ -42,6 +42,62 @@ const _wea = [0, 0];
 /** Vertices below this height pick up ground splash-back by default. */
 export const SPLASH_HEIGHT = 1.35;
 
+/**
+ * Chamfer level-of-detail.
+ *
+ * A bevel costs a flat 32 triangles no matter how small the solid is, and the
+ * kit emits several thousand boxes that are trim bars, slats, glazing panes,
+ * railing pipes and bolt heads. Measured on this map, boxes whose bevel was
+ * under 15 mm — or whose smallest dimension was under 110 mm — accounted for
+ * ~137k triangles of chamfer that can never resolve as a lit sliver: a 8 mm
+ * bevel on a 35 mm window bar is below a pixel at any range the bar itself is
+ * still readable at. Everything at or above these thresholds keeps its full
+ * bevel, so plinths, cornices, crates, sandbags, jersey barriers, treads and
+ * vehicle bodies are untouched.
+ */
+const MIN_CHAMFER = 0.0145;
+const MIN_HALF_EXTENT = 0.055;
+
+/**
+ * Hard ceiling on the subdivisions `quad()` will emit along one axis. The
+ * tessellation exists to give the per-vertex weathering field somewhere to
+ * live; past this the field is already oversampled and the extra rows are pure
+ * cost. Without it a single mis-typed step on a 280 m ground plane is 300k
+ * triangles nobody notices until the frame budget is gone.
+ */
+const MAX_SUBDIV = 20;
+
+/* --------------------------------------------------------------- noise ---- */
+
+/** Deterministic 2D value hash in [0,1). Stable across loads and platforms. */
+export function hash2(x, y, seed = 0) {
+  let h = Math.imul(x | 0, 0x27d4eb2d) ^ Math.imul(y | 0, 0x165667b1) ^ Math.imul(seed | 0, 0x9e3779b1);
+  h = Math.imul(h ^ (h >>> 15), 0x2c1b3c6d);
+  h = Math.imul(h ^ (h >>> 12), 0x297a2d39);
+  return ((h ^ (h >>> 15)) >>> 0) / 4294967296;
+}
+
+/** Smooth 2D value noise on a unit lattice, in [0,1]. */
+export function noise2(x, y, seed = 0) {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const xf = x - xi, yf = y - yi;
+  const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+  const a = hash2(xi, yi, seed), b = hash2(xi + 1, yi, seed);
+  const c = hash2(xi, yi + 1, seed), d = hash2(xi + 1, yi + 1, seed);
+  return (a + (b - a) * u) + ((c + (d - c) * u) - (a + (b - a) * u)) * v;
+}
+
+/** Fractal value noise, `oct` octaves at half amplitude each. Returns [0,1]. */
+export function fbm2(x, y, oct = 3, seed = 0) {
+  let f = 1, a = 0.5, sum = 0, norm = 0;
+  for (let i = 0; i < oct; i++) {
+    sum += noise2(x * f, y * f, seed + i * 131) * a;
+    norm += a;
+    f *= 2.03; a *= 0.5;
+  }
+  return sum / norm;
+}
+
 /** Default weather field: grime rising out of the ground, none on up-faces. */
 export function groundGrime(x, y, z, nx, ny, nz, out) {
   const up = ny;
@@ -199,6 +255,11 @@ export class GeoBuilder {
    * Planar quad p0->p1->p2->p3 (CCW as seen from the front), optionally
    * tessellated on a grid so per-vertex weathering has resolution. `warp`, if
    * given, may displace each generated vertex — cloth sag uses it.
+   *
+   * `step` may be a single metre figure or `[alongP0P1, alongP0P3]`. The
+   * anisotropic form is what a wall wants: the weathering field is a function
+   * of height, so a 15 m run needs five rows vertically and exactly one column
+   * horizontally, not seventy-five cells.
    */
   quad(p0, p1, p2, p3, step = 0, warp = null) {
     _t0.set(p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]);
@@ -206,8 +267,10 @@ export class GeoBuilder {
     _n.crossVectors(_t0, _t1).normalize();
     const nx = _n.x, ny = _n.y, nz = _n.z;
 
-    const su = step > 0 ? Math.max(1, Math.round(_t0.length() / step)) : 1;
-    const sv = step > 0 ? Math.max(1, Math.round(_t1.length() / step)) : 1;
+    const stepU = Array.isArray(step) ? step[0] : step;
+    const stepV = Array.isArray(step) ? step[1] : step;
+    const su = stepU > 0 ? Math.min(MAX_SUBDIV, Math.max(1, Math.round(_t0.length() / stepU))) : 1;
+    const sv = stepV > 0 ? Math.min(MAX_SUBDIV, Math.max(1, Math.round(_t1.length() / stepV))) : 1;
 
     const P = (u, v, o) => {
       // Bilinear across the quad; correct for the trapezoids the wall kit emits.
@@ -258,7 +321,10 @@ export class GeoBuilder {
    */
   box(w, h, d, c = 0.02, grid = 0) {
     const hx = w * 0.5, hy = h * 0.5, hz = d * 0.5;
-    const cc = Math.min(c, hx * 0.9, hy * 0.9, hz * 0.9);
+    let cc = Math.min(c, hx * 0.9, hy * 0.9, hz * 0.9);
+    // Chamfer LOD — see MIN_CHAMFER. Small parts fall back to a plain solid,
+    // which is 12 triangles instead of 44.
+    if (cc < MIN_CHAMFER || Math.min(hx, hy, hz) < MIN_HALF_EXTENT) cc = 0;
     const ax = hx - cc, ay = hy - cc, az = hz - cc;
     const O = [0, 0, 0];
 
@@ -321,6 +387,11 @@ export class GeoBuilder {
     for (let r = 0; r < 3; r++) {
       const y0 = ringsY[r], y1 = ringsY[r + 1];
       const r0 = ringsR[r], r1 = ringsR[r + 1];
+      // An unchamfered cylinder collapses its two rim bands to zero height and
+      // zero radius change: 2/3 of the triangles are degenerate. Skipping them
+      // is what makes `cyl(..., 0)` an honest 1-band primitive, and there are
+      // several hundred of those on the map — hoops, collars, ferrules.
+      if (Math.abs(y1 - y0) < 1e-5 && Math.abs(r1 - r0) < 1e-5) continue;
       for (let i = 0; i < seg; i++) {
         this.quad(
           [cs[i] * r0, y0, sn[i] * r0],

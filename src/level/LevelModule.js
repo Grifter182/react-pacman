@@ -2,19 +2,23 @@ import * as THREE from 'three';
 import { makeMaterial } from '../materials/TextureFactory.js';
 import { Config, QualityTier } from '../core/Config.js';
 
-import { ProxySet, rng } from './kit/Geo.js';
+import { ProxySet, rng, fbm2 } from './kit/Geo.js';
 import { Batcher, InstancePool } from './kit/Batcher.js';
 import { applyWeathering, disposeWeathering } from './kit/Weathering.js';
 import { Foliage } from './kit/Foliage.js';
 import {
   SCALE, wall, building, roof, stairs, railing, pillar, column, archway, awning,
-  windowFill, wallFrame,
+  windowFill, wallFrame, facadeFittings,
 } from './kit/Arch.js';
 import {
   protoCrate, protoBarrel, protoSandbagWall, protoJersey, protoPallet, protoTyre,
   protoAcUnit, protoPipeBundle, protoRubble, protoBollard, protoWaterTank, protoDish,
   placeStall, placeVehicle, placeHangingRug, placeCable, placeSign, placeLamp, placeDebris,
+  placeSpan, placeWashLine,
 } from './kit/Props.js';
+import {
+  groundWeather, pave, baseTerrain, tyreTracks, track, blot, cracks, wallSpill,
+} from './kit/Ground.js';
 
 /**
  * OWNER: level-art agent.
@@ -145,7 +149,7 @@ export class LevelModule {
     this._placeSpawns();
     this._placeNavPoints();
 
-    this._buildGround();
+    this._buildBackdrop();
     this._buildPerimeter();
     this._buildWestRow();
     this._buildVRow();
@@ -156,8 +160,12 @@ export class LevelModule {
     this._buildGarage();
     this._buildYard();
     this._buildSpawnEnds();
+    // Ground after architecture: the paving, its weathering and its spill all
+    // read off the building footprints the passes above registered.
+    this._buildGround();
     this._dressStreets();
     this._dressRoofs();
+    this._dressForeground();
     this._buildFoliage();
     this._buildLights(engine);
 
@@ -178,10 +186,51 @@ export class LevelModule {
     const M = this.materials;
     const S = 512;
 
-    M.sand = makeMaterial('sand', { seed: 11, size: S, worldScale: 3.2, macro: 0.55 });
-    M.gravel = makeMaterial('gravel', { seed: 29, size: S, worldScale: 2.6 });
-    M.asphalt = makeMaterial('asphalt', { seed: 47, size: S, worldScale: 3.0 });
-    M.tile = makeMaterial('tile', { seed: 53, size: S, worldScale: 1.6, detailFade: [5, 20] });
+    // GROUND TILE SCALE. These used to be requested 1.6x to 2.6x coarser than
+    // the recipe was authored for (sand 3.2 m against a native 2.0, gravel 2.6
+    // against 1.0, asphalt 3.0 against 1.2), which stretched every feature the
+    // recipe builds — the 90 mm ripple train, the 45 mm gravel grade, the 10 mm
+    // asphalt aggregate — past the point where it survives the bake. The ground
+    // is a third of most frames and it was reading as flat grey for exactly
+    // that reason. They now run at, or just above, the recipe's own scale, and
+    // the detail normal is held to a longer fade so it is still there at the
+    // 1–3 m the player's own feet occupy.
+    M.sand = makeMaterial('sand', {
+      seed: 11, size: S, worldScale: 2.0, macro: 0.62,
+      detailFade: [14, 46], detailStrength: 0.72,
+    });
+    // The far ring only ever appears past 60 m, where a 2 m tile would be a
+    // visible repeating weave. Big tile, no detail layer, no weathering.
+    M.sandFar = makeMaterial('sand', {
+      seed: 11, size: S, worldScale: 8.0, macro: 0.7, detail: false,
+    });
+    M.gravel = makeMaterial('gravel', {
+      seed: 29, size: S, worldScale: 1.3, macro: 0.34, detailFade: [12, 40], detailStrength: 0.7,
+    });
+    M.asphalt = makeMaterial('asphalt', {
+      seed: 47, size: S, worldScale: 1.5, macro: 0.3, detailFade: [12, 40], detailStrength: 0.68,
+    });
+    M.tile = makeMaterial('tile', { seed: 53, size: S, worldScale: 0.9, detailFade: [7, 24] });
+
+    // Ground decals. Plain geometry a few centimetres proud of the paving, with
+    // a polygon offset so the lift can stay small enough never to read as a
+    // floating sheet at a grazing angle.
+    const decal = (preset, color, extra = {}) => makeMaterial(preset, {
+      seed: 47, size: 256, worldScale: 1.5,
+      detailFade: [10, 30],
+      material: Object.assign({
+        color: new THREE.Color(color),
+        polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -6,
+      }, extra),
+    });
+    // The tint MULTIPLIES the recipe's albedo, and asphalt is already a 0.07
+    // linear surface, so anything below about 0.4 linear here paints a black
+    // river down the middle of the street rather than a worn line. These are
+    // deliberately shallow: a decal that announces itself is worse than none.
+    M.decalDark = decal('asphalt', 0xa9a396);                     // tyre ruts
+    M.decalWear = decal('gravel', 0xcbc4b8);                      // foot polish
+    M.decalOil = decal('asphalt', 0x6b6357, { roughness: 0.28 });
+    M.decalPale = decal('sand', 0xd8cdb4);
 
     // Two plasters and a bare concrete. Buildings are assigned between them so
     // that no two adjacent facades share a tone — the single cheapest way to
@@ -265,6 +314,16 @@ export class LevelModule {
     applyWeathering(M.plasterPale, { grime: 1.15, stain: 1.1 });
     applyWeathering(M.concrete, { grime: 0.9, stain: 0.85, dust: [0.13, 0.115, 0.09] });
     applyWeathering(M.brick, { grime: 0.85, stain: 0.8 });
+
+    // The ground carries the same per-vertex field, driven by `groundWeather`.
+    // Its dust colour is a *pale* film, so the drifts lighten the surface and
+    // the worn tracks — which come through the stain channel — darken and
+    // smooth it. That opposition is the whole reason 8,000 m² of pavement can
+    // stop reading as one value without a single extra texture.
+    applyWeathering(M.sand, { grime: 1.0, stain: 0.9, dust: [0.315, 0.278, 0.208] });
+    applyWeathering(M.gravel, { grime: 0.95, stain: 1.0, dust: [0.196, 0.180, 0.145] });
+    applyWeathering(M.asphalt, { grime: 0.9, stain: 1.15, dust: [0.212, 0.196, 0.158] });
+    applyWeathering(M.tile, { grime: 1.0, stain: 1.0, dust: [0.228, 0.206, 0.162] });
   }
 
   _defineBuckets() {
@@ -272,10 +331,20 @@ export class LevelModule {
     const b = this.batch;
     // uvScale must match the preset's worldScale, or the LOW tier — which
     // drops the triplanar path and falls back to these UVs — rescales.
-    b.define('sand', M.sand, { uvScale: 3.2, castShadow: false });
-    b.define('gravel', M.gravel, { uvScale: 2.6, castShadow: false });
-    b.define('asphalt', M.asphalt, { uvScale: 3.0, castShadow: false });
-    b.define('tile', M.tile, { uvScale: 1.6, castShadow: false });
+    b.define('sand', M.sand, { uvScale: 2.0, castShadow: false });
+    b.define('sandFar', M.sandFar, {
+      uvScale: 8.0, castShadow: false, receiveShadow: false, weather: false, cells: false,
+    });
+    b.define('gravel', M.gravel, { uvScale: 1.3, castShadow: false });
+    b.define('asphalt', M.asphalt, { uvScale: 1.5, castShadow: false });
+    b.define('tile', M.tile, { uvScale: 0.9, castShadow: false });
+    // Decals skip the spatial split: they never cast, they are a few thousand
+    // triangles between them, and four draw calls beats sixteen.
+    const dc = { castShadow: false, weather: false, cells: false };
+    b.define('decalDark', M.decalDark, Object.assign({ uvScale: 1.5 }, dc));
+    b.define('decalWear', M.decalWear, Object.assign({ uvScale: 1.3 }, dc));
+    b.define('decalOil', M.decalOil, Object.assign({ uvScale: 1.5 }, dc));
+    b.define('decalPale', M.decalPale, Object.assign({ uvScale: 1.5 }, dc));
 
     b.define('plaster', M.plaster, { uvScale: 2.0 });
     b.define('plasterWarm', M.plasterWarm, { uvScale: 2.0 });
@@ -301,6 +370,14 @@ export class LevelModule {
     b.define('signage', M.signage, { uvScale: 1.4, weather: false, cells: false });
     b.define('emissive', M.emissive, { uvScale: 1.4, weather: false, cells: false, castShadow: false });
     b.define('rubblebits', M.concrete, { uvScale: 2.4 });
+    // Backdrop masses: silhouette only. No shadow casting or receiving (they
+    // are outside every cascade anyway), no spatial cells (one draw call each),
+    // and they keep the weather attribute purely so they share the exact same
+    // shader program as the compound rather than compiling three more.
+    const bg = { castShadow: false, receiveShadow: false, cells: false };
+    b.define('bgPale', M.plasterPale, Object.assign({ uvScale: 2.0 }, bg));
+    b.define('bgWarm', M.plasterWarm, Object.assign({ uvScale: 2.0 }, bg));
+    b.define('bgGrey', M.concrete, Object.assign({ uvScale: 2.4 }, bg));
   }
 
   _defineProps() {
@@ -358,32 +435,90 @@ export class LevelModule {
   }
 
   /**
-   * Flat inlay of a surface material, 20 mm proud of the base sand. Tessellated
-   * so the ground carries a weathering field too — dirt pools where a paved
-   * area meets a wall.
+   * The desire lines: where feet and wheels actually go. These drive the worn,
+   * dark, smooth channels in the ground weathering field and the tyre decals,
+   * and they are the reason the ground now has a *direction* rather than just a
+   * texture. [x0, z0, x1, z1, halfWidth]
    */
-  _pad(bucket, x0, z0, x1, z1, y = 0.02) {
-    const g = this.batch.at(bucket, (x0 + x1) / 2, (z0 + z1) / 2);
-    g.identity();
-    g.quad([x0, y, z0], [x1, y, z0], [x1, y, z1], [x0, y, z1], 6);
-    return g;
+  static get TRACKS() {
+    return [
+      [34, -45, 34, 45, 3.0],          // the motor yard, end to end
+      [30.5, -45, 31.5, 45, 2.0],
+      [-33, -26, 39, -26, 2.8],        // the long cross-street
+      [0, -42, 0, -16, 2.2],           // market street, south half
+      [0, 14, 0, 42, 2.2],             // market street, north half
+      [-29.5, -44, -29.5, 44, 1.8],    // the alley
+      [-16, 0, 16, 0, 2.6],            // across the plaza
+      [-12.5, -42, -12.5, 12, 1.7],    // west inner street
+      [12.5, -42, 12.5, 12, 1.7],      // east inner street
+      [30, -2, 17, -2, 2.2],           // into the garage
+      [21, -20, 34, -30, 2.4],         // the shortcut everyone takes
+    ];
+  }
+
+  /**
+   * Footprints the ground reacts to: splash-back, shed render and shadow dirt
+   * all collect within about a metre of a wall base. Filled in by `_block()`
+   * and by the hand-built interiors, which is why the ground is now built
+   * *after* the architecture rather than before it.
+   */
+  _footprint(x0, z0, x1, z1) {
+    (this._foot = this._foot || []).push([
+      Math.min(x0, x1), Math.min(z0, z1), Math.max(x0, x1), Math.max(z0, z1),
+    ]);
   }
 
   _buildGround() {
-    // Base plane runs well past the play space so the horizon is not a void.
-    const g = this.batch.at('sand', 0, 0);
-    g.identity();
-    g.quad([-140, 0, -140], [140, 0, -140], [140, 0, 140], [-140, 0, 140], 14);
+    const walls = this._foot || [];
+    const tracks = LevelModule.TRACKS;
+    const gw = groundWeather({ seed: 4111, dust: 1.05, tracks, walls });
+    // Paving is compacted and swept, so it collects less loose dust than the
+    // open sand does but takes a much harder polish where it is walked.
+    const pw = groundWeather({ seed: 4111, dust: 0.72, trackGain: 1.25, tracks, walls });
+
+    // Inner field at the sand recipe's own scale, coarse ring out to the fog.
+    baseTerrain(this.kit, {
+      bucket: 'sand', farBucket: 'sandFar', inner: 54, outer: 150, step: 3.0, weather: gw,
+    });
 
     // Surface zoning. This is navigation feedback as much as art: the player
     // learns "asphalt = the open lane, tile = the plaza, gravel = the alley".
-    this._pad('gravel', -34, -45, -25, 45);                   // alley
-    this._pad('asphalt', 26.5, -45, 40, 45);                  // motor yard
-    this._pad('asphalt', -34, -30.5, 40, -21.5);              // cross-street
-    this._pad('tile', -17, -15, 17, 15);                      // plaza
-    this._pad('gravel', -5.6, 14, 5.6, 45);                   // market street
-    this._pad('gravel', -5.6, -45, 5.6, -15);                 // south street
-    this._pad('asphalt', 16.2, -8.2, 28.2, 8.2, 0.03);        // garage slab
+    //
+    // Every region is emitted through `pave()`, which dissolves its own border
+    // against a noise field. The old `_pad()` drew a rectangle, and a ruled
+    // 74 m line where asphalt meets sand is the most obviously authored thing
+    // that can happen to a ground plane.
+    // Cell size is the ground's only real cost knob: the mask and the
+    // weathering field are both continuous, so a coarser grid loses resolution
+    // in the boundary and nothing else.
+    const cell = { 0: 1.7, 1: 1.15, 2: 1.0, 3: 0.85 }[this.detail] ?? 1.0;
+    const P = (bucket, x0, z0, x1, z1, o = {}) => pave(this.kit, Object.assign({
+      bucket, x0, z0, x1, z1, y: 0.02, feather: 1.9, weather: pw,
+      seed: (Math.abs(x0 * 7 + z1 * 13) | 0) + 3,
+    }, o, { step: (o.step ?? 2.1) * cell }));
+
+    P('gravel', -34, -45, -25, 45, { step: 2.0, feather: 1.5 });      // alley
+    P('asphalt', 26.5, -45, 40, 45, { step: 2.4, feather: 2.4 });     // motor yard
+    P('asphalt', -34, -30.5, 40, -21.5, { step: 2.2, feather: 2.0 }); // cross-street
+    // The plaza is kerbed, so its edge is genuinely built and stays crisp.
+    P('tile', -17, -15, 17, 15, { step: 1.8, feather: 0.7, jitter: 0.07 });
+    P('gravel', -5.6, 14, 5.6, 45, { step: 2.0, feather: 1.5 });      // market street
+    P('gravel', -5.6, -45, 5.6, -15, { step: 2.0, feather: 1.5 });    // south street
+    P('asphalt', 16.2, -8.2, 28.2, 8.2, { y: 0.03, step: 2.0, feather: 0.9 });
+
+    // Sand blows back over the edges of every paved area. A *second* pass of
+    // the base material laid on top of the paving, masked by a heavily eroded
+    // version of the same field, is what turns a boundary into a transition.
+    for (const [x0, z0, x1, z1] of [
+      [-34, -45, -25, 45], [26.5, -45, 40, 45], [-34, -30.5, 40, -21.5],
+      [-5.6, 14, 5.6, 45], [-5.6, -45, 5.6, -15],
+    ]) {
+      pave(this.kit, {
+        bucket: 'sand', x0, z0, x1, z1, y: 0.035, step: 2.4, feather: 3.4,
+        coverage: -0.44, jitter: 0.24, weather: gw, seed: 611 + (x0 | 0),
+        noiseScale: 0.16,
+      });
+    }
 
     // Kerbs around the plaza give the pad a real edge and a 0.14 m step.
     const kerb = this.batch.at('concrete', 0, 0);
@@ -395,8 +530,102 @@ export class LevelModule {
       kerb.at((x0 + x1) / 2, 0.07, (z0 + z1) / 2).box(Math.abs(x1 - x0), 0.16, Math.abs(z1 - z0), 0.03, 2.5);
     }
 
+    this._groundDecals(walls);
+
     // One box under everything: the floor the capsule stands on.
     this.proxy.extent(-140, -1.0, -140, 140, 0, 140);
+  }
+
+  /**
+   * Tyre ruts, oil, cracking and spill. All of it is geometry lifted 45-60 mm
+   * and polygon offset; a real deferred decal system buys nothing on a map
+   * whose ground never changes, and this way the marks merge into the same
+   * handful of draw calls as everything else.
+   */
+  _groundDecals(walls) {
+    const r = this.rand;
+
+    // Vehicle ruts down the two lanes that carry vehicles.
+    tyreTracks(this.kit, {
+      bucket: 'decalDark', points: [[33.2, -44], [33.8, -12], [33.0, 6], [33.6, 44]],
+      width: 0.34, gauge: 1.8, y: 0.062, seed: 5, segments: 40,
+    });
+    tyreTracks(this.kit, {
+      bucket: 'decalDark', points: [[-32, -26.4], [-4, -25.6], [18, -26.6], [38, -25.8]],
+      width: 0.30, gauge: 1.7, y: 0.062, seed: 9, segments: 40,
+    });
+    tyreTracks(this.kit, {
+      bucket: 'decalDark', points: [[30.5, -2.2], [24, -2.6], [17.5, -2.2]],
+      width: 0.32, gauge: 1.75, y: 0.07, seed: 12, segments: 20,
+    });
+    // A vehicle turned around here once and never came back.
+    tyreTracks(this.kit, {
+      bucket: 'decalDark', points: [[36.5, 18], [33.5, 22], [31.5, 27.5], [33, 31]],
+      width: 0.28, gauge: 1.7, y: 0.062, seed: 21, segments: 24,
+    });
+
+    // Foot polish down the market street and across the plaza: one broad, soft,
+    // dark centre line, which is what a walked surface actually looks like.
+    for (const [pts, w, sd] of [
+      [[[0, 14], [0.6, 26], [-0.4, 38], [0, 44]], 0.85, 31],
+      [[[0, -16], [-0.5, -26], [0.4, -36], [0, -43]], 0.85, 33],
+      [[[-16, 0.5], [-4, -0.4], [6, 0.6], [16, -0.3]], 1.05, 35],
+      [[[-29.6, -42], [-29.2, -10], [-29.8, 14], [-29.4, 42]], 0.75, 37],
+    ]) {
+      track(this.kit, {
+        bucket: 'decalWear', points: pts, width: w, y: 0.058, wander: 0.75,
+        seed: sd, segments: 34,
+      });
+    }
+
+    // Oil under every parked vehicle, plus the garage floor.
+    for (const [x, z, rad] of [
+      [20.0, -3.4, 1.0], [33.5, -14.0, 0.9], [36.2, 20.5, 0.8], [30.6, 30.0, 0.75],
+      [31.2, -30.0, 0.9], [-22.0, -44.2, 0.7], [21.0, 44.0, 0.7],
+      [21.5, -1.0, 1.4], [23.0, 3.5, 0.9],
+    ]) {
+      blot(this.kit, { bucket: 'decalOil', x, z, radius: rad, y: 0.056, seed: (x * 13 + z * 7) | 0 });
+    }
+    // Damp patches and spilled fines where water is drawn or thrown out.
+    for (let i = 0; i < 10; i++) {
+      const p = this.randomOpenPoint(r);
+      blot(this.kit, {
+        bucket: 'decalPale', x: p.x, z: p.z, radius: 0.7 + r() * 1.5,
+        y: 0.05, seed: 700 + i * 17,
+      });
+    }
+
+    // Cracking. Pavement fails from a point outward; a straight painted line
+    // never convinces, and a rectangle of "cracked" texture convinces less.
+    for (const [x, z, arms, reach] of [
+      [-9.5, 6.0, 5, 3.4], [11.0, -7.5, 4, 2.8], [0.5, -20.5, 4, 3.0],
+      [31.0, 9.0, 5, 3.8], [-30.0, -8.0, 3, 2.4], [24.0, -27.0, 4, 3.2],
+      [-2.0, 27.0, 3, 2.6], [35.5, -34.0, 4, 3.0],
+    ]) {
+      cracks(this.kit, {
+        bucket: 'decalDark', x, z, arms, reach, y: 0.05,
+        seed: (x * 31 + z) | 0, width: 0.07,
+      });
+    }
+
+    // Spill at the foot of the walls. This is the join the eye spends the most
+    // time on, and a clean 90-degree corner is what makes a street read as a
+    // box with texture on it.
+    for (const f of walls) {
+      const [x0, z0, x1, z1] = f;
+      const edges = [
+        [x0, z0, x1, z0], [x1, z1, x0, z1], [x1, z0, x1, z1], [x0, z1, x0, z0],
+      ];
+      for (let e = 0; e < edges.length; e++) {
+        // Only some runs get spill; an unbroken skirt around every building is
+        // as uniform as no skirt at all.
+        if (fbm2(edges[e][0] * 0.05, edges[e][1] * 0.05, 2, 77) < 0.36) continue;
+        wallSpill(this.kit, {
+          x0: edges[e][0], z0: edges[e][1], x1: edges[e][2], z1: edges[e][3],
+          bucket: 'rubblebits', density: 0.7, reach: 0.85, seed: 41 + e * 13 + (x0 | 0),
+        });
+      }
+    }
   }
 
   /* ==================================================================== */
@@ -429,6 +658,77 @@ export class LevelModule {
     }
   }
 
+  /**
+   * The town beyond the compound.
+   *
+   * Every outward sightline on this map used to terminate on a 5.6 m perimeter
+   * wall with sky above it, which is what makes an arena read as an arena: the
+   * skyline steps twice — wall, sky — and stops. A ring of simple parapeted
+   * masses from 55 m to 130 m out, at heights the compound never reaches, gives
+   * the horizon four or five value steps instead and lets the fog do the work
+   * it exists to do. They are pure silhouette: no collision, no shadow casting,
+   * no openings, ~7k triangles for the whole ring.
+   */
+  _buildBackdrop() {
+    const r = rng(0xBACD70);
+    const buckets = ['bgPale', 'bgWarm', 'bgGrey'];
+    let placed = 0;
+    // The outermost ring is 120 m out and behind most of the fog; it is the
+    // first thing to go when the budget is tight.
+    const rings = this.detail >= 2 ? 3 : 2;
+    for (let ring = 0; ring < rings; ring++) {
+      // Rectangular rings, not circular: the compound is a rectangle and a
+      // circle of masses around it crowds the short axis and abandons the long
+      // one. Half-extents clear the 40 x 46 perimeter with room to spare.
+      const hx = 52 + ring * 30, hz = 58 + ring * 30;
+      const n = 24 + ring * 10;
+      for (let i = 0; i < n; i++) {
+        if (r() < 0.22) continue;
+        const a = (i / n) * Math.PI * 2 + (r() - 0.5) * 0.14;
+        const ca = Math.cos(a), sa = Math.sin(a);
+        // Project the direction onto the rectangle, then push out at random.
+        const k = 1 / Math.max(Math.abs(ca) / hx, Math.abs(sa) / hz);
+        const push = 1 + r() * 0.26;
+        const x = ca * k * push, z = sa * k * push;
+        // The compound's own perimeter is 5.6 m and the eye is at 1.6 m, so a
+        // mass at 55 m has to reach about 11 m before any of it clears the wall
+        // at all. Anything shorter is invisible from inside and is pure cost.
+        const H = 11 + ring * 3.5 + r() * (8 + ring * 5);
+        const w = 9 + r() * 16, dp = 9 + r() * 16;
+        const bk = buckets[(r() * 3) | 0];
+        const b = this.batch.at(bk, x, z);
+        b.at(x, H / 2, z, a).box(w, H, dp, 0.08, [6, 3]);
+        // Parapet band and a coping: two more value steps per mass, and they
+        // are the only thing that keeps these from reading as plain slabs.
+        b.at(x, H + 0.45, z, a).box(w + 0.2, 0.9, dp + 0.2, 0.06, 0);
+        b.at(x, H + 0.95, z, a).box(w + 0.5, 0.16, dp + 0.5, 0.05, 0);
+        // A stair penthouse and a tank on roughly half of them.
+        if (r() < 0.55) {
+          const ox = (r() - 0.5) * w * 0.5, oz = (r() - 0.5) * dp * 0.5;
+          b.at(x + ox, H + 2.3, z + oz, a).box(3.0, 3.0, 3.4, 0.06, 0);
+          b.at(x + ox, H + 3.9, z + oz, a).box(3.4, 0.2, 3.8, 0.05, 0);
+        }
+        if (r() < 0.6) {
+          const ox = (r() - 0.5) * w * 0.6, oz = (r() - 0.5) * dp * 0.6;
+          const m = this.batch.at('bgGrey', x, z);
+          m.at(x + ox, H + 1.7, z + oz).cyl(0.75, 0.7, 1.5, 8, 0.05);
+          m.at(x + ox, H + 3.4, z + oz).cyl(0.07, 0.04, 2.0 + r() * 2.5, 5, 0);
+        }
+        placed++;
+      }
+    }
+    // A minaret and two towers: the map needs at least one landmark that
+    // orients the player from anywhere on it.
+    for (const [x, z, h, rr] of [[-58, 92, 34, 1.7], [98, -54, 27, 2.6], [-92, -80, 30, 2.2]]) {
+      const b = this.batch.at('bgPale', x, z);
+      b.at(x, h / 2, z).cyl(rr * 1.15, rr * 0.92, h, 10, 0.08);
+      b.at(x, h + 0.5, z).cyl(rr * 1.5, rr * 1.4, 1.0, 10, 0.06);
+      b.at(x, h + 2.4, z).cyl(rr * 1.2, rr * 0.9, 2.8, 10, 0.05);
+      b.at(x, h + 4.6, z).cyl(rr * 0.6, 0.02, 2.0, 8, 0.03);
+    }
+    this._backdropCount = placed;
+  }
+
   /* ==================================================================== */
   /*  Buildings                                                           */
   /* ==================================================================== */
@@ -455,10 +755,18 @@ export class LevelModule {
       shutter: 'shutter',
       parapet: o.parapet ?? SCALE.parapet,
       parapetSides: o.parapetSides,
+      // Roofline breakup and bolted-on facade kit. Both are cheap and both are
+      // what stop a row of extruded rectangles reading as extruded rectangles.
+      parapetVary: o.parapetVary ?? 1,
+      fittingDensity: o.fittings ?? 1,
       interior: false,
     });
     this._roofSlots = this._roofSlots || [];
-    this._roofSlots.push({ x0: o.x0, z0: o.z0, x1: o.x1, z1: o.z1, y: o.H });
+    this._roofSlots.push({
+      x0: o.x0, z0: o.z0, x1: o.x1, z1: o.z1, y: o.H,
+      sides: o.parapetSides ?? 'nsew',
+    });
+    this._footprint(o.x0, o.z0, o.x1, o.z1);
   }
 
   _buildWestRow() {
@@ -584,6 +892,19 @@ export class LevelModule {
     roof(this.kit, {
       x0: x0 + 0.04, z0: z0 + 0.04, x1: x1 - 0.04, z1: z1 - 0.04,
       y: H, bucket: 'concrete', trim: 'plasterPale', parapet: SCALE.parapet,
+      parapetVary: 1, seed: 517,
+    });
+    this._roofSlots.push({ x0, z0, x1, z1, y: H, sides: 'nsew' });
+    this._footprint(x0, z0, x1, z1);
+    // The east elevation faces the plaza approach and is in shot from half the
+    // map, so it gets the full fitting set.
+    facadeFittings(this.kit, {
+      x0: x1 - h, z0: z0 + h, x1: x1 - h, z1: z1 - h, height: H, thickness: T,
+      seed: 3301, density: 1.3, trimBucket: 'plasterPale',
+    });
+    facadeFittings(this.kit, {
+      x0: x0 + h, z0: z1 - h, x1: x0 + h, z1: z0 + h, height: H, thickness: T,
+      seed: 3307, density: 1.0, trimBucket: 'plasterPale',
     });
 
     // Interior floor: the tiled slab the fight happens on.
@@ -849,6 +1170,13 @@ export class LevelModule {
       [nf, { x: -4.0, w: 1.1, h: 1.5, sill: 3.5 }]]) {
       windowFill(this.kit, f.m, k, T, { bars: this.detail >= 1, glass: false });
     }
+
+    this._footprint(x0, z0, x1, z1);
+    this._roofSlots.push({ x0: x0 + 1, z0: z0 + 1, x1: x1 - 1, z1: z1 - 1, y: H + 0.2, sides: 'nsew' });
+    facadeFittings(this.kit, {
+      x0: x0 + h, z0: z1 - h, x1: x0 + h, z1: z0 + h, height: H, thickness: T,
+      seed: 4401, density: 1.1, trimBucket: 'plasterPale',
+    });
 
     // Corrugated deck on exposed steel purlins.
     const cr = this.batch.at('corrugated', 22, 0);
@@ -1136,34 +1464,119 @@ export class LevelModule {
     for (const s of slots) {
       const cx = (s.x0 + s.x1) / 2, cz = (s.z0 + s.z1) / 2;
       const w = Math.abs(s.x1 - s.x0), d = Math.abs(s.z1 - s.z0);
-      const n = Math.max(2, Math.round((w * d) / 42));
+
+      // DENSITY. This was one prop per 42 m² of roof, which on a 7x15 block is
+      // three objects — below the threshold where a roof reads as inhabited at
+      // all. One per 8 m², clustered rather than scattered, is what a street of
+      // flat roofs in this part of the world actually looks like from below.
+      const perM2 = { 0: 16, 1: 10, 2: 8, 3: 7 }[this.detail] ?? 8;
+      const n = Math.max(this.detail >= 1 ? 6 : 4, Math.round((w * d) / perM2));
+
+      // Everything that has to break the skyline has to clear the parapet, and
+      // the parapet is 1.05 m with piers to 1.5. A 0.74 m AC unit sitting flat
+      // on the slab is invisible from the street no matter how many you place,
+      // which is why the old pass bought nothing: half of these now stand on a
+      // 0.55 m sleeper frame, and the tallest go closest to the edge.
+      const edgeBand = 1.6;
       for (let i = 0; i < n; i++) {
-        const x = cx + (r() - 0.5) * (w - 2.6);
-        const z = cz + (r() - 0.5) * (d - 2.6);
+        // Bias toward the parapet: a roof reads from the street through its
+        // edge, and the middle of it is never in frame.
+        const edgeward = r() < 0.62;
+        let x, z;
+        if (edgeward) {
+          const side = (r() * 4) | 0;
+          const t = 0.08 + r() * 0.84;
+          if (side === 0) { x = s.x0 + w * t; z = s.z0 + edgeBand * (0.35 + r() * 0.9); }
+          else if (side === 1) { x = s.x0 + w * t; z = s.z1 - edgeBand * (0.35 + r() * 0.9); }
+          else if (side === 2) { x = s.x0 + edgeBand * (0.35 + r() * 0.9); z = s.z0 + d * t; }
+          else { x = s.x1 - edgeBand * (0.35 + r() * 0.9); z = s.z0 + d * t; }
+        } else {
+          x = cx + (r() - 0.5) * (w - 2.6);
+          z = cz + (r() - 0.5) * (d - 2.6);
+        }
         const pick = r();
-        if (pick < 0.34) this._prop('tank', x, s.y, z, r() * 3.14);
-        else if (pick < 0.62) this._prop('ac', x, s.y, z, r() * 3.14);
-        else if (pick < 0.82) this._prop('dish', x, s.y, z, r() * 3.14);
-        else this._prop('crateMetal', x, s.y, z, r() * 3.14);
+        const yaw = r() * 3.14;
+        if (pick < 0.30) {
+          // Water tank on a steel sleeper frame: 1.48 m of tank on 0.55 m of
+          // stand clears any parapet on the map by half a metre.
+          const stand = r() < 0.7;
+          if (stand) this._roofStand(x, s.y, z, 1.3, 1.3, 0.55, yaw);
+          this._prop('tank', x, s.y + (stand ? 0.55 : 0), z, yaw);
+        } else if (pick < 0.56) {
+          const stand = r() < 0.55;
+          if (stand) this._roofStand(x, s.y, z, 1.15, 1.0, 0.62, yaw);
+          this._prop('ac', x, s.y + (stand ? 0.62 : 0), z, yaw);
+        } else if (pick < 0.78) {
+          // Dishes go on a post so they stand at head height above the coping.
+          const post = this.batch.at('ironwork', x, z);
+          post.at(x, s.y + 0.55, z).box(0.11, 1.1, 0.11, 0.02, 0);
+          this._prop('dish', x, s.y + 1.1, z, yaw);
+        } else if (pick < 0.90) {
+          this._prop('crateMetal', x, s.y, z, yaw);
+          if (r() < 0.5) this._prop('crateWood', x + 0.5, s.y, z + 0.3, yaw + 0.7);
+        } else {
+          this._prop('barrelBlue', x, s.y, z, yaw);
+        }
       }
-      // A stair bulkhead on the larger roofs.
-      if (w * d > 140 && r() < 0.7) {
+
+      // Pipe runs across the deck and over the parapet — the thing that ties a
+      // roof's clutter together instead of leaving it as scattered objects.
+      if (w * d > 60) {
+        const py = s.y + 0.16;
+        const ax = s.x0 + 1.2 + r() * (w - 2.4);
+        placeCable(this.kit, [ax, py, s.z0 + 0.8], [ax, py, s.z1 - 0.8], 0.05, 0.055);
+        const pz = s.z0 + 1.0 + r() * (d - 2.0);
+        placeCable(this.kit, [s.x0 + 0.8, py + 0.06, pz], [s.x1 - 0.8, py + 0.06, pz], 0.05, 0.045);
+      }
+
+      // A stair bulkhead on the larger roofs, now with a door and a coping so
+      // it is a building rather than a block.
+      if (w * d > 90 && r() < 0.85) {
         const bx = cx + (r() - 0.5) * (w - 4), bz = cz + (r() - 0.5) * (d - 4);
         const bl = this.batch.at('plasterPale', bx, bz);
-        bl.at(bx, s.y + 1.15, bz).box(2.2, 2.3, 2.6, 0.05, 1.2);
-        bl.at(bx, s.y + 2.36, bz).box(2.5, 0.16, 2.9, 0.04, 0);
-        this.proxy.box(bx, s.y + 1.15, bz, 2.2, 2.3, 2.6);
+        bl.at(bx, s.y + 1.3, bz).box(2.2, 2.6, 2.6, 0.05, [3.2, 1.2]);
+        bl.at(bx, s.y + 2.68, bz).box(2.5, 0.16, 2.9, 0.04, 0);
+        bl.at(bx, s.y + 2.86, bz).box(2.1, 0.20, 2.5, 0.04, 0);
+        const dr = this.batch.at('shutter', bx, bz);
+        dr.at(bx, s.y + 1.05, bz - 1.32).box(0.95, 2.05, 0.09, 0.02, 0);
+        this.proxy.box(bx, s.y + 1.3, bz, 2.2, 2.6, 2.6);
+        // Vent stub off the bulkhead roof.
+        const vt = this.batch.at('ironwork', bx, bz);
+        vt.at(bx + 0.6, s.y + 3.25, bz).cyl(0.14, 0.14, 0.7, 8, 0.02);
+        vt.at(bx + 0.6, s.y + 3.66, bz).cyl(0.22, 0.10, 0.16, 8, 0.02);
       }
-      // Aerial masts: cheap, tall, and they break the parapet line.
-      if (r() < 0.6) {
+
+      // Aerial masts: cheap, tall, and they break the parapet line. Two or
+      // three per roof, guyed, because a single stick reads as an accident.
+      const masts = 1 + ((r() * 2.5) | 0);
+      for (let k = 0; k < masts; k++) {
+        if (r() > 0.75) continue;
         const mx = cx + (r() - 0.5) * (w - 2), mz = cz + (r() - 0.5) * (d - 2);
         const m = this.batch.at('ironwork', mx, mz);
-        const hh = 2.2 + r() * 2.4;
-        m.at(mx, s.y + hh / 2, mz).cyl(0.045, 0.025, hh, 6, 0.01);
-        for (let k = 0; k < 3; k++) {
-          const a = (k / 3) * Math.PI * 2;
-          m.at(mx, s.y + hh * 0.62, mz, a).box(0.7, 0.03, 0.03, 0.008, 0);
+        const hh = 2.6 + r() * 3.2;
+        m.at(mx, s.y + hh / 2, mz).cyl(0.05, 0.025, hh, 6, 0.01);
+        for (let j = 0; j < 3; j++) {
+          const a = (j / 3) * Math.PI * 2;
+          m.at(mx, s.y + hh * (0.5 + j * 0.16), mz, a).box(0.8 - j * 0.16, 0.03, 0.03, 0.008, 0);
         }
+        // Guy wires down to the deck.
+        for (let j = 0; j < 3; j++) {
+          const a = (j / 3) * Math.PI * 2 + 0.4;
+          placeCable(this.kit, [mx, s.y + hh * 0.86, mz],
+            [mx + Math.cos(a) * 1.5, s.y + 0.1, mz + Math.sin(a) * 1.5], 0.06, 0.012);
+        }
+      }
+
+      // Washing strung between the aerials and the parapet. Nothing else on
+      // this map puts a light, moving, high-value shape against the sky.
+      if (w > 5 && d > 5 && r() < 0.6) {
+        const t0 = s.z0 + 1.4 + r() * (d - 2.8);
+        placeWashLine(this.kit, {
+          x0: s.x0 + 0.9, z0: t0, x1: s.x1 - 0.9, z1: t0 + (r() - 0.5) * 2,
+          y: s.y + 2.1, clear: s.y + 0.9, count: 2 + ((r() * 3) | 0),
+          width: 1.0, sag: 0.22, seed: 300 + (t0 | 0), bucket: r() < 0.5 ? 'awning' : 'rug',
+          posts: true, postBase: s.y, postBucket: 'ironwork', collide: false,
+        });
       }
     }
     // Cables strung between roofs across the streets.
@@ -1174,6 +1587,223 @@ export class LevelModule {
       [[-33.2, 6.2, -20], [-26.2, 6.4, -18]], [[-33.2, 9.2, 4], [-26.2, 6.2, 6]],
     ];
     for (const [a, b] of spans) placeCable(this.kit, a, b, 1.2, 0.02);
+  }
+
+  /** Steel sleeper frame that lifts roof plant clear of the parapet coping. */
+  _roofStand(x, y, z, w, d, h, ry = 0) {
+    const b = this.batch.at('ironwork', x, z);
+    b.at(x, y + h - 0.05, z, ry).box(w, 0.10, d, 0.02, 0);
+    for (const sx of [-1, 1]) {
+      for (const sz of [-1, 1]) {
+        b.at(x + sx * (w / 2 - 0.09) * Math.cos(ry) - sz * (d / 2 - 0.09) * Math.sin(ry),
+          y + h / 2,
+          z - sx * (w / 2 - 0.09) * Math.sin(ry) - sz * (d / 2 - 0.09) * Math.cos(ry), ry)
+          .box(0.09, h, 0.09, 0.018, 0);
+      }
+    }
+    b.at(x, y + h * 0.35, z, ry).box(w - 0.1, 0.06, 0.06, 0.014, 0);
+  }
+
+  /* ----------------------------------------------------- foreground ----- */
+
+  /**
+   * Deliberate near-field occluders.
+   *
+   * Every reference frame from a shipped campaign has something inside four
+   * metres of the camera — a beam, a hanging textile, a barrel, an arch soffit
+   * — that is in shadow and frames the lit street behind it. It does three
+   * jobs at once: it gives the eye a true black to measure the midtones
+   * against, it creates the foreground layer the composition otherwise lacks,
+   * and it hides the horizon line that makes a box arena read as a box.
+   *
+   * Nothing here narrows a lane below its designed width or blocks a sightline
+   * that gameplay depends on: the spans and the textiles all clear 2.35 m, the
+   * arches spring above head height, and the ground clutter sits against the
+   * kerbs rather than in the running line.
+   */
+  _dressForeground() {
+    const r = this.rand;
+
+    /* --- the market street: the shot the camera spends most of its time in.
+     * Spans, an arch, wash lines and kerbside clutter, staggered so that from
+     * any point on the street there is something within four metres and
+     * something else at fifteen. */
+    // Every one of these has to land where BOTH facades exist: the centre
+    // blocks are 14..28 / 31..44 on the west and 14..26 / 29..44 on the east,
+    // and a beam springing into the gap between them floats.
+    for (const [z, joists, deck] of [[31.4, 3, 0], [22.8, 2, 0.22], [17.6, 3, 0]]) {
+      placeSpan(this.kit, {
+        x0: -4.86, z0: z, x1: 4.86, z1: z, y: 2.72, depth: 0.30, width: 0.22,
+        joists, deck, deckOffset: 0.12,
+      });
+    }
+    // Segmental arch over the street: it springs off both facades at 3.2 m, so
+    // it costs nothing in width and puts a dark soffit across the top third of
+    // every southbound frame.
+    archway(this.kit, {
+      x: 0, y: 0, z: 25.0, yaw: 0, span: 9.8, rise: 1.55, springY: 3.2,
+      thickness: 0.46, depth: 0.5, bucket: 'brick',
+    });
+    // Market gate at the plaza mouth: two piers and a lintel, which frames the
+    // plaza and the hall behind it instead of letting them sit in open space.
+    for (const s of [-1, 1]) {
+      pillar(this.kit, { x: s * 4.45, z: 15.3, height: 4.3, size: 0.85, bucket: 'brick' });
+    }
+    const gt = this.batch.at('plasterWarm', 0, 15.3);
+    gt.at(0, 4.55, 15.3).box(10.2, 0.5, 1.1, 0.05, [3, 1]);
+    gt.at(0, 4.92, 15.3).box(10.7, 0.24, 1.4, 0.04, 0);
+    this.proxy.extent(-5.2, 4.3, 14.75, 5.2, 5.05, 15.85);
+    placeSign(this.kit, { x: 0, y: 3.75, z: 14.72, width: 3.6, height: 0.7, yaw: Math.PI });
+
+    for (const [z, sd] of [[32.6, 71], [20.4, 73], [35.4, 75]]) {
+      placeWashLine(this.kit, {
+        x0: -4.7, z0: z, x1: 4.7, z1: z + 0.6, y: 4.35, clear: 2.42,
+        count: 4, width: 1.55, sag: 0.34, seed: sd,
+        bucket: sd % 2 ? 'rug' : 'awning',
+      });
+    }
+    // Kerbside clutter: dark mass low in frame, hard against the buildings so
+    // the running line down the middle of the street stays clear.
+    for (const [x, z, kind, yaw] of [
+      [-4.05, 32.6, 'barrel', 0.3], [-3.55, 33.3, 'barrel', 1.1], [-4.15, 34.1, 'crateWoodBig', 0.6],
+      [4.05, 30.2, 'jersey', Math.PI / 2], [4.10, 27.9, 'jersey', Math.PI / 2],
+      [-4.20, 25.6, 'crateWoodBig', 0.2], [-4.20, 25.6, 'crateWood', 1.4],
+      [4.15, 22.4, 'barrel', 0.8], [3.65, 22.9, 'barrel', 2.0],
+      [-4.10, 19.4, 'jersey', Math.PI / 2], [4.20, 17.2, 'crateWoodBig', 0.9],
+    ]) {
+      this._prop(kind, x, kind === 'crateWood' ? 0.86 : 0, z, yaw);
+    }
+    this._prop('pipes', -4.3, 0, 36.6, 0.02);
+    this._prop('tyre', 4.3, 0.0, 35.0, 0.4);
+    this._prop('tyre', 4.3, 0.14, 35.1, 1.4);
+    this._prop('pallet', -4.35, 0, 28.2, 1.55);
+    this._prop('pallet', -4.35, 0.13, 28.3, 1.62);
+
+    /* --- the plaza approach from the north, and the hall's north face. */
+    placeWashLine(this.kit, {
+      x0: -6.6, z0: 11.4, x1: 6.6, z1: 11.0, y: 4.1, clear: 2.5,
+      count: 5, width: 1.5, sag: 0.3, seed: 81, bucket: 'awning', posts: true,
+    });
+    for (const [x, z, yaw] of [[-2.9, 10.6, 0.1], [3.1, 10.0, -0.2]]) {
+      this._prop('jersey', x, 0, z, yaw + Math.PI / 2);
+    }
+    placeStall(this.kit, {
+      x: -6.6, z: 11.6, yaw: -0.4, width: 2.6, depth: 1.8,
+      clothBucket: 'awningRed', seed: 811,
+    });
+
+    /* --- the plaza's north-east quarter, looked at from the yard side. */
+    placeStall(this.kit, {
+      x: 5.2, z: 5.4, y: 1.62, yaw: -Math.PI * 0.75, width: 2.6, depth: 1.8,
+      clothBucket: 'awning', seed: 823,
+    });
+    this._fixtures.push({
+      pos: placeLamp(this.kit, { x: 8.2, y: 4.4, z: 8.2, yaw: -2.4, style: 'bracket' }),
+      color: 0xffb469, intensity: 8, radius: 10, priority: 4,
+    });
+    const pg = this.batch.at('timber', 12.5, 12.5);
+    // A pergola over the plaza corner — one more overhead plane between the
+    // camera and the sky in the shot that looks up into the sun.
+    for (const sx of [-1, 1]) {
+      pg.at(12.6 + sx * 1.9, 1.4, 12.6 - sx * 1.9).box(0.16, 2.8, 0.16, 0.03, 0);
+    }
+    pg.at(12.6, 2.85, 12.6, -Math.PI / 4).box(5.4, 0.16, 0.18, 0.03, 0);
+    for (let i = 0; i < 6; i++) {
+      pg.at(12.6 - 2.0 + i * 0.8, 2.98, 12.6 + 2.0 - i * 0.8, -Math.PI / 4)
+        .box(0.10, 0.10, 2.4, 0.02, 0);
+    }
+    this.proxy.box(12.6 + 1.9, 1.4, 12.6 - 1.9, 0.28, 2.8, 0.28);
+    this.proxy.box(12.6 - 1.9, 1.4, 12.6 + 1.9, 0.28, 2.8, 0.28);
+
+    /* --- the alley: it already had awnings, but nothing at the near end of
+     * the northbound view. */
+    // West side of the alley is the west row (16..32, -5..12, -24..-8); east
+    // side is the V row (26..44, 2..20) and the souk house (-22..-2).
+    for (const z of [26.0, 30.5, 8.0, -18.0]) {
+      placeSpan(this.kit, {
+        x0: -32.85, z0: z, x1: -26.15, z1: z, y: 2.68, depth: 0.26, width: 0.20,
+        joists: 2, deck: z > 0 ? 0.3 : 0, deckOffset: -0.1,
+      });
+    }
+    for (const [z, sd] of [[28.5, 91], [10.5, 93], [-16.0, 95]]) {
+      placeWashLine(this.kit, {
+        x0: -32.7, z0: z, x1: -26.3, z1: z + 0.5, y: 4.2, clear: 2.4,
+        count: 3, width: 1.5, sag: 0.3, seed: sd, bucket: sd % 2 ? 'rug' : 'awning',
+      });
+    }
+    awning(this.kit, {
+      x: -32.1, z: 30.0, width: 3.0, depth: 2.0, yaw: Math.PI / 2,
+      height: 2.8, drop: 0.45, posts: true, clothBucket: 'awningRed',
+    });
+    this._prop('barrel', -32.2, 0, 34.4, 0.5);
+    this._prop('barrel', -31.7, 0, 34.9, 1.6);
+    this._prop('crateWoodBig', -32.3, 0, 27.4, 0.3);
+
+    /* --- the souk house interior: two timber posts under the mezzanine, a
+     * rug on the rail, and goods stacked into the near corner. Interiors are
+     * where the 0-4 m band matters most, because there is no distance to fall
+     * back on. */
+    const post = this.batch.at('timber', -22, -6);
+    for (const [px, pz] of [[-22.7, -6.4], [-19.2, -3.4]]) {
+      post.at(px, 1.55, pz).box(0.22, 3.1, 0.22, 0.03, [3, 1.4]);
+      post.at(px, 3.02, pz).box(0.52, 0.16, 0.52, 0.03, 0);
+      post.at(px, 2.86, pz).box(0.34, 0.20, 0.34, 0.025, 0);
+      this.proxy.box(px, 1.55, pz, 0.3, 3.1, 0.3);
+    }
+    for (let i = 0; i < 3; i++) {
+      placeHangingRug(this.kit, {
+        x: -22.0 + i * 1.9, z: -9.05, yaw: 0, width: 1.5, height: 1.7,
+        top: 3.15, phase: i * 2.2,
+      });
+    }
+    this._prop('crateWoodBig', -23.6, 0, -5.4, 0.5);
+    this._prop('crateWood', -23.5, 0.86, -5.3, 1.1);
+    this._prop('barrel', -22.6, 0, -4.2, 0.2);
+    // A shelf rack against the west wall with goods on it: the north half of
+    // the interior had bare plaster from the floor to the mezzanine.
+    const rack = this.batch.at('timber', -25, -6);
+    for (let i = 0; i < 4; i++) {
+      rack.at(-25.25, 0.42 + i * 0.66, -6.4).box(0.62, 0.055, 5.0, 0.014, 0);
+    }
+    for (const z of [-8.6, -6.4, -4.2]) rack.at(-25.5, 1.42, z).box(0.08, 2.6, 0.5, 0.018, 0);
+    this.proxy.box(-25.3, 1.3, -6.4, 0.7, 2.6, 5.0);
+    const goods = this.batch.at('sack', -25, -6);
+    for (let i = 0; i < 12; i++) {
+      goods.at(-25.2 + (r() - 0.5) * 0.2, 0.52 + ((i % 4) | 0) * 0.66,
+        -8.6 + r() * 4.4, r() * 3.14).box(0.34, 0.22, 0.30, 0.08);
+    }
+    for (let i = 0; i < 4; i++) {
+      goods.at(-24.4 + r() * 0.6, 0.19, -3.4 + r() * 1.6, r() * 3.14).box(0.46, 0.38, 0.42, 0.13);
+    }
+
+    /* --- the garage mouth, looked into from the plaza side. */
+    placeSpan(this.kit, {
+      x0: 18.3, z0: -6.4, x1: 18.3, z1: 2.4, y: 2.78, depth: 0.30, width: 0.24,
+      joists: 2, bucket: 'ironwork',
+    });
+    for (let i = 0; i < 4; i++) this._prop('tyre', 18.5 + (i % 2) * 0.18, 0.14 * i, -4.9, i * 0.9);
+    this._prop('crateMetal', 18.0, 0, 1.6, 0.4);
+    this._prop('barrel', 17.4, 0, -6.2, 0.9);
+
+    /* --- both spawn frontages, so the very first frame of a life has depth. */
+    for (const [z, yaw] of [[-38.6, 0], [38.6, Math.PI]]) {
+      placeSpan(this.kit, {
+        x0: -4.9, z0: z, x1: 4.9, z1: z, y: 2.75, depth: 0.28, width: 0.22, joists: 2,
+      });
+      void yaw;
+    }
+    for (const [x, z] of [[-4.2, -40.2], [4.2, -39.4], [-4.2, 40.0], [4.2, 41.2]]) {
+      this._prop(r() < 0.5 ? 'barrel' : 'crateWoodBig', x, 0, z, r() * 3.14);
+    }
+
+    /* --- the long cross-street: two spans between the block corners so the
+     * 74 m sightline is layered rather than empty. */
+    for (const [x, z0, z1] of [[-21.0, -22.1, -29.9], [22.0, -21.1, -30.9]]) {
+      placeSpan(this.kit, {
+        x0: x, z0, x1: x, z1, y: 3.0, depth: 0.30, width: 0.24, joists: 2,
+        bucket: 'ironwork',
+      });
+    }
   }
 
   /* -------------------------------------------------------- foliage ----- */
@@ -1190,20 +1820,43 @@ export class LevelModule {
       [-19.5, 23.0, 7.8], [-11.8, -12.0, 6.9], [11.8, -12.0, 7.6],
       [-11.8, 12.0, 8.2], [14.4, 12.0, 7.1],
       [33.5, 40.5, 8.0], [-30.0, -34.0, 6.4],
+      // Now that crowns cast a real cutout shadow, a palm is worth putting
+      // where its shadow lands on something the player looks at: across the
+      // market street, over the plaza kerb, and against the yard's long wall.
+      [-4.6, 30.4, 7.9], [4.6, 23.2, 7.2], [-4.5, 18.6, 8.4],
+      [15.4, -13.4, 7.6], [-15.2, -13.6, 7.0],
+      [37.2, -8.0, 8.2], [37.4, 14.0, 7.4], [-37.0, 6.0, 7.6],
+      // Two behind the north gate: from the south end of the market street the
+      // gate frames 6 m of spawn frontage and then a blank 5.6 m perimeter
+      // wall, and a crown at 9 m is the cheapest thing that breaks it.
+      [-7.2, 43.0, 8.6], [6.8, 43.6, 9.2],
+      [-7.0, -42.4, 8.4], [7.4, -42.0, 8.0],
     ];
     for (const [x, z, hgt] of palms) {
       this.foliage.addPalm(x, z, hgt, r() * Math.PI * 2, (r() - 0.5) * 0.2);
       this.proxy.box(x, hgt * 0.5, z, 0.44, hgt, 0.44);
     }
-    const scrubCount = d >= 2 ? 46 : 22;
+    const scrubCount = d >= 2 ? 96 : 44;
+    const foot = this._foot || [];
     for (let i = 0; i < scrubCount; i++) {
       // Scrub grows where nobody walks: against walls and in corners.
       const edge = r();
       let x, z;
-      if (edge < 0.3) { x = -39.0 + r() * 1.6; z = -44 + r() * 88; }
-      else if (edge < 0.6) { x = 38.0 + r() * 1.6; z = -44 + r() * 88; }
-      else if (edge < 0.8) { x = -38 + r() * 76; z = -45.0 + r() * 1.6; }
-      else { x = -38 + r() * 76; z = 43.4 + r() * 1.6; }
+      if (edge < 0.22) { x = -39.0 + r() * 1.6; z = -44 + r() * 88; }
+      else if (edge < 0.44) { x = 38.0 + r() * 1.6; z = -44 + r() * 88; }
+      else if (edge < 0.56) { x = -38 + r() * 76; z = -45.0 + r() * 1.6; }
+      else if (edge < 0.68) { x = -38 + r() * 76; z = 43.4 + r() * 1.6; }
+      else if (foot.length) {
+        // Against a building base, in the dead 400 mm nobody's capsule reaches.
+        const f = foot[(r() * foot.length) | 0];
+        const side = (r() * 4) | 0;
+        const t = 0.1 + r() * 0.8;
+        const off = 0.35 + r() * 0.55;
+        if (side === 0) { x = f[0] + (f[2] - f[0]) * t; z = f[1] - off; }
+        else if (side === 1) { x = f[0] + (f[2] - f[0]) * t; z = f[3] + off; }
+        else if (side === 2) { x = f[0] - off; z = f[1] + (f[3] - f[1]) * t; }
+        else { x = f[2] + off; z = f[1] + (f[3] - f[1]) * t; }
+      } else { x = -38 + r() * 76; z = -44 + r() * 88; }
       this.foliage.addScrub(x, z, 0.8 + r() * 0.7, r() * 3.14);
     }
     // Raised bed in the garden pocket — 0.56 m, so it is a step, not an

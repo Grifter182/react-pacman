@@ -109,7 +109,10 @@ export class HudModule {
     this.callouts = new Callouts(this.hud);
     this.objective = new ObjectiveStrip(this.hud);
     this.respawn = new RespawnOverlay(this.hud);
-    this.$perf = el('div.bl-perf'); this.hud.appendChild(this.$perf);
+    // `debug-only` is the hook `setCaptureMode()` in main.js hides on: the FPS
+    // readout is a development affordance and must never be photographed.
+    this.$perf = el('div.bl-perf.debug-only'); this.hud.appendChild(this.$perf);
+    this._capture = false;
 
     /* --- overlays ---------------------------------------------------------- */
     this.scoreboard = new Scoreboard(this.root);
@@ -137,6 +140,7 @@ export class HudModule {
     this.map.build(collision?.collider || level?.collider, level?.bounds);
 
     this._bind(engine);
+    this.crosshair.resize(engine.width, engine.height);
 
     // The harness gets the live HUD with no overlay; a human gets the title.
     if (this.headless) { this.state = State.LIVE; this.menus.hide(); }
@@ -170,6 +174,9 @@ export class HudModule {
 
     bus.on('ui:vitals', (v) => { this._vitalsState = v; });
 
+    // The capture harness photographs the presentation, not the instrumentation.
+    bus.on('ui:capture', ({ capture }) => { this._capture = !!capture; });
+
     /* --- contacts on the map ----------------------------------------------- */
     bus.on('ai:fire', ({ origin }) => { if (origin) this.map.ping(origin.x, origin.z, 'contact', 2.8); });
     bus.on('fx:explosion', ({ position }) => { if (position) this.map.ping(position.x, position.z, 'explosion', 3.4); });
@@ -184,7 +191,7 @@ export class HudModule {
     /* --- match ------------------------------------------------------------- */
     bus.on('match:killfeed', (e) => this.killfeed.push(e));
     bus.on('match:callout', ({ title, sub, kind, dwell }) => this.callouts.push(title, sub, kind, dwell ?? 2.6));
-    bus.on('match:objective', ({ text, sub }) => this.objective.set(text, sub));
+    bus.on('match:objective', ({ text, sub, dwell }) => this.objective.set(text, sub, dwell));
     bus.on('match:uav', ({ active }) => this.map.setUav(active));
     bus.on('match:end', (summary) => this.showSummary(summary));
     bus.on('match:state', ({ state }) => {
@@ -333,6 +340,8 @@ export class HudModule {
     this.compass.update(s.yaw);
     this.killfeed.update(dt);
     this.callouts.update(dt);
+    // The objective is a timed card now, so it needs a clock of its own.
+    this.objective.update(dt);
 
     const mv = match?.view?.();
     if (mv) {
@@ -353,12 +362,15 @@ export class HudModule {
 
     this.scoreboard.update(dt, this._boardThunk);
 
-    if (engine.frame % 20 === 0) {
+    if (!this._capture && engine.frame % 20 === 0) {
       this.$perf.textContent = `${engine.perf.fps.toFixed(0)} FPS · ${engine.perf.smoothMs.toFixed(1)} MS`;
     }
   }
 
-  resize() { this.map?._resize(); }
+  resize(w, h) {
+    this.map?._resize();
+    this.crosshair?.resize(w, h);
+  }
 
   dispose() {
     window.removeEventListener('keydown', this._onKeyDown);

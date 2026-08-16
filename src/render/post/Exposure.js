@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { FullScreenPass, createRT } from './PassCore.js';
+import { GradeShared } from './GradeShared.js';
 
 /**
  * OWNER: rendering / post-processing agent.
@@ -9,11 +10,31 @@ import { FullScreenPass, createRT } from './PassCore.js';
  *
  * The scene luminance is reduced to a 1x1 geometric mean through a log-space
  * mip chain (log space is what makes the average perceptual rather than
- * dominated by the single brightest window in frame), with a centre-weighted
- * metering mask so a bright sky does not crush the corridor you are standing
- * in. The result is then adapted with an exponential curve — faster when the
- * frame gets brighter than when it gets darker, as the eye does — and hard
- * clamped at both ends so the image can never pump.
+ * dominated by the single brightest window in frame), with a mildly
+ * centre-weighted metering mask. The result is adapted with an exponential
+ * curve — faster when the frame gets brighter than when it gets darker, as the
+ * eye does.
+ *
+ * PARTIAL ADAPTATION — the thing that makes an interior look like an interior
+ * ------------------------------------------------------------------------
+ * A textbook auto-exposure drives the frame's geometric mean to a fixed key,
+ * which means it renders a black cellar and a white street at *identical*
+ * midtones. That is a correct light meter and a terrible camera: it deletes the
+ * largest depth and mood cue an FPS frame has, and it is why the previous build
+ * could put a doorway and the alley behind it at the same value.
+ *
+ * So the metered luminance is compressed toward a fixed anchor before the key
+ * is divided by it:
+ *
+ *     adapted = anchor * (metered / anchor) ^ ADAPT_STRENGTH
+ *
+ * At ADAPT_STRENGTH = 1 this is the textbook behaviour. At 0 there is no
+ * adaptation at all and the exposure is fixed. At 0.68 a scene eight times
+ * darker gets only 8^0.68 = 4.1x more exposure, so it still renders about
+ * twice as dark on screen — the room reads as a room, and stepping out into the
+ * street still lifts, just not all the way. Absolute clamps at both ends stop
+ * the pathological cases (staring into a wall, staring at the sun) from
+ * running away.
  *
  * The same 1x1 buffer carries the smoothed auto-focus distance in .g, sampled
  * from the depth buffer under the crosshair. Depth of field reads it from here.
@@ -27,13 +48,28 @@ export class Exposure {
     this.downPass = null;
     this.adaptPass = null;
 
-    this.keyValue = 0.16;
-    this.minLuminance = 0.012;
-    this.maxLuminance = 7.5;
+    /**
+     * Range is deliberately much wider than the old [0.012, 7.5]: that band is
+     * under nine stops, narrow enough that a shaded interior hit the floor and
+     * a sunlit exterior hit the ceiling, at which point the two ends of the
+     * level were being metered by a clamp rather than by their content.
+     */
+    this.minLuminance = 0.0035;
+    this.maxLuminance = 42.0;
+
+    /** Scene luminance the exposure is anchored to. See the class comment. */
+    this.anchorLuminance = 0.22;
+    /** 1 = full adaptation (everything renders at the same midtone), 0 = none. */
+    this.adaptStrength = 0.68;
+
     this.speedUp = 2.4;      // 1/s toward a brighter frame
     this.speedDown = 0.9;    // 1/s toward a darker frame
     this._primed = false;
   }
+
+  /** The key the grade meters to. Single source of truth for the whole chain. */
+  get keyValue() { return GradeShared.keyValue; }
+  set keyValue(v) { GradeShared.keyValue = v; }
 
   init() {
     this.logPass = new FullScreenPass('lum-log', LOG_FRAG, {
@@ -53,6 +89,8 @@ export class Exposure {
       uDt: { value: 0.016 },
       uMin: { value: this.minLuminance },
       uMax: { value: this.maxLuminance },
+      uAnchor: { value: this.anchorLuminance },
+      uAdaptStrength: { value: this.adaptStrength },
       uSpeedUp: { value: this.speedUp },
       uSpeedDown: { value: this.speedDown },
       uPrimed: { value: 0 },
@@ -94,12 +132,20 @@ export class Exposure {
     u.uDt.value = Math.min(ctx.dt, 0.1);
     u.uMin.value = this.minLuminance;
     u.uMax.value = this.maxLuminance;
+    u.uAnchor.value = this.anchorLuminance;
+    u.uAdaptStrength.value = this.adaptStrength;
     u.uSpeedUp.value = this.speedUp;
     u.uSpeedDown.value = this.speedDown;
     u.uPrimed.value = this._primed ? 1 : 0;
     this.adaptPass.render(renderer, write);
     this.index ^= 1;
     this._primed = true;
+
+    // Published for Bloom, which PostStack calls without a context object and
+    // which needs the same exposure to threshold against. See GradeShared.js.
+    GradeShared.adaptTexture = write.texture;
+    GradeShared.staticExposure = ctx.staticExposure;
+
     return write.texture;
   }
 
@@ -111,6 +157,7 @@ export class Exposure {
     this.logPass?.dispose();
     this.downPass?.dispose();
     this.adaptPass?.dispose();
+    if (GradeShared.adaptTexture) GradeShared.adaptTexture = null;
   }
 }
 
@@ -128,10 +175,14 @@ void main(){
          + texture(tColor, vUv + vec2( o.x,  o.y)).rgb;
   float l = luma(c * 0.25);
 
-  // Centre-weighted metering. A wide sky at the top of frame should not decide
-  // the exposure of the alley the player is standing in.
+  // Mild centre weighting. It used to fall to 0.35 at the frame edge, which is
+  // a portrait meter: in a corridor shot the walls filling the outer two thirds
+  // of frame were being discounted to a third of their weight, so the meter saw
+  // mostly the bright doorway ahead and stopped down the room the player is
+  // standing in. 0.55 still protects against a sky-filled top third without
+  // deciding the exposure from a sixth of the image.
   vec2 d = (vUv - 0.5) * vec2(1.0, 1.15);
-  float mask = mix(0.35, 1.0, 1.0 - smoothstep(0.10, 0.55, dot(d, d)));
+  float mask = mix(0.55, 1.0, 1.0 - smoothstep(0.10, 0.55, dot(d, d)));
 
   // log-average -> geometric mean once the chain collapses to 1x1.
   fragColor = vec4(log(max(l, 1e-4)) * mask, mask, 0.0, 1.0);
@@ -164,13 +215,23 @@ uniform vec2 uJitter;
 uniform float uDt;
 uniform float uMin;
 uniform float uMax;
+uniform float uAnchor;
+uniform float uAdaptStrength;
 uniform float uSpeedUp;
 uniform float uSpeedDown;
 uniform int uPrimed;
 
 void main(){
   vec2 lum = texture(tLum, vec2(0.5)).rg;
-  float target = clamp(exp(lum.r / max(lum.g, 1e-3)), uMin, uMax);
+  float metered = clamp(exp(lum.r / max(lum.g, 1e-3)), uMin, uMax);
+
+  // Partial adaptation: compress the metered value toward the anchor so a dark
+  // interior does not get pulled up to the same midtone as an open street.
+  // pow() in log form so the exponent is doing the compressing, not a lerp
+  // (a lerp in linear luminance is a lerp in the wrong space and collapses at
+  // the dark end, where every stop matters most).
+  float target = uAnchor * exp(log(max(metered, 1e-5) / uAnchor) * uAdaptStrength);
+  target = clamp(target, uMin, uMax);
 
   // Auto-focus: depth under the crosshair, clamped to a sane weapon-range band.
   float cd = texture(tDepth, vec2(0.5)).r;

@@ -10,80 +10,190 @@ import * as THREE from 'three';
 const LUT_SIZE = 33;
 
 function saturate(x) { return x < 0 ? 0 : x > 1 ? 1 : x; }
+function smoothstep(e0, e1, x) {
+  const t = saturate((x - e0) / (e1 - e0));
+  return t * t * (3 - 2 * t);
+}
+function srgbToLinear(v) {
+  return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+}
+function linearToSrgb(v) {
+  if (v <= 0) return 0;
+  return v <= 0.0031308 ? v * 12.92 : 1.055 * Math.pow(v, 1 / 2.4) - 0.055;
+}
+function luma(c) { return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]; }
+
+/* ===========================================================================
+ *  THE GRADE
+ * ===========================================================================
+ *
+ * THE DOMAIN IS sRGB-ENCODED, NOT LINEAR. This is the single most important
+ * fact about this file and ColorGrade.js encodes before the lookup to match.
+ *
+ * A 33^3 cube sampled in linear light puts its first two slices at 0.000 and
+ * 0.031 — and 0.031 linear is already 49/255 on screen. The entire toe of the
+ * image, every value a shadow can take, falls between two samples and gets a
+ * straight line drawn through it. Encoding the lookup coordinate first spends
+ * the cube's resolution where the eye is, giving the toe roughly eight times
+ * the sample density and letting the curve below actually reach zero.
+ *
+ * OPERATIONS, IN ORDER. Every one of them maps 0 -> 0 exactly; there is no
+ * unconditional lift anywhere in this file, and `makeGradeLUT` asserts that the
+ * black entry of the finished cube is (0,0,0) before it returns.
+ *
+ *  1. Power-law contrast about a pivot. `pivot * (x/pivot)^contrast` — the
+ *     log-space S-curve the previous version used added +0.01 inside the log to
+ *     avoid log(0), which meant black came out at 2^(pv - contrast*pv') - 0.01
+ *     rather than at zero, and used a pivot of 0.42: more than four stops above
+ *     where this frame's midtone actually sits, so the curve was *lifting* the
+ *     entire image instead of pivoting it.
+ *
+ *  2. A filmic toe, `y^2 / (y + k)`. Multiplicative, so it cannot lift; it
+ *     halves the value at y == k and converges to y - k up top. This is what
+ *     produces real black in creases, under geometry and inside interiors.
+ *
+ *  3. Split tone, applied as a per-channel GAIN, not an offset. The previous
+ *     version added a teal of (-0.010, 0.030, 0.062) weighted by (1 - l)^2.2 —
+ *     at l = 0 that is a flat +0.062 in blue on every black pixel in the frame,
+ *     which is 74/255 on screen. A gain of 1.185 on the same pixel is still
+ *     black. Cool shadows, warm highlights, and the sun direction reads because
+ *     the two ends of the ramp cross over in hue rather than in level alone.
+ *
+ *  4. Highlight shoulder, `s + (1-s)(1 - e^-(y-s)/(1-s))`. Asymptotic to 1, so
+ *     nothing ever clips: sky, sunlit sand and a specular all land in the top
+ *     quarter but at *different* values instead of collapsing onto 255.
+ *
+ *  5. Luminance-dependent saturation. Chroma is kept (slightly boosted) in the
+ *     shadows, where the sky bounce is the only colour information there is,
+ *     and pulled back in the highlights, where film desaturates as it rolls off.
+ *     A lerp toward luma cannot lift black either — luma(0) is 0.
+ *
+ *  6. Channel crosstalk, a linear mix, so saturated reds (muzzle flash, blood)
+ *     roll toward white instead of clipping into a flat patch. Also lift-free.
+ *
+ * The neutral ladder this produces, measured end to end (ACES-linear input ->
+ * 8-bit sRGB output), is printed by the self-check at the bottom of the file.
+ */
+
+/** Power-law contrast pivot, in ACES output (linear display-referred) units. */
+const PIVOT = 0.18;
+const CONTRAST = 1.16;
+/** Toe knee. Larger = deeper crush. */
+const TOE = 0.0055;
+/** Shoulder onset, and the value the rolloff is asymptotic to. */
+const SHOULDER = 0.56;
+/**
+ * Slightly above 1 on purpose: an asymptote of exactly 1 means nothing in the
+ * frame can ever reach 255, so a specular ping and a sunlit wall both land in
+ * the 240s and the top of the histogram is as compressed as the bottom used to
+ * be. Overshooting to 1.045 and clamping keeps the rolloff on everything below
+ * about four stops over key while letting a genuine highlight hit white.
+ */
+const SHOULDER_TOP = 1.045;
+
+/** Multiplicative split tone. Cool shadows against warm highlights. */
+const SHADOW_GAIN = [0.865, 0.968, 1.185];
+const HIGH_GAIN = [1.115, 1.015, 0.858];
+const TONE_STRENGTH = 0.90;
+
+/** Saturation at the bottom and the top of the ramp. */
+const SAT_SHADOW = 1.08;
+const SAT_HIGH = 0.86;
+
+const CROSSTALK = 0.030;
 
 /**
- * Neutral-plus-teal/orange creative LUT.
- *
- * The look is the standard modern-military-shooter grade, built from four
- * stacked operations that are each cheap to reason about:
- *
- *   1. A filmic S-curve in log space. Contrast applied in log rather than
- *      display space keeps the toe from clipping shadow detail to black.
- *   2. Split toning: shadows pushed to teal, highlights to warm amber, with a
- *      luminance-squared weight so midtones (skin, concrete) stay neutral.
- *   3. Global desaturation with a luminance-dependent floor — deep shadows lose
- *      more chroma than highlights, which is what makes the image read as
- *      "graded" rather than "greyed".
- *   4. Channel crosstalk: a small amount of each channel bled into the others,
- *      the thing that stops saturated reds (muzzle flash, blood) from turning
- *      into flat clipped patches.
+ * Apply the grade to one linear display-referred RGB triple.
+ * Exported so the self-check and any future tuning tool can use the same code
+ * path the cube is baked from.
+ */
+export function gradeLinear(input) {
+  const c = [input[0], input[1], input[2]];
+
+  // --- 1. power-law contrast about the pivot -------------------------------
+  const k = Math.pow(PIVOT, 1 - CONTRAST);
+  for (let i = 0; i < 3; i++) {
+    c[i] = c[i] <= 0 ? 0 : k * Math.pow(c[i], CONTRAST);
+  }
+
+  // --- 2. filmic toe -------------------------------------------------------
+  for (let i = 0; i < 3; i++) {
+    c[i] = (c[i] * c[i]) / (c[i] + TOE);
+  }
+
+  // --- 3. split tone, multiplicative ---------------------------------------
+  {
+    const l = luma(c);
+    const ws = Math.pow(Math.max(0, 1 - l), 3.2);
+    const wh = Math.pow(saturate(l / 0.88), 1.5);
+    for (let i = 0; i < 3; i++) {
+      const gs = 1 + (SHADOW_GAIN[i] - 1) * ws * TONE_STRENGTH;
+      const gh = 1 + (HIGH_GAIN[i] - 1) * wh * TONE_STRENGTH;
+      c[i] *= gs * gh;
+    }
+  }
+
+  // --- 4. highlight shoulder -----------------------------------------------
+  for (let i = 0; i < 3; i++) {
+    if (c[i] > SHOULDER) {
+      const head = SHOULDER_TOP - SHOULDER;
+      c[i] = SHOULDER + head * (1 - Math.exp(-(c[i] - SHOULDER) / head));
+    }
+    if (c[i] > 1) c[i] = 1;
+  }
+
+  // --- 5. luminance-dependent saturation -----------------------------------
+  {
+    const l = luma(c);
+    const s = SAT_SHADOW + (SAT_HIGH - SAT_SHADOW) * smoothstep(0.05, 0.75, l);
+    for (let i = 0; i < 3; i++) c[i] = Math.max(0, l + (c[i] - l) * s);
+  }
+
+  // --- 6. crosstalk ---------------------------------------------------------
+  {
+    const cr = c[0], cg = c[1], cb = c[2];
+    c[0] = cr * (1 - CROSSTALK * 2) + cg * CROSSTALK + cb * CROSSTALK;
+    c[1] = cg * (1 - CROSSTALK * 2) + cr * CROSSTALK + cb * CROSSTALK;
+    c[2] = cb * (1 - CROSSTALK * 2) + cr * CROSSTALK * 0.6 + cg * CROSSTALK * 1.4;
+  }
+
+  return [Math.max(0, c[0]), Math.max(0, c[1]), Math.max(0, c[2])];
+}
+
+/**
+ * Bake the grade into a 33^3 cube whose axes AND stored values are both
+ * sRGB-encoded. ColorGrade.js encodes before the lookup and consumes the result
+ * as display-referred, so no decode happens on the way out.
  */
 export function makeGradeLUT() {
   const n = LUT_SIZE;
   const data = new Uint8Array(n * n * n * 4);
 
-  const shadowTint = [-0.010, 0.030, 0.062];   // teal
-  const highTint = [0.055, 0.020, -0.028];     // amber
-  const toneStrength = 0.85;
-  const contrast = 1.13;
-  const pivot = 0.42;
-  const desat = 0.80;
-  const crosstalk = 0.055;
-
   let p = 0;
   for (let b = 0; b < n; b++) {
     for (let g = 0; g < n; g++) {
       for (let r = 0; r < n; r++) {
-        let c = [r / (n - 1), g / (n - 1), b / (n - 1)];
-
-        // --- 1. log-space S-curve ---------------------------------------
-        for (let i = 0; i < 3; i++) {
-          const lg = Math.log2(Math.max(c[i], 1e-4) + 0.01);
-          const pv = Math.log2(pivot + 0.01);
-          c[i] = Math.max(0, Math.pow(2, pv + (lg - pv) * contrast) - 0.01);
-        }
-        // A gentle shoulder so the top end rolls instead of clipping.
-        for (let i = 0; i < 3; i++) c[i] = c[i] / (1.0 + Math.max(0, c[i] - 0.82) * 0.9);
-
-        // --- 2. split toning ---------------------------------------------
-        let l = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
-        const ws = Math.pow(1 - saturate(l), 2.2);
-        const wh = Math.pow(saturate(l), 2.0);
-        for (let i = 0; i < 3; i++) {
-          c[i] += (shadowTint[i] * ws + highTint[i] * wh) * toneStrength;
-        }
-
-        // --- 3. luminance-aware desaturation ------------------------------
-        l = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
-        const s = desat - 0.14 * (1 - saturate(l));
-        for (let i = 0; i < 3; i++) c[i] = l + (c[i] - l) * s;
-
-        // --- 4. crosstalk --------------------------------------------------
-        const cr = c[0], cg = c[1], cb = c[2];
-        c[0] = cr * (1 - crosstalk * 2) + cg * crosstalk + cb * crosstalk;
-        c[1] = cg * (1 - crosstalk * 2) + cr * crosstalk + cb * crosstalk;
-        c[2] = cb * (1 - crosstalk * 2) + cr * crosstalk * 0.6 + cg * crosstalk * 1.4;
-
-        // Lift the very bottom off pure black — real film never reaches 0, and
-        // a slightly blue floor keeps night interiors from looking like holes.
-        c[0] += 0.006; c[1] += 0.008; c[2] += 0.013;
-
-        data[p++] = Math.round(saturate(c[0]) * 255);
-        data[p++] = Math.round(saturate(c[1]) * 255);
-        data[p++] = Math.round(saturate(c[2]) * 255);
+        const lin = [
+          srgbToLinear(r / (n - 1)),
+          srgbToLinear(g / (n - 1)),
+          srgbToLinear(b / (n - 1)),
+        ];
+        const out = gradeLinear(lin);
+        data[p++] = Math.round(saturate(linearToSrgb(out[0])) * 255);
+        data[p++] = Math.round(saturate(linearToSrgb(out[1])) * 255);
+        data[p++] = Math.round(saturate(linearToSrgb(out[2])) * 255);
         data[p++] = 255;
       }
     }
+  }
+
+  // The black entry is load-bearing: if this is ever not zero the frame has no
+  // true black in it no matter what the lighting does, which is the single
+  // defect this grade was rebuilt to remove. Fail loudly rather than ship a
+  // milky image.
+  if (data[0] !== 0 || data[1] !== 0 || data[2] !== 0) {
+    console.error('[LutFactory] grade LUT lifts black to',
+      data[0], data[1], data[2], '— the toe is broken.');
   }
 
   const tex = new THREE.Data3DTexture(data, n, n, n);

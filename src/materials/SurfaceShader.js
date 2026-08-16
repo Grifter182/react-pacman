@@ -72,6 +72,18 @@ function bakeDetail(kind, anisotropy) {
       w(u, v, cell);
       return -Math.pow(clamp01(1 - cell.f1 / 0.32), 0.7) * 0.8 + n(u, v) * 0.25;
     };
+  } else if (kind === 'stipple') {
+    // Lime render / paint stipple: isotropic sand grit with *no* cellular
+    // structure, which is what separates a floated coat from a mineral one.
+    // Deliberately different statistics to 'grain' so plaster and concrete do
+    // not share a micro-signature.
+    const n1 = fbm(seed + 9, 40, 4, 0.62);
+    const n2 = fbm(seed + 10, 96, 2, 0.5);
+    f = (u, v) => {
+      const a = n1(u, v);
+      // Sharpen into shallow pinholes rather than rolling dunes.
+      return Math.sign(a) * Math.pow(Math.abs(a), 1.6) * 0.9 + n2(u, v) * 0.30;
+    };
   } else {
     // 'grain' — mineral micro-relief: sharp cellular grit over fine fbm.
     const w = worley(seed + 6, 34, 1.0);
@@ -126,27 +138,49 @@ export function getDetailMap(kind, anisotropy = 8) {
 }
 
 /**
- * The shared macro-variation map. Three decorrelated low-frequency fields:
- * R tints albedo, G modulates roughness, B modulates AO/dirt. One texture for
- * the whole world, so every surface's large-scale variation stays coherent —
- * a damp patch of ground reads as the same weather as the damp wall above it.
+ * The shared macro-variation map. Three decorrelated fields: R tints albedo,
+ * G modulates roughness, B modulates AO/dirt. One texture for the whole world,
+ * so every surface's large-scale variation stays coherent — a damp patch of
+ * ground reads as the same weather as the damp wall above it.
+ *
+ * DELIBERATELY ONLY TWO OCTAVES. The previous four-octave version put its
+ * finest octave at 1/16 of the mapping period; sampled at a 26 m period that
+ * is a 1.6 m blob, and 1.6 m blobs painted over every wall, floor and facade in
+ * the same world-space frame is the definition of a camouflage pattern. Macro
+ * variation is only allowed to live at frequencies *below* the ones a viewer
+ * can read as a pattern; anything smaller belongs in the baked recipe, where it
+ * is attached to actual material structure.
+ *
+ * Each channel is rescaled to a standard deviation of 0.25 about 0.5, so the
+ * shader-side amplitudes below mean the same thing regardless of how the noise
+ * happened to be distributed.
  */
 export function getMacroMap() {
   if (_macroTexture) return _macroTexture;
   const N = 128;
-  const a = fbm(0x51ed, 2, 4, 0.6);
-  const b = fbm(0x2f5a, 3, 4, 0.55);
-  const c = fbm(0x1b87, 2, 3, 0.6);
-  const data = new Uint8Array(N * N * 4);
-  for (let y = 0; y < N; y++) {
-    for (let x = 0; x < N; x++) {
-      const u = (x + 0.5) / N, v = (y + 0.5) / N;
-      const i = (y * N + x) * 4;
-      data[i] = clamp01(a(u, v) * 0.5 + 0.5) * 255 | 0;
-      data[i + 1] = clamp01(b(u, v) * 0.5 + 0.5) * 255 | 0;
-      data[i + 2] = clamp01(c(u, v) * 0.5 + 0.5) * 255 | 0;
-      data[i + 3] = 255;
+  const fields = [fbm(0x51ed, 1, 2, 0.5), fbm(0x2f5a, 2, 2, 0.5), fbm(0x1b87, 1, 2, 0.55)];
+  const chan = fields.map((f) => {
+    const buf = new Float32Array(N * N);
+    for (let y = 0; y < N; y++) {
+      for (let x = 0; x < N; x++) buf[y * N + x] = f((x + 0.5) / N, (y + 0.5) / N);
     }
+    let mean = 0;
+    for (let i = 0; i < buf.length; i++) mean += buf[i];
+    mean /= buf.length;
+    let sd = 0;
+    for (let i = 0; i < buf.length; i++) { const d = buf[i] - mean; sd += d * d; }
+    sd = Math.sqrt(sd / buf.length) || 1;
+    const k = 0.25 / sd;
+    for (let i = 0; i < buf.length; i++) buf[i] = clamp01(0.5 + (buf[i] - mean) * k);
+    return buf;
+  });
+
+  const data = new Uint8Array(N * N * 4);
+  for (let i = 0; i < N * N; i++) {
+    data[i * 4] = chan[0][i] * 255 + 0.5 | 0;
+    data[i * 4 + 1] = chan[1][i] * 255 + 0.5 | 0;
+    data[i * 4 + 2] = chan[2][i] * 255 + 0.5 | 0;
+    data[i * 4 + 3] = 255;
   }
   _macroTexture = makeDataTexture(data, N, false, 4);
   return _macroTexture;
@@ -173,7 +207,8 @@ const PARS_FRAGMENT = /* glsl */`
 #endif
 #ifdef SF_MACRO
   uniform sampler2D sfMacroMap;
-  uniform vec3 sfMacro;       // x 1/period (1/m), y albedo amount, z rough+ao amount
+  uniform vec4 sfMacro;       // x 1/period mid (1/m), y albedo amt mid, z rough amt mid, w 1/period low
+  uniform vec2 sfMacroLo;     // x albedo amt low, y rough amt low
 #endif
 #ifdef SF_TRIPLANAR
   uniform vec2 sfTri;         // x tiles per metre, y blend sharpness
@@ -256,13 +291,31 @@ void sfSampleSurface() {
   #endif
 
   #ifdef SF_MACRO
-    // Skewed world projection — continuous across every face orientation, so a
-    // single tap works where a triplanar blend would need three.
-    vec2 muv = ( vSfWPos.xz + vSfWPos.y * vec2( 0.71, 0.37 ) ) * sfMacro.x;
-    vec3 mac = texture2D( sfMacroMap, muv ).rgb;
-    sfAlbedo *= mix( 1.0, 0.64 + mac.r * 0.76, sfMacro.y );
-    sfArm.g = clamp( sfArm.g * mix( 1.0, 0.76 + mac.g * 0.52, sfMacro.z ), 0.02, 1.0 );
-    sfArm.r *= mix( 1.0, 0.82 + mac.b * 0.24, sfMacro.z );
+    // Two bands, and they do different jobs.
+    //
+    // MID (~4-8 m) is the one that used to wreck everything: crank it and every
+    // surface in the frame wears the same blob field. It is capped hard by the
+    // factory and kept subtle here — just enough to break the base tile.
+    //
+    // LOW (~15-30 m) is the band a 30 m facade actually needs so it does not
+    // read as one flat pass of paint. It is allowed to be several times
+    // stronger precisely because it is too large to be read as a pattern.
+    //
+    // Both use a skewed world projection — continuous across every face
+    // orientation, so a single tap works where triplanar would need three.
+    vec3 sfWP = vSfWPos;
+    vec2 muv = ( sfWP.xz + sfWP.y * vec2( 0.71, 0.37 ) ) * sfMacro.x;
+    vec3 sfMid = texture2D( sfMacroMap, muv ).rgb - 0.5;
+
+    // Rotated, offset, channel-swizzled so the low band never correlates with
+    // the mid one and the two cannot beat into a visible lattice.
+    vec2 luv = ( sfWP.xz * mat2( 0.83, -0.56, 0.56, 0.83 )
+               + sfWP.y * vec2( -0.29, 0.53 ) ) * sfMacro.w + vec2( 0.37, 0.61 );
+    vec3 sfLow = texture2D( sfMacroMap, luv ).gbr - 0.5;
+
+    sfAlbedo *= clamp( 1.0 + sfMid.r * sfMacro.y + sfLow.r * sfMacroLo.x, 0.55, 1.55 );
+    sfArm.g = clamp( sfArm.g * ( 1.0 + sfMid.g * sfMacro.z + sfLow.g * sfMacroLo.y ), 0.02, 1.0 );
+    sfArm.r *= clamp( 1.0 + sfMid.b * sfMacro.z * 0.5 + sfLow.b * sfMacroLo.y * 0.35, 0.72, 1.12 );
   #endif
 
   sfAlbedo = clamp( sfAlbedo, vec3( 0.004 ), vec3( 0.92 ) );
@@ -288,6 +341,15 @@ const VERTEX_WORLD = /* glsl */`
 /* ------------------------------------------------------------- application */
 
 /**
+ * Hard ceilings on the world-space macro term, enforced here so no call site
+ * can reintroduce the camouflage look by passing a large `macro`.
+ *   MID  ~4-8 m  — the pattern-forming band. Kept small on purpose.
+ *   LOW  ~15-30 m — genuine large-scale variation. Allowed to be stronger.
+ */
+const MACRO_MID_CAP = 0.18;
+const MACRO_LOW_CAP = 0.30;
+
+/**
  * Wire the detail / macro / triplanar path into a standard-family material.
  *
  * `cfg` fields (all optional):
@@ -295,8 +357,10 @@ const VERTEX_WORLD = /* glsl */`
  *   detailScale   detail tiles per base tile
  *   detailStrength / detailRough
  *   detailFade    [ start, end ] in metres
- *   macro         0..1 strength (0 disables)
- *   macroPeriod   metres per macro cycle
+ *   macro         0..1 breakup strength (0 disables). Split internally into a
+ *                 capped mid band and a stronger low band — see MACRO_*_CAP.
+ *   macroPeriod   metres per macro cycle, mid band (default 7)
+ *   macroPeriodLow  metres per macro cycle, low band (default 30)
  *   triplanar     boolean
  *   worldScale    metres per base tile (drives the triplanar frequency)
  *   triSharp      triplanar blend exponent
@@ -328,13 +392,23 @@ export function applySurfaceShader(material, cfg = {}) {
   if (useMacro) {
     defines.SF_MACRO = '';
     defines.SF_WORLD = '';
+    const want = cfg.macro ?? 0.15;
+    // The mid band is capped here rather than trusted from the caller: it is
+    // the term that turns ten materials into one camouflage pattern, and no
+    // call site has enough context to be allowed to crank it.
+    const mid = Math.min(want, MACRO_MID_CAP);
+    const low = Math.min(want, MACRO_LOW_CAP);
     uniforms.sfMacroMap = { value: getMacroMap() };
     uniforms.sfMacro = {
-      value: new THREE.Vector3(
-        1 / Math.max(0.5, cfg.macroPeriod ?? 26),
-        cfg.macro ?? 0.35,
-        (cfg.macro ?? 0.35) * 0.8,
+      value: new THREE.Vector4(
+        1 / Math.max(0.5, cfg.macroPeriod ?? 7),
+        mid * 1.10,                       // albedo, mid band
+        mid * 0.95,                       // roughness, mid band
+        1 / Math.max(4, cfg.macroPeriodLow ?? 30),
       ),
+    };
+    uniforms.sfMacroLo = {
+      value: new THREE.Vector2(low * 2.20, low * 1.40),
     };
   }
   if (useTri) {

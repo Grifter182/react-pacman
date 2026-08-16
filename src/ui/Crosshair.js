@@ -18,6 +18,25 @@ import { el, frag, clamp, damp } from './Dom.js';
  * The gap is damped rather than tracked instantly: the spread value steps on
  * every shot, and a reticle that steps with it strobes. 26/s upward and 12/s
  * downward keeps the bloom legible while the recovery stays readable.
+ *
+ * THE PIXEL GRID IS PART OF THE CONTRACT.
+ * The reticle is the only element on the HUD whose two halves are compared
+ * against each other by eye, twenty times a second, at the exact centre of
+ * attention. That makes it the only element where a half-pixel is a bug:
+ *
+ *   1. `--gap` is committed as a whole number of pixels. It used to be rounded
+ *      to a tenth, so a gap of 9.4 put the top blade's outer edge on x.6 and the
+ *      bottom blade's on x.4 — complementary sub-pixel phases, rasterised with
+ *      different coverage, which is exactly the "top blade sits at a different
+ *      offset from the bottom in every shot" the review reported. The damped
+ *      value is still continuous; only the committed one is quantised, so the
+ *      bloom still animates, it just animates on the grid.
+ *   2. The container origin is an explicit integer, written on resize, instead
+ *      of `left:50%`. On a viewport with an odd width or height (the harness
+ *      captures at whatever the window reports) 50% is a half pixel, and every
+ *      blade inherits that offset.
+ *
+ * Both fixes are free — one `Math.round` and two style writes per resize.
  */
 export class Crosshair {
   constructor(parent) {
@@ -41,6 +60,23 @@ export class Crosshair {
     this._pendingKind = '';
     this._lastGap = -1;
     this._lastAlpha = -1;
+    this._cx = -1; this._cy = -1;
+  }
+
+  /**
+   * Snap the reticle origin onto the pixel grid. See the note at the top of the
+   * class: `left:50%` is a half pixel on any odd viewport dimension, and every
+   * blade offset is measured from it.
+   */
+  resize(w, h) {
+    const cx = Math.round(w * 0.5);
+    const cy = Math.round(h * 0.5);
+    if (cx === this._cx && cy === this._cy) return;
+    this._cx = cx; this._cy = cy;
+    for (const n of [this.node, this.hm]) {
+      n.style.left = `${cx}px`;
+      n.style.top = `${cy}px`;
+    }
   }
 
   /**
@@ -77,8 +113,9 @@ export class Crosshair {
     const aTarget = hidden ? 0 : (1 - ads * 0.92);
     this._alpha = damp(this._alpha, aTarget, 14, dt);
 
-    // Two style writes per frame, and only when the rounded value moved.
-    const g = Math.round(this._gap * 10) / 10;
+    // Two style writes per frame, and only when the committed value moved. The
+    // gap is committed on whole pixels — see the pixel-grid note above.
+    const g = Math.round(this._gap);
     if (g !== this._lastGap) { this.node.style.setProperty('--gap', `${g}px`); this._lastGap = g; }
     const a = Math.round(this._alpha * 100) / 100;
     if (a !== this._lastAlpha) { this.node.style.setProperty('--a', a); this._lastAlpha = a; }

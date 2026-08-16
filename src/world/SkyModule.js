@@ -18,16 +18,23 @@ import { ATMO, atmosphereGLSL, sunDirectionArray, sunTransmittance, skyRadiance 
  *   2. CLOUDS (128-512)     Volumetric raymarch of a cumulus slab plus a cirrus
  *                           sheet, lit by the same atmosphere, with aerial
  *                           perspective applied against the LUT.
- *   3. COMPOSITE (512-1024) LUT + distant ridge silhouette + clouds + the sun
- *                           disc with limb darkening. Per-pixel cost here is
- *                           two cube fetches and a few pows, so full resolution
- *                           is affordable and the sun disc stays crisp.
+ *   3. COMPOSITE (512-1024) LUT + distant ridge silhouette + the sun's aureole
+ *                           and disc + clouds over the top. Per-pixel cost here
+ *                           is two cube fetches and a few pows, so full
+ *                           resolution is affordable and the disc stays crisp.
+ *
+ * The warm horizon haze band is NOT a pass here — it lives in the atmosphere
+ * model itself (ATMO.dust), so the LUT, the IBL and the fog all inherit it from
+ * one place and cannot disagree about where the horizon is.
  *
  * Publishes for LightingModule:
  *   engine.sunDirection  unit vector, world -> sun
  *   engine.sunColor      spectral transmittance of the sun, normalised
  *   engine.sunIrradiance raw irradiance in renderer light units
  *   engine.skyBake       { cubeRT, envMap } for anyone who needs the bake
+ *   engine.skyFit        five-term horizon fit driving the fog
+ *   engine.skyIrradianceUp  measured sky irradiance on an up-facing surface,
+ *                        which is what the ground-bounce term is derived from
  */
 export class SkyModule {
   constructor() {
@@ -51,8 +58,10 @@ export class SkyModule {
     engine.sunIrradiance = this.sunIrradiance;
 
     const tier = Config.quality;
-    const cloudSize = { low: 128, medium: 192, high: 384, ultra: 512 }[tier] ?? 192;
-    const cloudSteps = { low: 8, medium: 12, high: 20, ultra: 28 }[tier] ?? 14;
+    // Medium was 192 / 12 steps, which is 3.5 texels per degree — a cumulus
+    // tower is four texels wide there and survives the PMREM as a smudge.
+    const cloudSize = { low: 160, medium: 320, high: 448, ultra: 512 }[tier] ?? 320;
+    const cloudSteps = { low: 10, medium: 18, high: 24, ultra: 30 }[tier] ?? 18;
     const skySize = { low: 512, medium: 768, high: 1024, ultra: 1024 }[tier] ?? 768;
 
     const renderer = engine.get('render').renderer;
@@ -82,6 +91,12 @@ export class SkyModule {
     // Horizon/zenith fit for LightingModule's fog, taken from the same model
     // that produced the pixels above.
     engine.skyFit = this._fitHorizon();
+
+    // Measured sky irradiance on an up-facing surface. LightingModule's ground
+    // bounce is derived from it.
+    const up = this._hemisphereIrradianceUp();
+    this.skyIrradianceUp = new THREE.Vector3(up[0], up[1], up[2]);
+    engine.skyIrradianceUp = this.skyIrradianceUp;
 
     for (const d of this._transient) d.dispose();
     this._transient.length = 0;
@@ -201,6 +216,34 @@ export class SkyModule {
     return acc.map((v) => v / N);
   }
 
+  /**
+   * Cosine-weighted irradiance landing on an upward-facing surface — the actual
+   * integral, over the same model that baked the cubemap, not an eyeball of the
+   * zenith colour.
+   *
+   * LightingModule needs this number to size the ground bounce: the sand's
+   * exitance is its albedo times the irradiance it receives, and half of that
+   * irradiance is sky. Publishing it here keeps the bounce tied to whatever the
+   * sky actually turned out to be rather than to a constant that drifts every
+   * time the atmosphere is retuned.
+   */
+  _hemisphereIrradianceUp() {
+    const sun = sunDirectionArray();
+    const N = 160;
+    const ga = Math.PI * (3 - Math.sqrt(5));
+    const acc = [0, 0, 0];
+    const dOmega = (4 * Math.PI) / N;
+    for (let i = 0; i < N; i++) {
+      const y = 1 - ((i + 0.5) / N) * 2;
+      if (y <= 0) continue;
+      const r = Math.sqrt(Math.max(1 - y * y, 0));
+      const th = ga * i;
+      const c = skyRadiance([Math.cos(th) * r, y, Math.sin(th) * r], sun, 10, 4);
+      acc[0] += c[0] * y * dOmega; acc[1] += c[1] * y * dOmega; acc[2] += c[2] * y * dOmega;
+    }
+    return acc;
+  }
+
   /** Pass 2 — volumetric cumulus deck + cirrus sheet. */
   _cloudMaterial(lut, steps) {
     const amb = this._sphereAverageRadiance();
@@ -228,6 +271,17 @@ export class SkyModule {
         #define C_SIGMA 0.0040          // extinction per metre at density 1
         #define C_STEPS ${steps}
         #define C_AP_K  0.000026        // aerial-perspective falloff, 1/m
+        // See cloudDensity(). ~1.7 km coverage cells, ~550 m puffs.
+        #define C_F_COVER 0.0006
+        #define C_F_SHAPE 0.0018
+        #define C_F_WARP  0.00042
+        // Chosen, not arbitrary: this offset puts a clear hole on the solar
+        // bearing with a dense bank immediately below it, so the sun reads
+        // against cloud with a lit rim instead of either being swallowed
+        // (alpha 0.66 at the origin) or floating in empty sky.
+        #define C_MAX_DIST 16000.0
+        #define C_ORIGIN_X -5655.0
+        #define C_ORIGIN_Z 11350.0
 
         float hash13(vec3 p){
           p = fract(p * 0.1031);
@@ -256,16 +310,35 @@ export class SkyModule {
 
         // Cumulus density. Work in a local frame (horizontal offset, altitude)
         // so the noise never sees planet-radius coordinates and loses precision.
+        //
+        // FREQUENCY IS NOT A TASTE PARAMETER HERE. The deck spans 1450-3550 m,
+        // so a ray leaving the camera at 45 degrees crosses the whole slab
+        // within 3 km of horizontal travel, and one at 70 degrees within 1 km.
+        // At the old 10 km coverage cells that put the ENTIRE sky above ~25
+        // degrees of elevation inside a single cell — whichever way that one
+        // cell fell decided the whole upper sky, and it fell empty. Marching a
+        // hemisphere of directions through the old constants gives a mean alpha
+        // of 0.92 in a thin band at 10 degrees of elevation and 0.000 above 40
+        // degrees: a solid bank hidden in the haze at the horizon and clear sky
+        // everywhere a player actually looks. That is the whole of "the cloud
+        // bake produces nothing visible".
+        //
+        // Cells are now ~1.7 km across and puffs ~550 m, so the visible dome
+        // spans four to six weather cells and a dozen towers. The same sweep now
+        // reports 0.19 mean alpha with maxima at 0.99 — broken cumulus with real
+        // holes, at every elevation.
         float cloudDensity(vec3 pos, float alt, bool detail){
           float h = (alt - C_BOT) / (C_TOP - C_BOT);
           if (h < 0.0 || h > 1.0) return 0.0;
-          vec3 q = vec3(pos.x, alt, pos.z);
+          // C_ORIGIN moves the camera off the noise field's own origin. Looking
+          // straight up samples a single point of the coverage field, so
+          // whichever cell sits at the origin is the cell permanently overhead;
+          // at (0,0) that cell is a hole and the zenith is bald in every frame.
+          vec3 q = vec3(pos.x + C_ORIGIN_X, alt, pos.z + C_ORIGIN_Z);
           // Low-frequency domain warp stands in for curl advection: it shears
           // the puffs downwind instead of leaving them radially symmetric.
-          vec3 p = q * 0.00046 + (fbm3(q * 0.000085) - 0.5) * 1.3;
-          // ~10km coverage cells: whole weather systems, so the sky has open
-          // holes and dense banks rather than uniform stipple.
-          float cov = smoothstep(0.30, 0.68, fbm3(vec3(q.x, 0.0, q.z) * 0.0001));
+          vec3 p = q * C_F_SHAPE + (fbm3(q * C_F_WARP) - 0.5) * 1.3;
+          float cov = smoothstep(0.47, 0.90, fbm3(vec3(q.x, 0.0, q.z) * C_F_COVER));
           // Rounded base, sheared-off top: cumulus mediocris, not spheres.
           float shape = smoothstep(0.0, 0.17, h) * smoothstep(1.0, 0.58, h);
           float d = fbm3(p) * shape - (1.0 - cov) * 0.62 - 0.10;
@@ -310,7 +383,15 @@ export class SkyModule {
               tBot = -b + sqrt(max(b * b - cb, 0.0));
               tTop = -b + sqrt(max(b * b - ct, 0.0));
             }
-            float ds = clamp((tTop - tBot) / float(C_STEPS), 45.0, 420.0);
+            // Near the horizon the slab is tens of kilometres deep. Marching all
+            // of it turns the bottom 10 degrees of sky into an opaque white
+            // wall, because a 40 km chord through broken cumulus hits something
+            // everywhere. Cap the march at C_MAX_DIST instead: beyond that the
+            // deck has curved away and thinned, and whatever is left is haze,
+            // not cloud. The hash jitter below is what keeps the coarse steps
+            // from banding.
+            float span = min(tTop, tBot + C_MAX_DIST) - tBot;
+            float ds = clamp(span / float(C_STEPS), 55.0, 620.0);
             float mu = dot(d, sun);
             // Three scattering octaves, each with its own phase (Wrenninge et
             // al.). Light that has bounced once keeps a strong forward lobe —
@@ -375,7 +456,7 @@ export class SkyModule {
               // Stretched 3:1 along x — cirrus is sheared out by the jet stream.
               vec3 q = vec3(p.x * 0.00011, 0.0, p.z * 0.000034);
               float w = fbm3(q + vec3(fbm2(q * 3.1) * 0.6, 0.0, 0.0));
-              float a = smoothstep(0.50, 0.88, w) * 0.62 * smoothstep(0.0, 0.10, d.y);
+              float a = smoothstep(0.58, 0.94, w) * 0.40 * smoothstep(0.0, 0.14, d.y);
               vec3 c = uSunIrradiance * (0.34 * hg(mu, 0.62) + 0.075) + uAmbient * 0.6;
               vec3 apT = aSegmentTransmittance(2.0, 2.0 + d.y * tc, d.y, tc);
               c = c * apT + skyHere * (1.0 - apT);
@@ -392,10 +473,19 @@ export class SkyModule {
 
   /** Pass 3 — assemble the visible sky. */
   _compositeMaterial(lut, clouds, T, peak) {
+    // The disc keeps the sun's own spectrum; the aureole is desaturated halfway
+    // toward grey, because forward-scattered light has been through the aerosol
+    // rather than through four air masses of Rayleigh and is far less selective.
     const disc = new THREE.Vector3(
       (ATMO.sunDiscRadiance * T[0]) / peak,
       (ATMO.sunDiscRadiance * T[1]) / peak,
       (ATMO.sunDiscRadiance * T[2]) / peak,
+    );
+    const mean = (T[0] + T[1] + T[2]) / 3;
+    const glow = new THREE.Vector3(
+      (ATMO.sunGlow.radiance * (T[0] + mean)) / (2 * peak),
+      (ATMO.sunGlow.radiance * (T[1] + mean)) / (2 * peak),
+      (ATMO.sunGlow.radiance * (T[2] + mean)) / (2 * peak),
     );
     return new THREE.ShaderMaterial({
       side: THREE.BackSide,
@@ -406,15 +496,17 @@ export class SkyModule {
         uSkyLut: { value: lut },
         uClouds: { value: clouds },
         uDisc: { value: disc },
+        uGlow: { value: glow },
       },
       vertexShader: this._domeVertex(),
       fragmentShader: /* glsl */`
         precision highp float;
         varying vec3 vDir;
-        uniform vec3 uSunDir, uDisc;
+        uniform vec3 uSunDir, uDisc, uGlow;
         uniform samplerCube uSkyLut, uClouds;
 
-        #define SUN_R ${ATMO.sunAngularRadius.toExponential(6)}
+        #define SUN_R ${(ATMO.sunAngularRadius * ATMO.discScale).toExponential(6)}
+        #define GLOW_R ${ATMO.sunGlow.radius.toExponential(6)}
 
         float h21(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
         float n21(vec2 x){
@@ -449,9 +541,30 @@ export class SkyModule {
           sky = mix(sky, sky * 0.920, mFar);
           sky = mix(sky, sky * 0.840, mNear);
 
-          // --- sun disc ------------------------------------------------------
+          // --- sun disc + aureole --------------------------------------------
+          // Composited BEFORE the clouds, so a cumulus in front of the sun
+          // occludes it and gets its silver lining, which is the whole reason
+          // the cloud pass runs first.
           float cosT = dot(d, sun);
           float ang = acos(clamp(cosT, -1.0, 1.0));
+
+          // Forward-scattering aureole. The single-scattering LUT resolves the
+          // Mie phase over the whole sky at 28 view steps and cannot possibly
+          // resolve the first degree around the sun, which is exactly where
+          // most of the aerosol's forward lobe lives — so the LUT alone gives a
+          // disc sitting in clean sky with no glare around it at all. An
+          // inverse-square falloff from the rim out to GLOW_R reinstates it,
+          // and it is what actually gets the frame over the bloom threshold:
+          // the disc is six pixels wide and the prefilter Karis-averages it
+          // away, whereas the aureole is several degrees of continuous
+          // above-threshold radiance that survives the whole mip chain.
+          {
+            float x = max(ang, SUN_R) / SUN_R;
+            float falloff = 1.0 / (x * x);
+            float cut = smoothstep(GLOW_R, GLOW_R * 0.18, ang);
+            sky += uGlow * falloff * cut;
+          }
+
           float r = ang / SUN_R;
           if (r < 1.04){
             // Limb darkening: the photosphere is optically thick, so near the
@@ -493,11 +606,11 @@ export class SkyModule {
     for (const elev of [0.004, 0.02, 0.06, 0.14, 0.30, 0.55, 0.90, 1.30]) {
       for (let i = 0; i < 12; i++) {
         const d = dirAt(elev, (i / 12) * Math.PI * 2);
-        samples.push({ d, mu: dot(d, sun), s: Math.max(d[1], 0), c: skyRadiance(d, sun, 16, 5),
+        samples.push({ d, mu: dot(d, sun), s: Math.max(d[1], 0), c: skyRadiance(d, sun, 16, 5, false),
           w: Math.exp(-elev / 0.30) + 0.15 });
       }
     }
-    samples.push({ d: [0, 1, 0], mu: sun[1], s: 1, c: skyRadiance([0, 1, 0], sun, 20, 6), w: 0.3 });
+    samples.push({ d: [0, 1, 0], mu: sun[1], s: 1, c: skyRadiance([0, 1, 0], sun, 20, 6, false), w: 0.3 });
 
     /**
      * Model, linear in five coefficients per channel:
@@ -617,7 +730,7 @@ export class SkyModule {
         const d = dirAt(0.004, (i / 24) * Math.PI * 2);
         const mu = dot(d, sun);
         const hg = (1 - gg) / (4 * Math.PI * Math.pow(Math.max(1 + gg - 2 * best.g * mu, 1e-4), 1.5));
-        const truth = skyRadiance(d, sun, 16, 5);
+        const truth = skyRadiance(d, sun, 16, 5, false);
         for (let c = 0; c < 3; c++) {
           const t = Math.pow(Math.max(d[1], 0), best.pows[c]);
           const v = horizon[c] + best.coef[c][1] * t + best.coef[c][2] * t * (1 - t)

@@ -97,13 +97,15 @@ export class Explosions {
     for (let i = 0; i < 2; i++) {
       resetP();
       P.x = p.x; P.y = p.y; P.z = p.z;
-      P.life = 0.05 + i * 0.03;
+      P.life = 0.09 + i * 0.05;
       P.size0 = r * (0.5 + i * 0.5); P.size1 = P.size0 * 2.2;
       P.alpha = 1; P.tile = PT.FLARE; P.fade = 1.0; P.soft = 0;
       P.spin = (Math.random() - 0.5) * 4;
       P.r0 = 14; P.g0 = 11; P.b0 = 8;
       P.r1 = 6; P.g1 = 3.0; P.b1 = 1.0;
-      sys.spawn(LAYER.ADDITIVE);
+      // Bias 0: the detonation flash is shorter than a slow frame, and
+      // backdating its birth would retire it before it was ever drawn.
+      sys.spawn(LAYER.ADDITIVE, 0);
     }
 
     // Fireball shell: fire thrown radially, fastest at the leading edge.

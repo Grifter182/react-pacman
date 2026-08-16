@@ -10,6 +10,21 @@ import { frag } from './Dom.js';
  * Bearing derivation: the camera's forward vector is `(-sin yaw, -cos yaw)` and
  * +Z is north, so the compass bearing measured clockwise from north is
  * `atan2(-sin yaw, -cos yaw)` = `yaw + PI`.
+ *
+ * TICKS SHARE A BASELINE. Minor and major ticks are both anchored to the same
+ * bottom edge in CSS and majors grow upward from it. The tape previously
+ * top-anchored both and gave the majors a taller box, which put a stray tick
+ * four pixels below every other one — the "descending tick" the review caught.
+ * Nothing here sets a tick's vertical geometry; that lives entirely in the
+ * sheet, so there is one place for the baseline to be defined.
+ *
+ * LABEL DENSITY. The tape carries the eight cardinals and nothing else. It used
+ * to interleave a numeric bearing every 15 degrees, which at 3.6 px/deg is a
+ * label every 54 px — an unbroken band of numerals with no rhythm, and one whose
+ * spacing collided with the cardinals (S at 180, then 210, then SW at 225, then
+ * 240). The exact heading is in the chip above the tape, to the degree, so the
+ * tape is free to do the only job a tape does well: show which way round the
+ * world you are.
  */
 
 const PX_PER_DEG = 3.6;      // 120 degrees across a 432 px tape
@@ -31,11 +46,7 @@ export class Compass {
       const m = d % 360;
       const major = m % 45 === 0;
       html += `<u class="${major ? 'maj' : ''}" style="left:${x}px"></u>`;
-      if (major) {
-        html += `<s class="card" style="left:${x}px">${CARDINALS[m]}</s>`;
-      } else if (m % 15 === 0) {
-        html += `<s style="left:${x}px">${String(m).padStart(3, '0')}</s>`;
-      }
+      if (major) html += `<s style="left:${x}px">${CARDINALS[m]}</s>`;
     }
     this.strip.innerHTML = html;
 

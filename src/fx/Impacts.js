@@ -38,22 +38,22 @@ const CONCRETE = {
   bursts: [
     // Pulverised cement — the loud part of the effect, gone in a second.
     {
-      tile: PT.SPALL, count: [5, 8], speed: [1.1, 3.4], cone: 0.85, life: [0.45, 0.95],
-      size0: [0.035, 0.07], size1: 4.2, drag: 3.6, gravity: 0.12, turbulence: 0.35,
-      lit: 1, spin: 2.2, alpha: 0.62, fade: 1.5, soft: 0.35,
+      tile: PT.SPALL, count: [6, 9], speed: [1.1, 3.4], cone: 0.85, life: [0.5, 1.05],
+      size0: [0.060, 0.110], size1: 4.6, drag: 3.6, gravity: 0.12, turbulence: 0.35,
+      lit: 1, spin: 2.2, alpha: 0.66, fade: 1.5, soft: 0.35,
       colorA: DUST_PALE, colorB: DUST_GREY,
     },
     // The cloud that hangs behind it.
     {
-      tile: PT.SMOKE, count: [2, 3], speed: [0.3, 0.9], cone: 1.0, life: [1.2, 2.2],
-      size0: [0.08, 0.14], size1: 3.4, drag: 2.2, gravity: -0.02, turbulence: 0.22,
-      lit: 1, spin: 0.7, alpha: 0.3, fade: 1.9, soft: 0.5,
+      tile: PT.SMOKE, count: [3, 4], speed: [0.3, 0.9], cone: 1.0, life: [1.4, 2.6],
+      size0: [0.14, 0.22], size1: 3.6, drag: 2.2, gravity: -0.02, turbulence: 0.22,
+      lit: 1, spin: 0.7, alpha: 0.34, fade: 1.9, soft: 0.5,
       colorA: DUST_GREY, colorB: [0.5, 0.49, 0.48],
     },
     // Chips with real ballistic arcs.
     {
       tile: PT.CHIP, count: [4, 8], speed: [2.2, 6.5], cone: 1.15, life: [0.5, 1.1],
-      size0: [0.012, 0.026], size1: 1.0, drag: 0.35, gravity: 1.0, turbulence: 0,
+      size0: [0.016, 0.032], size1: 1.0, drag: 0.35, gravity: 1.0, turbulence: 0,
       lit: 1, spin: 9, alpha: 1, fade: 0.6, soft: 0.1,
       colorA: [0.55, 0.54, 0.52], colorB: [0.42, 0.41, 0.40],
     },
@@ -63,27 +63,36 @@ const CONCRETE = {
 const METAL = {
   decal: { tile: DT.METAL, size: [0.045, 0.07], tint: [0.9, 0.9, 0.92], life: 120 },
   sound: 'impact_metal',
-  light: { color: 0xffb060, intensity: 7, radius: 3.2, life: 0.10 },
+  light: { color: 0xffb060, intensity: 22, radius: 5.0, life: 0.12 },
   bursts: [
+    // The white-hot instant of contact. Steel struck by a jacketed round
+    // flashes before it sparks, and that overexposed core is the single cue
+    // that tells a player at thirty metres they just hit metal and not wall.
+    {
+      tile: PT.FLARE, count: 1, speed: 0, cone: 0, life: [0.075, 0.115],
+      size0: [0.13, 0.20], size1: 2.4, drag: 0, gravity: 0,
+      spin: 3, alpha: 1, fade: 1.5, soft: 0, additive: true,
+      colorA: [11.0, 6.4, 2.6], colorB: [2.6, 0.9, 0.22],
+    },
     // Burning steel fragments: fast, stretched, arcing, cooling to red.
     {
-      tile: PT.SPARK, count: [10, 18], speed: [3.0, 11.0], cone: 1.25, life: [0.22, 0.75],
-      size0: [0.008, 0.016], size1: 0.35, drag: 1.1, gravity: 1.0, turbulence: 0.1,
-      stretch: 0.026, alpha: 1, fade: 1.1, soft: 0, additive: true,
+      tile: PT.SPARK, count: [14, 22], speed: [3.0, 11.0], cone: 1.25, life: [0.26, 0.85],
+      size0: [0.013, 0.024], size1: 0.35, drag: 1.1, gravity: 1.0, turbulence: 0.1,
+      stretch: 0.045, alpha: 1, fade: 1.1, soft: 0, additive: true,
       colorA: SPARK_HOT, colorB: SPARK_COOL,
     },
     // A couple of long ricochet streaks that outrun the rest.
     {
       tile: PT.SPARK, count: [1, 3], speed: [9.0, 16.0], cone: 0.9, life: [0.35, 0.6],
-      size0: [0.010, 0.014], size1: 0.3, drag: 0.55, gravity: 1.0,
-      stretch: 0.05, alpha: 1, fade: 0.9, soft: 0, additive: true,
+      size0: [0.014, 0.020], size1: 0.3, drag: 0.55, gravity: 1.0,
+      stretch: 0.075, alpha: 1, fade: 0.9, soft: 0, additive: true,
       colorA: SPARK_HOT, colorB: SPARK_COOL,
     },
     // Vaporised paint and oil.
     {
       tile: PT.SMOKE, count: [1, 2], speed: [0.4, 1.2], cone: 0.8, life: [0.5, 1.0],
-      size0: [0.03, 0.06], size1: 3.0, drag: 3.0, gravity: -0.05, turbulence: 0.3,
-      lit: 0.6, alpha: 0.22, fade: 1.6, soft: 0.4,
+      size0: [0.055, 0.095], size1: 3.2, drag: 3.0, gravity: -0.05, turbulence: 0.3,
+      lit: 0.6, alpha: 0.26, fade: 1.6, soft: 0.4,
       colorA: [0.32, 0.31, 0.30], colorB: [0.22, 0.22, 0.22],
     },
   ],
@@ -101,8 +110,8 @@ const WOOD = {
     },
     {
       tile: PT.DUST, count: [3, 5], speed: [0.6, 2.0], cone: 0.9, life: [0.6, 1.3],
-      size0: [0.03, 0.07], size1: 3.2, drag: 3.4, gravity: 0.1, turbulence: 0.3,
-      lit: 1, alpha: 0.42, fade: 1.6, soft: 0.4,
+      size0: [0.055, 0.105], size1: 3.4, drag: 3.4, gravity: 0.1, turbulence: 0.3,
+      lit: 1, alpha: 0.46, fade: 1.6, soft: 0.4,
       colorA: [0.76, 0.62, 0.42], colorB: [0.55, 0.45, 0.32],
     },
   ],
@@ -114,9 +123,9 @@ const SAND = {
   bursts: [
     // A plume, not a puff: dry sand keeps going up after the round has stopped.
     {
-      tile: PT.DUST, count: [7, 11], speed: [1.4, 4.0], cone: 0.7, life: [0.9, 1.9],
-      size0: [0.05, 0.10], size1: 4.5, drag: 2.4, gravity: 0.16, turbulence: 0.45,
-      lit: 1, spin: 1.2, alpha: 0.5, fade: 1.5, soft: 0.45,
+      tile: PT.DUST, count: [9, 14], speed: [1.4, 4.0], cone: 0.7, life: [1.0, 2.1],
+      size0: [0.095, 0.165], size1: 4.8, drag: 2.4, gravity: 0.16, turbulence: 0.45,
+      lit: 1, spin: 1.2, alpha: 0.55, fade: 1.5, soft: 0.45,
       colorA: [0.92, 0.82, 0.62], colorB: [0.74, 0.66, 0.50],
     },
     {
@@ -153,9 +162,9 @@ const PLASTER = {
   sound: 'impact_plaster',
   bursts: [
     {
-      tile: PT.SMOKE, count: [5, 8], speed: [0.9, 2.8], cone: 0.95, life: [0.8, 1.7],
-      size0: [0.05, 0.10], size1: 4.0, drag: 3.0, gravity: 0.05, turbulence: 0.35,
-      lit: 1, alpha: 0.6, fade: 1.5, soft: 0.45,
+      tile: PT.SMOKE, count: [6, 9], speed: [0.9, 2.8], cone: 0.95, life: [0.9, 1.8],
+      size0: [0.090, 0.160], size1: 4.2, drag: 3.0, gravity: 0.05, turbulence: 0.35,
+      lit: 1, alpha: 0.62, fade: 1.5, soft: 0.45,
       colorA: [0.96, 0.95, 0.93], colorB: [0.78, 0.77, 0.75],
     },
     {
@@ -172,9 +181,9 @@ const BRICK = {
   sound: 'impact_brick',
   bursts: [
     {
-      tile: PT.SPALL, count: [5, 8], speed: [1.2, 3.6], cone: 0.9, life: [0.5, 1.1],
-      size0: [0.035, 0.07], size1: 4.0, drag: 3.4, gravity: 0.12, turbulence: 0.3,
-      lit: 1, spin: 2, alpha: 0.6, fade: 1.5, soft: 0.35,
+      tile: PT.SPALL, count: [6, 9], speed: [1.2, 3.6], cone: 0.9, life: [0.55, 1.15],
+      size0: [0.060, 0.110], size1: 4.2, drag: 3.4, gravity: 0.12, turbulence: 0.3,
+      lit: 1, spin: 2, alpha: 0.64, fade: 1.5, soft: 0.35,
       colorA: [0.80, 0.55, 0.42], colorB: [0.58, 0.42, 0.34],
     },
     {
@@ -238,8 +247,8 @@ const FLESH = {
     // Airborne mist — the part that reads at distance.
     {
       tile: PT.SMOKE, count: [3, 5], speed: [0.6, 2.0], cone: 0.9, life: [0.35, 0.8],
-      size0: [0.05, 0.11], size1: 2.4, drag: 4.0, gravity: 0.05, turbulence: 0.25,
-      lit: 1, alpha: 0.34, fade: 1.8, soft: 0.35,
+      size0: [0.085, 0.170], size1: 2.6, drag: 4.0, gravity: 0.05, turbulence: 0.25,
+      lit: 1, alpha: 0.38, fade: 1.8, soft: 0.35,
       colorA: [0.48, 0.06, 0.05], colorB: [0.24, 0.03, 0.03],
     },
   ],
@@ -250,9 +259,9 @@ const ASPHALT = {
   sound: 'impact_asphalt',
   bursts: [
     {
-      tile: PT.SPALL, count: [4, 7], speed: [1.0, 3.0], cone: 0.9, life: [0.4, 0.9],
-      size0: [0.03, 0.06], size1: 3.6, drag: 3.6, gravity: 0.12, turbulence: 0.3,
-      lit: 1, spin: 2, alpha: 0.5, fade: 1.5, soft: 0.35,
+      tile: PT.SPALL, count: [6, 9], speed: [1.0, 3.0], cone: 0.9, life: [0.5, 1.0],
+      size0: [0.055, 0.100], size1: 4.0, drag: 3.6, gravity: 0.12, turbulence: 0.3,
+      lit: 1, spin: 2, alpha: 0.56, fade: 1.5, soft: 0.35,
       colorA: [0.38, 0.37, 0.36], colorB: [0.26, 0.26, 0.26],
     },
     {
@@ -289,6 +298,32 @@ const RECIPES = {
 
 export function recipeFor(name) {
   return RECIPES[name] || CONCRETE;
+}
+
+/**
+ * Recover a plausible surface name when the trace could not supply one.
+ *
+ * The world's collision proxy is a single merged mesh carrying an invisible
+ * `MeshBasicMaterial` — it has no `userData.preset`, so every hit the ballistics
+ * code reports arrives labelled with its fallback, 'concrete'. Taking that at
+ * face value means the desert floor spalls grey cement, which is worse than
+ * guessing. Geometry is the evidence we do have: a near-horizontal face at
+ * ground level is the ground.
+ *
+ * (The real fix is a per-triangle material id on the proxy, which lives in the
+ * level module's files, not this one.)
+ *
+ * @param {THREE.Vector3} point
+ * @param {THREE.Vector3} normal
+ * @param {string} [given] preset reported by the trace
+ */
+export function classifySurface(point, normal, given) {
+  if (given && given !== 'concrete' && RECIPES[given]) return given;
+  const up = normal ? normal.y : 0;
+  // Upward-facing and at or near grade: the street, not a wall.
+  if (up > 0.72 && point.y < 0.35) return 'sand';
+  if (up > 0.72 && point.y < 1.2) return 'asphalt';
+  return 'concrete';
 }
 
 /* ------------------------------------------------------------- emission */

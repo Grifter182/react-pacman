@@ -132,9 +132,16 @@ export function wall(kit, o) {
   const inv = f.m.clone().invert();
   const weather = wallWeather(inv, openings, H, o);
 
+  // Anisotropic tessellation. The weathering field is a function of *height* —
+  // splash-back climbs out of the ground, stains hang below sills, the cornice
+  // sheds down the top. It barely varies along the run, so a wall wants rows,
+  // not a grid: three times the step horizontally, the requested step
+  // vertically. On this map that is 48k triangles of pure redundancy removed.
+  const gridA = grid > 0 ? [grid * 3, grid] : 0;
+
   b.withWeather(weather, () => {
     if (!openings.length) {
-      b.at(0, H / 2, 0).box(L, H, T, chamfer, grid);
+      b.at(0, H / 2, 0).box(L, H, T, chamfer, gridA);
     } else {
       // Sort openings and walk the run: pier, opening (with lintel above and
       // apron below), pier, ... The pier side faces double as the reveals.
@@ -146,17 +153,17 @@ export function wall(kit, o) {
         const head = sill + k.h;
         if (l - cursor > 0.02) {
           const w = l - cursor;
-          b.at(cursor + w / 2, H / 2, 0).box(w, H, T, chamfer, grid);
+          b.at(cursor + w / 2, H / 2, 0).box(w, H, T, chamfer, gridA);
         }
-        if (sill > 0.02) b.at(k.x, sill / 2, 0).box(k.w, sill, T, chamfer, grid);
+        if (sill > 0.02) b.at(k.x, sill / 2, 0).box(k.w, sill, T, chamfer, gridA);
         if (H - head > 0.02) {
-          b.at(k.x, (head + H) / 2, 0).box(k.w, H - head, T, chamfer, grid);
+          b.at(k.x, (head + H) / 2, 0).box(k.w, H - head, T, chamfer, gridA);
         }
         cursor = r;
       }
       if (L / 2 - cursor > 0.02) {
         const w = L / 2 - cursor;
-        b.at(cursor + w / 2, H / 2, 0).box(w, H, T, chamfer, grid);
+        b.at(cursor + w / 2, H / 2, 0).box(w, H, T, chamfer, gridA);
       }
     }
   });
@@ -182,19 +189,59 @@ export function wall(kit, o) {
   // so the hole stays a hole — plus a projecting sill. Exterior face only:
   // there are ~200 openings on this map and a mirrored inner surround doubles
   // their cost for trim that is only ever seen from inside four buildings.
+  //
+  // RELIEF. The surround used to project 45 mm, which is nothing: with the sun
+  // at campaign elevation a 45 mm ledge throws a 30 mm shadow and the facade
+  // reads as a decal of a window rather than a hole in a wall. Everything here
+  // is now dimensioned so it casts onto its own elevation — a 260 mm hood over
+  // the head, a 300 mm sill on corbels, and jambs standing 110 mm proud.
+  const relief = o.relief ?? 1;
+  const hoods = o.hoods !== false && relief > 0;
   for (const k of openings) {
     const sill = k.sill ?? 0;
     const head = sill + k.h;
-    const side = -(T / 2 + 0.045);
+    const pj = 0.11 * relief;                                  // jamb projection
+    const side = -(T / 2 + pj * 0.5);
     for (const sx of [-1, 1]) {
-      tb.at(k.x + sx * (k.w / 2 + 0.075), (sill + head) / 2, side)
-        .box(0.15, k.h + 0.22, 0.09, 0.022, 0);
+      tb.at(k.x + sx * (k.w / 2 + 0.085), (sill + head) / 2, side)
+        .box(0.17, k.h + 0.26, pj, 0.022, 0);
     }
-    tb.at(k.x, head + 0.07, side).box(k.w + 0.30, 0.14, 0.10, 0.025, 0);
+    // Head: a lintel band, then a hood that oversails it. The hood is the
+    // single most valuable 12 triangles on the whole elevation.
+    tb.at(k.x, head + 0.075, side).box(k.w + 0.34, 0.15, pj + 0.02, 0.025, 0);
+    if (hoods && k.h > 1.0) {
+      tb.at(k.x, head + 0.20, -(T / 2 + 0.13 * relief))
+        .box(k.w + 0.52, 0.10, 0.26 * relief + 0.06, 0.028, 0);
+      for (const sx of [-1, 1]) {
+        tb.at(k.x + sx * (k.w / 2 + 0.13), head + 0.115, -(T / 2 + 0.11 * relief))
+          .box(0.11, 0.14, 0.22 * relief, 0.02, 0);
+      }
+    }
     if (sill > 0.3) {
-      tb.at(k.x, sill - 0.05, -(T / 2 + 0.085)).box(k.w + 0.36, 0.10, 0.28, 0.025, 0);
+      tb.at(k.x, sill - 0.055, -(T / 2 + 0.15 * relief))
+        .box(k.w + 0.40, 0.11, 0.30 * relief + 0.04, 0.025, 0);
+      // Corbels under the sill: they are what puts a hard vertical shadow on
+      // the wall directly below a window instead of a soft gradient.
+      if (relief > 0) {
+        for (const sx of [-1, 1]) {
+          tb.at(k.x + sx * (k.w / 2 - 0.02), sill - 0.19, -(T / 2 + 0.10 * relief))
+            .box(0.13, 0.17, 0.20 * relief, 0.02, 0);
+        }
+      }
     } else {
-      tb.at(k.x, 0.055, side).box(k.w + 0.28, 0.11, 0.10, 0.02, 0);          // threshold
+      tb.at(k.x, 0.055, side).box(k.w + 0.28, 0.11, pj, 0.02, 0);            // threshold
+    }
+  }
+
+  // String course: one band per storey across the whole run. A facade whose
+  // only horizontal breaks are its plinth and its cornice changes value twice;
+  // this makes it change value once per three metres of height, and every band
+  // shadows the wall under it.
+  if (o.courses) {
+    for (const cy of o.courses) {
+      if (cy <= 0.4 || cy >= H - 0.4) continue;
+      tb.at(0, cy, -(T / 2 + 0.055)).box(L + 0.02, 0.13, 0.16, 0.025, 0);
+      tb.at(0, cy - 0.10, -(T / 2 + 0.03)).box(L + 0.02, 0.07, 0.10, 0.018, 0);
     }
   }
 
@@ -253,6 +300,21 @@ export function windowFill(kit, frame, k, T, opts = {}) {
     const y = sill + 0.14 + (k.h - 0.28) * (i / (slats - 1 || 1));
     sh.at(k.x, y, T * 0.30 - 0.055).box(k.w - 0.12, 0.10, 0.035, 0.012, 0);
   }
+
+  // Open leaves, folded back against the *outside* face. This is the only
+  // thing on a plaster elevation that projects far enough to shadow itself:
+  // two 45 mm boards standing 200 mm off the wall put a hard vertical dark
+  // line either side of every opening they are on.
+  if (opts.openShutter) {
+    const th = opts.shutterAngle ?? 0.58;
+    const lw = (k.w - 0.06) * 0.5;
+    for (const s of [-1, 1]) {
+      const hx = k.x + s * (k.w / 2);
+      const ry = s > 0 ? Math.PI - th : th;
+      sh.at(hx - s * Math.cos(th) * lw * 0.5, cy, -(T / 2) - Math.sin(th) * lw * 0.5, ry)
+        .box(lw, k.h - 0.04, 0.045, 0.014, 0);
+    }
+  }
   sh.clearFrame();
 
   if (opts.bars) {
@@ -307,22 +369,51 @@ export function roof(kit, o) {
     if (sides.includes('n')) rails.push([x0, z1, x1, z1]);
     if (sides.includes('w')) rails.push([x0, z0, x0, z1]);
     if (sides.includes('e')) rails.push([x1, z0, x1, z1]);
+    // Bay rhythm. A parapet run at one height is the reason a modular kit has a
+    // skyline that changes value exactly twice across a frame: two roofs, two
+    // steps. Breaking each run into ~3.4 m bays at three different heights, with
+    // a pier standing proud at every joint, turns one step into eight and costs
+    // about forty triangles a building.
+    const vary = o.parapetVary ?? 1;
+    let bseed = (o.seed ?? 11) | 0;
+    const brnd = () => { bseed = (bseed * 1103515245 + 12345) & 0x7fffffff; return bseed / 0x7fffffff; };
     for (const [ax, az, bx, bz] of rails) {
       const f = wallFrame(ax, az, bx, bz, y);
       const L = f.len;
       tb.frame(f.m);
-      tb.at(0, ph / 2, 0).box(L, ph, pt, 0.03, 1.0);
-      tb.at(0, ph + 0.045, 0).box(L + 0.10, 0.10, pt + 0.14, 0.028, 0);   // coping
-      // Weep slots: a parapet with no drainage reads as a solid extruded band.
-      const slots = Math.max(1, Math.floor(L / 3.4));
-      for (let i = 0; i < slots; i++) {
-        const x = -L / 2 + (L * (i + 0.5)) / slots;
-        tb.at(x, ph - 0.30, 0).box(0.24, 0.24, pt + 0.05, 0.02, 0);
+      const bays = Math.max(1, Math.round(L / 3.4));
+      const bw = L / bays;
+      let maxH = ph;
+      for (let i = 0; i < bays; i++) {
+        const cxL = -L / 2 + bw * (i + 0.5);
+        // Three heights, weighted so the low return is rare: a run that
+        // alternates evenly reads as crenellation, not as building.
+        const roll = brnd();
+        const k = vary === 0 ? 1 : roll < 0.30 ? 1.34 : roll < 0.52 ? 0.62 : 1.0;
+        const bh = ph * (1 + (k - 1) * vary);
+        maxH = Math.max(maxH, bh);
+        tb.at(cxL, bh / 2, 0).box(bw + 0.02, bh, pt, 0.03, [3.0, 1.0]);
+        tb.at(cxL, bh + 0.045, 0).box(bw + 0.06, 0.10, pt + 0.14, 0.028, 0);  // coping
+        // Weep slot, one per bay: a parapet with no drainage reads as an
+        // extruded band.
+        if (bh > 0.7) tb.at(cxL, bh - 0.30, 0).box(0.24, 0.24, pt + 0.05, 0.012, 0);
+      }
+      // Piers standing above the tallest bay. Every *other* joint plus both
+      // ends: a pier at every joint turns the run back into an even rhythm,
+      // which is the thing the bay heights were introduced to break.
+      if (vary > 0) {
+        for (let i = 0; i <= bays; i++) {
+          if (i > 0 && i < bays && (i & 1)) continue;
+          const cxL = -L / 2 + bw * i;
+          const hh = ph * 1.42;
+          tb.at(cxL, hh / 2, 0).box(0.34, hh, pt + 0.10, 0.03, [3.0, 1.2]);
+          tb.at(cxL, hh + 0.055, 0).box(0.44, 0.10, pt + 0.20, 0.02, 0);
+        }
       }
       tb.clearFrame();
       if (o.collide !== false) {
-        localToWorld(f.m, 0, ph / 2, 0, _v);
-        proxy.box(_v.x, _v.y, _v.z, L, ph, pt, f.yaw);
+        localToWorld(f.m, 0, maxH / 2, 0, _v);
+        proxy.box(_v.x, _v.y, _v.z, L, maxH, pt, f.yaw);
       }
     }
   }
@@ -544,6 +635,113 @@ export function awning(kit, o) {
   }
 }
 
+/* ------------------------------------------------------- facade fittings */
+
+/**
+ * Everything bolted *onto* an elevation: downpipes, wall-mounted split units,
+ * dishes, a projecting balconette, a laundry line, a bracket lamp.
+ *
+ * This exists because the reviewer's complaint is exactly right — an extruded
+ * rectangle with a plinth and a cornice has nothing standing off it, so nothing
+ * shadows it and the whole facade is one value. Six or seven of these per
+ * street elevation costs a few hundred triangles and is the difference between
+ * a blockout and a street.
+ *
+ * @param {object} o
+ *   x0,z0,x1,z1  the elevation's run (exterior is to the LEFT of x0->x1, i.e.
+ *                the same convention every `wall()` here uses: local -Z)
+ *   height       facade height
+ *   seed
+ *   density      0..2, multiplies how many fittings land
+ */
+export function facadeFittings(kit, o) {
+  const { batch } = kit;
+  const f = wallFrame(o.x0, o.z0, o.x1, o.z1, 0);
+  const L = f.len;
+  const H = o.height;
+  const T = o.thickness ?? SCALE.wallT;
+  const out = -(T / 2);
+  let s = (o.seed ?? 19) | 0;
+  const rnd = () => { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff; };
+  const density = o.density ?? 1;
+
+  const mb = batch.at(o.metalBucket || 'ironwork', (o.x0 + o.x1) / 2, (o.z0 + o.z1) / 2);
+  mb.frame(f.m);
+
+  // Downpipes. Two per elevation, run to a hopper at the cornice and a shoe at
+  // the plinth, and they hold a vertical dark line against a flat wall.
+  const pipes = Math.max(1, Math.round(L / 9 * density));
+  for (let i = 0; i < pipes; i++) {
+    const px = -L / 2 + L * ((i + 0.5) / pipes) + (rnd() - 0.5) * 1.2;
+    mb.at(px, H * 0.5 - 0.2, out - 0.075).box(0.11, H - 0.5, 0.11, 0.018, 0);
+    mb.at(px, H - 0.34, out - 0.10).box(0.30, 0.30, 0.22, 0.02, 0);          // hopper
+    mb.at(px, 0.34, out - 0.14, 0, 0.42).box(0.12, 0.42, 0.12, 0.018, 0);    // shoe
+    for (let k = 1; k < 3; k++) {
+      mb.at(px, H * (k / 3), out - 0.035).box(0.16, 0.05, 0.09, 0.012, 0);   // clips
+    }
+  }
+
+  // Wall boxes: split-unit condensers and meter cabinets on brackets.
+  const units = Math.max(1, Math.round(L / 7 * density));
+  for (let i = 0; i < units; i++) {
+    if (rnd() > 0.75) continue;
+    const px = -L / 2 + 0.9 + (L - 1.8) * rnd();
+    const py = 2.4 + rnd() * (H - 3.6);
+    mb.at(px, py, out - 0.20).box(0.86, 0.56, 0.34, 0.02, 0);
+    mb.at(px, py + 0.30, out - 0.20).box(0.92, 0.05, 0.40, 0.015, 0);
+    for (const sx of [-1, 1]) {
+      mb.at(px + sx * 0.36, py - 0.34, out - 0.16).box(0.05, 0.24, 0.30, 0.012, 0);
+    }
+    // Condensate line dribbling down the wall under it.
+    mb.at(px + 0.3, py * 0.5, out - 0.03).box(0.03, py, 0.03, 0.008, 0);
+  }
+
+  // A projecting balconette on the upper floor: a slab, three corbels and a
+  // rail. The deepest thing on the elevation, so the biggest cast shadow.
+  if (H > 5.0 && rnd() < 0.55 * density) {
+    const px = -L / 2 + 1.6 + (L - 3.2) * rnd();
+    const by = 3.35;
+    const tbk = batch.at(o.trimBucket || 'plasterPale', (o.x0 + o.x1) / 2, (o.z0 + o.z1) / 2);
+    tbk.frame(f.m);
+    tbk.at(px, by, out - 0.34).box(2.1, 0.16, 0.70, 0.03, 0);
+    for (let k = -1; k <= 1; k++) {
+      tbk.at(px + k * 0.85, by - 0.24, out - 0.24).box(0.16, 0.34, 0.48, 0.025, 0);
+    }
+    tbk.clearFrame();
+    for (let k = 0; k < 6; k++) {
+      mb.at(px - 0.95 + (1.9 * k) / 5, by + 0.5, out - 0.66).box(0.035, 0.86, 0.035, 0.01, 0);
+    }
+    mb.at(px, by + 0.92, out - 0.66).box(2.06, 0.06, 0.06, 0.012, 0);
+    for (const sx of [-1, 1]) {
+      mb.at(px + sx * 1.0, by + 0.5, out - 0.5).box(0.035, 0.86, 0.36, 0.01, 0);
+    }
+  }
+
+  // Laundry line on two brackets — the cheapest possible silhouette in a
+  // near-field window, and it moves the eye up the elevation.
+  if (rnd() < 0.5 * density && L > 6) {
+    const py = 3.9 + rnd() * 1.2;
+    const ax = -L / 2 + 1.2, bx = L / 2 - 1.2;
+    for (const px of [ax, bx]) mb.at(px, py, out - 0.30).box(0.05, 0.05, 0.6, 0.012, 0);
+    const cl = batch.at(o.clothBucket || 'awning', (o.x0 + o.x1) / 2, (o.z0 + o.z1) / 2);
+    cl.frame(f.m);
+    cl.identity();
+    const n = 3 + ((rnd() * 3) | 0);
+    for (let i = 0; i < n; i++) {
+      const cx2 = ax + 0.9 + (bx - ax - 1.8) * ((i + 0.5) / n);
+      const w = 0.5 + rnd() * 0.35, h = 0.55 + rnd() * 0.6;
+      const zz = out - 0.58;
+      cl.quad([cx2 - w / 2, py - 0.03, zz], [cx2 + w / 2, py - 0.03, zz],
+        [cx2 + w / 2, py - 0.03 - h, zz + 0.04], [cx2 - w / 2, py - 0.03 - h, zz + 0.04],
+        0.25, (u, v, p) => { p[2] += Math.sin(u * 5.0 + i) * 0.045 * (0.3 + v); });
+    }
+    cl.clearFrame();
+    mb.at(0, py, out - 0.58).box(L - 2.0, 0.02, 0.02, 0.006, 0);
+  }
+
+  mb.clearFrame();
+}
+
 /* ------------------------------------------------------------- composites */
 
 /**
@@ -583,6 +781,11 @@ export function building(kit, o) {
     const [ax, az, bx, bz] = runs[key];
     const len = Math.hypot(bx - ax, bz - az);
     const openings = buildOpenings(len, H, storeys, sh, spec, o.seed + key.charCodeAt(0));
+    // String courses on the storey lines of any face that carries openings.
+    const courses = [];
+    if (!spec.blank && o.courses !== false) {
+      for (let st = 1; st < storeys; st++) courses.push(st * sh - 0.28);
+    }
     const f = wall(kit, {
       x0: ax, z0: az, x1: bx, z1: bz,
       height: H, thickness: T, bucket, trim,
@@ -590,10 +793,26 @@ export function building(kit, o) {
       cornice: o.cornice ?? 0.24,
       collide: !interior ? false : true,
       grid: o.grid ?? 0.8,
+      relief: o.relief ?? 1,
+      courses,
     });
+    let shutterRoll = (o.seed + key.charCodeAt(0)) | 0;
     for (const k of openings) {
       if ((k.sill ?? 0) < 0.4) continue;
-      windowFill(kit, f.m, k, T, { shutter: o.shutter, glass: o.glass, bars: k.bars });
+      shutterRoll = (shutterRoll * 1103515245 + 12345) & 0x7fffffff;
+      windowFill(kit, f.m, k, T, {
+        shutter: o.shutter, glass: o.glass, bars: k.bars,
+        // A third of the shutters stand open. Streets are never uniformly
+        // shut, and the open leaves are the deepest relief on the elevation.
+        openShutter: !spec.blank && (shutterRoll / 0x7fffffff) < 0.34,
+      });
+    }
+    if (!spec.blank && o.fittings !== false) {
+      facadeFittings(kit, {
+        x0: ax, z0: az, x1: bx, z1: bz, height: H, thickness: T,
+        seed: (o.seed | 0) + key.charCodeAt(0) * 7, density: o.fittingDensity ?? 1,
+        trimBucket: trim,
+      });
     }
   }
 
@@ -601,6 +820,7 @@ export function building(kit, o) {
     x0: x0 + 0.04, z0: z0 + 0.04, x1: x1 - 0.04, z1: z1 - 0.04,
     y: H, bucket: o.roofBucket || 'concrete', trim,
     parapet: o.parapet, sides: o.parapetSides, thickness: 0.28,
+    parapetVary: o.parapetVary ?? 1, seed: o.seed,
     collide: true,
   });
 

@@ -167,10 +167,15 @@ void main() {
   }
 
   // --- size / alpha over life ---------------------------------------------
+  // NO FADE-IN. A particle must be at full opacity on the very first frame it
+  // is drawn. The old smoothstep(0, 0.07, u) ramp meant every burst was
+  // invisible on the frame it was spawned and nearly invisible on the next —
+  // which is exactly why a single captured firing frame contained no sparks,
+  // no dust and no tracer. The size ramp below is the growth-in; opacity is
+  // not allowed to hide the birth of an effect.
   float ease = 1.0 - ( 1.0 - u ) * ( 1.0 - u );      // fast then settling
   float size = mix( aSize.x, aSize.y, ease );
-  float fadeIn = smoothstep( 0.0, 0.07, u );
-  vAlpha = aStyle.x * fadeIn * pow( 1.0 - u, aStyle.z ) * ( 1.0 - dead );
+  vAlpha = aStyle.x * pow( 1.0 - u, aStyle.z ) * ( 1.0 - dead );
   vTint = mix( aColorA, aColorB, ease );
   vDensity = aStyle.x;
   vLit = aDynamics.w;
@@ -388,7 +393,8 @@ class Layer {
     this.mesh.userData.noPrepass = true;
   }
 
-  write(time) {
+  write(birth, now) {
+    const time = birth;
     const i = this.head;
     this.head = (this.head + 1) % this.capacity;
     this.spawned++;
@@ -408,7 +414,7 @@ class Layer {
 
     if (o < this._dirtyMin) this._dirtyMin = o;
     if (o + STRIDE - 1 > this._dirtyMax) this._dirtyMax = o + STRIDE - 1;
-    this.lastSpawn = time;
+    this.lastSpawn = now;
     if (P.life > this.longestLife) this.longestLife = P.life;
     this.geometry.instanceCount = Math.min(this.capacity, Math.max(this.geometry.instanceCount, this.spawned));
   }
@@ -453,6 +459,18 @@ export class ParticleSystem {
     this.time = 0;
     this.atlas = atlas;
     this.hazeEnabled = haze;
+    /**
+     * Seconds a newly spawned particle is backdated by.
+     *
+     * An event fired during frame N happened at an unknown moment inside the
+     * frame interval that just elapsed, not exactly at its end — so birth at
+     * `now` is the one choice guaranteed to be wrong, and wrong in the worst
+     * direction: age 0 means zero displacement, zero stretch and the smallest
+     * size the particle will ever have. Half a frame back is the unbiased
+     * estimate. Capped so a very long frame cannot backdate a 40 ms tracer
+     * past its own death.
+     */
+    this.spawnBias = 1 / 120;
 
     // Alpha-blended smoke and dust are the volume; additive sparks and fire are
     // the accents. Splitting the budget 55/42 keeps a grenade's smoke alive
@@ -490,10 +508,16 @@ export class ParticleSystem {
     for (const l of this.layers) this.root.add(l.mesh);
   }
 
-  /** Spawn one particle from the shared descriptor `P`. */
-  spawn(layer) {
+  /**
+   * Spawn one particle from the shared descriptor `P`.
+   * @param {number} layer LAYER.*
+   * @param {number} [bias] seconds to backdate birth by; pass 0 for anything
+   *   whose whole life is shorter than a frame (tracers) so it is not born
+   *   already dead.
+   */
+  spawn(layer, bias = this.spawnBias) {
     if (layer === LAYER.HAZE && !this.hazeEnabled) return;
-    this.layers[layer].write(this.time);
+    this.layers[layer].write(this.time - bias, this.time);
   }
 
   /**
@@ -503,6 +527,11 @@ export class ParticleSystem {
    */
   update(dt, engine) {
     this.time = engine.elapsed;
+    // Half of the frame that just elapsed, clamped. At 60 Hz this is 8 ms and
+    // changes nothing perceptible; at the 6 Hz of a software-rasterised
+    // capture it is the difference between a burst photographed as a cluster
+    // of dots on the wall and one photographed mid-flight.
+    this.spawnBias = Math.min(dt * 0.5, 0.05);
     const s = this.shared;
     s.uTime.value = this.time;
 

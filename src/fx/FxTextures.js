@@ -288,6 +288,9 @@ export const DT = {
   CONCRETE: 0, METAL: 1, WOOD: 2, GLASS: 3,
   SAND: 4, PLASTER: 5, BRICK: 6, SCORCH: 7,
   FABRIC: 8, BLOOD: 9,
+  // Dressing rather than damage: these are placed at level build time, not by
+  // a bullet. Cheapest available route from grey-box to inhabited place.
+  STAIN: 10, GRIME: 11, SPLASH: 12,
 };
 
 /**
@@ -432,6 +435,47 @@ const DECAL_TILES = [
     o[1] = clamp01(blob + drops);
     const l = 0.10 + 0.10 * (1 - blob);
     o[2] = l * 3.2; o[3] = l * 0.35; o[4] = l * 0.28;
+  },
+  // 10 STAIN — rust and rainwater running down from a fixing or a sill. Dense
+  // at the top where it starts, dispersing into separate runs as it descends.
+  // Placed with +V pointing down the wall.
+  (u, v, o) => {
+    const t = clamp01((v + 1) * 0.5);                 // 0 at source, 1 at the tail
+    const runs = ridge2(u * 3.4, v * 0.9 + 4, 211, 3);
+    const spread = 0.22 + 0.62 * t;
+    const across = smoothstep(spread, spread * 0.15, Math.abs(u));
+    // The source blot, then the runs, fading out well before the tile border.
+    const head = smoothstep(0.34, 0.0, Math.hypot(u * 1.5, (v + 0.82) * 2.2));
+    const body = across * Math.pow(runs, 1.5 + t * 1.4) * (1 - smoothstep(0.55, 1.0, t));
+    const cov = clamp01(head * 0.9 + body * 0.85);
+    o[0] = 0.5;                                       // a stain, not a dent
+    const l = 0.16 + 0.16 * runs;
+    o[1] = cov;
+    o[2] = l * 1.0; o[3] = l * 0.72; o[4] = l * 0.48;
+  },
+  // 11 GRIME — a soft blotch of accumulated dirt with no edge at all. Reads as
+  // "this corner has never been cleaned" and nothing else.
+  (u, v, o) => {
+    const r = Math.hypot(u * (0.8 + 0.4 * noise2(v * 2, 0, 221)), v);
+    const n = fbm2(u * 2.2 + 61, v * 2.2 - 33, 222, 5);
+    const cov = clamp01(smoothstep(1.0, 0.05, r * (1 + (n - 0.5) * 0.7)) * (0.35 + 0.85 * n));
+    o[0] = 0.5;
+    const l = 0.13 + 0.20 * n;
+    o[1] = cov * 0.82;
+    o[2] = l * 1.0; o[3] = l * 0.94; o[4] = l * 0.82;
+  },
+  // 12 SPLASH — the dried mud/dust fan a vehicle throws onto a kerb or a wall
+  // base. Directional: heavy along -V, thinning and breaking into specks.
+  (u, v, o) => {
+    const t = clamp01((v + 1) * 0.5);
+    const fan = smoothstep(0.15 + 0.85 * t, 0.0, Math.abs(u)) * (1 - t);
+    const grit = fbm2(u * 9 - 4, v * 9 + 11, 231, 4);
+    const specks = smoothstep(0.66, 0.80, grit) * smoothstep(1.0, 0.1, Math.hypot(u, v));
+    const cov = clamp01(fan * (0.4 + 0.8 * grit) + specks * 0.7);
+    o[0] = 0.5;
+    const l = 0.20 + 0.26 * grit;
+    o[1] = cov * 0.9;
+    o[2] = l * 1.0; o[3] = l * 0.86; o[4] = l * 0.64;
   },
 ];
 

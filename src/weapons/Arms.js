@@ -86,6 +86,44 @@ function finger(kit, base, len, girth, curl, spread, D) {
   }
 }
 
+/**
+ * Mirror a built hand across the YZ plane, *in the buffer*.
+ *
+ * `mesh.scale.x = -1` is the obvious way to turn a right hand into a left one
+ * and it is why the support hand did not appear in a single captured frame: a
+ * negative scale reverses the winding of every triangle, so with the default
+ * `FrontSide` material every face on the hand becomes a back face and is
+ * culled. The mesh is in the graph, its bounds are correct, it draws nothing.
+ *
+ * Mirroring the vertices and swapping two corners of each triangle back
+ * restores the winding, so the left hand is a real left hand rather than an
+ * inside-out right one. (`Kit.build` does exactly this for `mirrored()` parts;
+ * this is the same fix applied to a finished geometry.)
+ */
+function mirrorGeometry(geo) {
+  const pos = geo.attributes.position.array;
+  const nrm = geo.attributes.normal ? geo.attributes.normal.array : null;
+  const uv = geo.attributes.uv ? geo.attributes.uv.array : null;
+  const n = geo.attributes.position.count;
+  for (let i = 0; i < n; i++) { pos[i * 3] = -pos[i * 3]; if (nrm) nrm[i * 3] = -nrm[i * 3]; }
+  const swap = (arr, k, a, b) => {
+    for (let c = 0; c < k; c++) {
+      const t = arr[a * k + c]; arr[a * k + c] = arr[b * k + c]; arr[b * k + c] = t;
+    }
+  };
+  for (let t = 0; t < n; t += 3) {
+    swap(pos, 3, t + 1, t + 2);
+    if (nrm) swap(nrm, 3, t + 1, t + 2);
+    if (uv) swap(uv, 2, t + 1, t + 2);
+  }
+  geo.attributes.position.needsUpdate = true;
+  if (geo.attributes.normal) geo.attributes.normal.needsUpdate = true;
+  if (geo.attributes.uv) geo.attributes.uv.needsUpdate = true;
+  geo.computeBoundingSphere();
+  geo.computeBoundingBox();
+  return geo;
+}
+
 /** Build one hand + forearm in the canonical right-hand frame. */
 function buildHand(mats, opts, D) {
   const kit = new Kit(1 / 0.22);
@@ -139,7 +177,9 @@ function buildHand(mats, opts, D) {
   kit.add(cyl(0.031, 0.033, 0.020, D >= 1 ? 12 : 8), PAD, { m: wrist.clone().multiply(new THREE.Matrix4().makeTranslation(0, 0, -0.026)) });
   if (D >= 1) kit.add(chamferBox(0.048, 0.010, 0.007, 0.0012), PAD, { m: wrist.clone().multiply(new THREE.Matrix4().makeTranslation(0, -0.026, -0.018)) });
 
-  const mesh = new THREE.Mesh(kit.build(), mats);
+  const geo = kit.build();
+  if (opts.mirror) mirrorGeometry(geo);
+  const mesh = new THREE.Mesh(geo, mats);
   mesh.frustumCulled = false;
   return mesh;
 }
@@ -153,6 +193,11 @@ export function buildArms(weapon, mats) {
   const D = detail();
   const root = new THREE.Group();
   root.name = 'Arms';
+  // The hands live inside the viewmodel camera's near volume and are posed
+  // every frame from the weapon's anchors, so their world bounds move faster
+  // than a cached bounding sphere can follow. Culling is switched off all the
+  // way down the chain rather than only on the leaf meshes.
+  root.frustumCulled = false;
 
   /* --- firing hand ----------------------------------------------------- */
   // Fingers run forward and down around the grip's front strap; the palm
@@ -160,6 +205,7 @@ export function buildArms(weapon, mats) {
   // to the shoulder and the thumb over the left side of the receiver.
   const right = new THREE.Group();
   right.name = 'rightArm';
+  right.frustumCulled = false;
   const rh = buildHand(mats, { curl: 1.30, thumbCurl: 0.85, trigger: 0.62, wrist: -0.55 }, D);
   rh.quaternion.setFromRotationMatrix(frame(
     [-0.08, -0.30 - weapon.anchors.rightRake * 0.30, -0.94],
@@ -177,9 +223,9 @@ export function buildArms(weapon, mats) {
   // exits down-left-back, out of the centre of the frame.
   const left = new THREE.Group();
   left.name = 'leftArm';
-  const lh = buildHand(mats, { curl: 1.24, thumbCurl: 0.30, wrist: 0.38 }, D);
+  left.frustumCulled = false;
+  const lh = buildHand(mats, { curl: 1.24, thumbCurl: 0.30, wrist: 0.38, mirror: true }, D);
   lh.quaternion.setFromRotationMatrix(frame([0.62, 0.72, -0.30], [-0.42, 0.10, -0.90]));
-  lh.scale.x = -1;                       // mirror the right hand into a left
   left.add(lh);
   left.position.copy(weapon.anchors.leftHand);
   left.position.x -= 0.026;

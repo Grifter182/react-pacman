@@ -67,10 +67,21 @@ export const ATMO = {
    * Planet-scale ground used to close the lower hemisphere of the bake. Matched
    * to the level's sand, because this hemisphere IS the bounce light every
    * downward-facing surface in the map receives through the IBL.
+   *
+   * These are the LINEAR albedo of `C_SAND` in materials/Recipes.js
+   * (sRGB 0.70, 0.61, 0.44), not a desaturated stand-in. The previous value was
+   * both darker and greyer than the ground it is supposed to represent, which
+   * is a large part of why every shaded facade in the game read blue: the only
+   * warm term in the whole fill was 25% too dark and 40% too desaturated.
    */
-  groundAlbedo: [0.300, 0.258, 0.196],
-  /** Sky irradiance landing on that ground (not a radiance — divided by PI). */
-  groundAmbient: [0.35, 0.50, 0.85],
+  groundAlbedo: [0.360, 0.270, 0.150],
+  /**
+   * Sky irradiance landing on that ground (an irradiance, not a radiance).
+   * Measured by cosine-integrating `skyRadiance` over the upper hemisphere
+   * rather than guessed: the old value under-counted blue by 2.2x, which
+   * suppressed the ground exitance that feeds bounce back into the IBL.
+   */
+  groundAmbient: [0.55, 0.90, 1.72],
 
   /** Angular radius of the solar disc: 0.2665 deg. */
   sunAngularRadius: 0.004654,
@@ -89,9 +100,63 @@ export const ATMO = {
    * Same numbers, same closed-form integral, therefore no seam.
    */
   haze: {
-    density: 0.0065,
-    scaleHeight: 26,
+    // Tuned as a DEPTH SEPARATOR, not a global wash. At 0.0065 / 26 m the
+    // half-extinction distance was 107 m and barely varied with height: a crate
+    // at 10 m was already veiled while a building at 120 m was still only
+    // two-thirds dissolved, so every layer of the frame got the same milky
+    // treatment and none of them separated. At 0.0035 / 14 m the same half
+    // point sits at 210 m, and because the layer e-folds twice as fast the
+    // difference between a street-level fragment and a rooftop 20 m up is a
+    // factor of ~2 in optical depth instead of ~1.2. Haze pools in the streets,
+    // thins over the rooftops, and distance does the separating.
+    density: 0.0035,
+    scaleHeight: 14,
     baseHeight: 0,
+  },
+
+  /**
+   * ELEVATED DUST — the horizon band.
+   *
+   * `haze` above is the metres-thick boundary layer that fogs geometry inside
+   * the map. It is far too shallow to do anything to the SKY: a ray leaving the
+   * camera at 10 degrees of elevation is out of a 14 m layer in 80 m and picks
+   * up an optical depth of 0.003. So the sky above the horizon was clean
+   * atmosphere, the sky below it was hazed ground, and there was no warm band
+   * between them at all — distant buildings ended against clear blue and the
+   * frame lost its background plane.
+   *
+   * Real desert air carries mineral dust lofted a few hundred metres by daytime
+   * convection. It is optically thin overhead and effectively opaque along the
+   * horizon, because the path length through an exponential layer goes as
+   * 1/sin(elevation). One number controls the whole band: `density *
+   * scaleHeight` is the vertical optical depth, here 0.042, which gives
+   *
+   *     zenith  4%      45 deg  6%      15 deg  15%      5 deg  38%      0 deg 100%
+   *
+   * of the sky mixed toward the dust colour. Mineral dust scatters forward
+   * hard and absorbs blue, so the band is warm everywhere and glares where it
+   * crosses the sun — which is precisely the cheap depth cue a desert frame
+   * needs. This is folded into `aSky`/`skyRadiance` themselves, so the sky
+   * bake, the IBL and the fog fit all see the same band and the horizon seam
+   * stays closed.
+   */
+  dust: {
+    density: 1.9e-4,
+    scaleHeight: 220,
+    /** Henyey-Greenstein asymmetry of the aerosol. */
+    phaseG: 0.60,
+    /** Isotropic pedestal added to the phase function, 1/sr. */
+    iso: 0.10,
+    /**
+     * Radiance the layer reaches under direct sun, per unit phase. This is the
+     * dust albedo times E0 times the sun's transmittance DESATURATED 50% toward
+     * grey: a 2 um mineral grain is spectrally flat compared to a Rayleigh air
+     * column, so illuminating it with the raw (0.79, 0.58, 0.35) sun colour
+     * would make the band tomato-red rather than sand.
+     */
+    sunlit: [4.98, 3.32, 1.72],
+    /** Multiply-scattered sky + ground light held in the layer. */
+    ambient: [0.93, 0.87, 0.65],
   },
 
   /**
@@ -109,21 +174,76 @@ export const ATMO = {
    * and a shooter needs readable targets in every direction.
    */
   sunElevationDeg: 14.5,
-  /** Horizontal bearing, kept from the original blockout lighting direction. */
-  sunBearing: [0.4936, -0.8697],
+  /**
+   * Horizontal bearing — azimuth 174 degrees, i.e. the sun sits almost due
+   * -X of the map.
+   *
+   * This was 0.4936, -0.8697 (azimuth -60.4 deg), "kept from the original
+   * blockout". That bearing is the single largest reason the game had no
+   * readable light direction, and it is measurable rather than a matter of
+   * taste. The capture harness drives ten fixed cameras; projecting the sun
+   * into each of them at the old bearing gives an angle between the view
+   * direction and the sun of
+   *
+   *   148, 147, 154, 148, 148, 75, 66, 146, 158, 148 degrees
+   *
+   * Eight of the ten sat within 35 degrees of DIRECTLY BEHIND THE CAMERA. A
+   * key light behind the lens is the textbook definition of flat: every
+   * surface the camera can see is the surface the sun can see, so there is no
+   * terminator anywhere in frame, and — this is the reason ten frames
+   * contained one cast shadow — every shadow falls on the far side of the
+   * object that casts it, hidden behind its own caster.
+   *
+   * At azimuth 174 the same ten cameras give
+   *
+   *   83, 82, 33, 83, 83, 48, 169, 92, 45, 83 degrees
+   *
+   * Six shots land at 82-92 degrees, which is pure cross light: a hard
+   * terminator down every vertical edge and shadows raking across the frame
+   * instead of away from it. Two more (03, 09) fall to 33-45 degrees, which is
+   * contre-jour with rim light. Shot 06 'sun-flare' now has the solar disc
+   * genuinely inside the frustum at screen (-0.68, +0.10) — at the old bearing
+   * it was 2.5 screen widths off the left edge, which is why that shot
+   * contained no sun, no flare and no shaft. Only shot 07 loses (169 deg,
+   * frontal); it keeps long shadows receding from the camera.
+   */
+  sunBearing: [-0.99452, 0.10453],
 
   /**
    * Radiance of the sun disc as baked into the sky cubemap.
    *
    * Physically this should be E0 / solidAngle ~= 1.25e5. It is clamped to a few
-   * dozen instead, deliberately: the same cubemap is the IBL environment, and a
-   * physically-bright disc would inject the sun's entire irradiance a second
+   * hundred instead, deliberately: the same cubemap is the IBL environment, and
+   * a physically-bright disc would inject the sun's entire irradiance a second
    * time through the diffuse convolution, on top of the directional light.
-   * At 70 the disc still blows through ACES to pure white (anything over ~16
-   * clips) so it reads correctly, while contributing ~0.005 of irradiance to
-   * the environment — under half a percent of the sun's real contribution.
+   *
+   * "Blows through ACES to pure white" was necessary but not sufficient — the
+   * bloom prefilter thresholds at 1.15 with a soft knee and then Karis-averages
+   * each 2x2 box, so a 6-pixel-wide disc contributes almost nothing to the
+   * bloom chain no matter how bright it is: its energy is averaged against 58
+   * dark neighbours before the threshold ever sees it. The disc therefore has
+   * to be both brighter AND bigger than the true 0.53-degree solar diameter,
+   * which is also what a real lens does to it. See `discScale` and the aureole
+   * in SkyModule's composite pass.
+   *
+   * Budget: at radiance 260 over a 2.4x-enlarged disc the environment picks up
+   * 0.10 of irradiance, and the aureole another 0.09, against the sun's 6.7 —
+   * under 3% double-counted.
    */
-  sunDiscRadiance: 70.0,
+  sunDiscRadiance: 260.0,
+  /**
+   * How much larger than the true solar disc to draw it. Cameras and eyes both
+   * bloom the sun well past its geometric size; at 1.0 it is 6 px across in a
+   * 900p frame and reads as a dead pixel cluster.
+   */
+  discScale: 2.4,
+  /**
+   * Forward-scattering aureole around the disc: peak radiance at the rim, and
+   * the angular radius over which it decays. The single-scattering LUT cannot
+   * produce this — it would need the Mie phase resolved inside a tenth of a
+   * degree — but it is the part of the sun a camera actually sees.
+   */
+  sunGlow: { radiance: 46.0, radius: 0.16 },
 };
 
 /* -------------------------------------------------------------------------- */
@@ -201,11 +321,56 @@ export function sunTransmittance(sunDir = sunDirectionArray()) {
 }
 
 /**
+ * Longest path any single ray is allowed to accumulate through the dust layer.
+ * 12 * the scale height horizontally is already an optical depth of ~0.66; past
+ * that the closed form is integrating air that, in a real boundary layer, has
+ * long since been stirred away.
+ */
+export const DUST_MAX_PATH = 260e3;
+
+/** Henyey-Greenstein phase, 1/sr. */
+function hgPhase(mu, g) {
+  const gg = g * g;
+  return (1 - gg) / (4 * Math.PI * Math.pow(Math.max(1 + gg - 2 * g * mu, 1e-4), 1.5));
+}
+
+/**
+ * Fraction of a ray of length `dist` that runs through the elevated dust layer.
+ * Closed-form integral of rho(y) = exp(-(y - base)/H); identical algebra to
+ * `aHazeFactor`, different layer. Shared verbatim with the GLSL below.
+ */
+export function dustFactor(camY, dirY, dist) {
+  const k = 1 / ATMO.dust.scaleHeight;
+  const y0 = camY * k;
+  const dy = dirY * k;
+  const path = Math.abs(dy) > 1e-9
+    ? (Math.exp(-y0) - Math.exp(-y0 - dy * dist)) / dy
+    : Math.exp(-y0) * dist;
+  return 1 - Math.exp(-ATMO.dust.density * Math.max(path, 0));
+}
+
+/** Radiance the dust layer reaches, looking along `rd`. */
+export function dustRadiance(rd, sunDir = sunDirectionArray()) {
+  const mu = rd[0] * sunDir[0] + rd[1] * sunDir[1] + rd[2] * sunDir[2];
+  const p = hgPhase(mu, ATMO.dust.phaseG) + ATMO.dust.iso;
+  return [0, 1, 2].map((c) => ATMO.dust.sunlit[c] * p + ATMO.dust.ambient[c]);
+}
+
+/**
  * Single-scattered sky radiance along `rd`, including the planet ground for
  * downward directions so the lower hemisphere of the IBL bake carries a real
- * bounce colour instead of black.
+ * bounce colour instead of black, and the elevated dust band that gives the
+ * horizon its warm haze layer.
+ *
+ * `applyDust = false` returns the sky WITHOUT the dust band. The horizon fit
+ * that drives the fog uses it: the dust band is a 1/sin(elevation) profile that
+ * a five-term smooth basis cannot represent (fitting it directly triples the
+ * residual and drives the red channel negative above 30 degrees), but it is
+ * analytic and cheap, so the fog reproduces it exactly with the same closed
+ * form instead of trying to approximate it. Fit the clean sky, add the dust on
+ * both sides — identical result, no residual.
  */
-export function skyRadiance(rd, sunDir = sunDirectionArray(), viewSteps = 20, lightSteps = 6) {
+export function skyRadiance(rd, sunDir = sunDirectionArray(), viewSteps = 20, lightSteps = 6, applyDust = true) {
   const ro = [0, ATMO.Rg + 2, 0];
   const tG = raySphereNear(ro, rd, ATMO.Rg);
   const tMax = tG > 0 ? tG : raySphereFar(ro, rd, ATMO.Rt);
@@ -251,6 +416,21 @@ export function skyRadiance(rd, sunDir = sunDirectionArray(), viewSteps = 20, li
     }
   }
 
+  // Elevated dust. Applied last, over both the sky and the ground hemisphere,
+  // so a ray that grazes the horizon converges on the band from above and below
+  // at the same value. `DUST_MAX_PATH` caps an upward ray's path at the point
+  // where the layer is exhausted; without it a near-horizontal ray integrates
+  // out to the atmosphere shell and the closed form saturates a few degrees too
+  // high up.
+  if (applyDust) {
+    const reach = tG > 0 ? tG : Math.min(tMax, DUST_MAX_PATH);
+    const f = dustFactor(2, rd[1], reach);
+    if (f > 1e-4) {
+      const dl = dustRadiance(rd, sunDir);
+      for (let c = 0; c < 3; c++) out[c] += (dl[c] - out[c]) * f;
+    }
+  }
+
   return out;
 }
 
@@ -290,6 +470,34 @@ const vec3  A_MS_GAIN = ${v3(ATMO.msGain)};
 #define A_HAZE_DENSITY ${f(ATMO.haze.density)}
 #define A_HAZE_FALLOFF ${f(1 / ATMO.haze.scaleHeight)}
 #define A_HAZE_BASE ${f(ATMO.haze.baseHeight)}
+
+#define A_DUST_DENSITY ${f(ATMO.dust.density)}
+#define A_DUST_FALLOFF ${f(1 / ATMO.dust.scaleHeight)}
+#define A_DUST_G ${f(ATMO.dust.phaseG)}
+#define A_DUST_ISO ${f(ATMO.dust.iso)}
+#define A_DUST_MAX_PATH ${f(DUST_MAX_PATH)}
+const vec3 A_DUST_SUNLIT = ${v3(ATMO.dust.sunlit)};
+const vec3 A_DUST_AMBIENT = ${v3(ATMO.dust.ambient)};
+
+float aHG(float mu, float g){
+  float gg = g * g;
+  return (1.0 - gg) / (4.0 * A_PI * pow(max(1.0 + gg - 2.0 * g * mu, 1e-4), 1.5));
+}
+
+// Elevated dust layer — see ATMO.dust. Same closed form as aHazeFactor over a
+// different (much deeper, much thinner) layer.
+float aDustFactor(float camY, float dirY, float dist){
+  float y0 = camY * A_DUST_FALLOFF;
+  float dy = dirY * A_DUST_FALLOFF;
+  float path = abs(dy) > 1e-9
+    ? (exp(-y0) - exp(-y0 - dy * dist)) / dy
+    : exp(-y0) * dist;
+  return 1.0 - exp(-A_DUST_DENSITY * max(path, 0.0));
+}
+
+vec3 aDustRadiance(vec3 rd, vec3 sunDir){
+  return A_DUST_SUNLIT * (aHG(dot(rd, sunDir), A_DUST_G) + A_DUST_ISO) + A_DUST_AMBIENT;
+}
 
 // Closed-form optical depth through the exponential boundary layer. Shared,
 // verbatim, with the fog chunk in AtmosphericFog.js.
@@ -392,6 +600,11 @@ vec3 aSky(vec3 ro, vec3 rd, vec3 sunDir, out vec3 tr){
     vec3 e = A_E0 * ts * max(dot(n, sunDir), 0.0) + A_GROUND_AMBIENT;
     col += A_GROUND_ALBEDO * e / A_PI * tr;
   }
+
+  // Elevated dust, over sky and ground alike so the band closes across the
+  // horizon instead of drawing a second seam on it.
+  float dustReach = tG > 0.0 ? tG : min(tMax, A_DUST_MAX_PATH);
+  col = mix(col, aDustRadiance(rd, sunDir), aDustFactor(2.0, rd.y, dustReach));
   return col;
 }
 `;

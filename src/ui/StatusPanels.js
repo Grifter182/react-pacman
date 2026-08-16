@@ -14,37 +14,51 @@ import { el, frag, clamp, clock } from './Dom.js';
 
 /* ------------------------------------------------------------------ vitals */
 
+/**
+ * Stance silhouettes, on a 16x22 box. Deliberately abstract: at fifteen pixels
+ * tall an anatomically drawn soldier is mush, whereas a head plus one mass
+ * whose proportion and axis change with the stance is readable instantly.
+ * `stand` is never drawn — it is the resting state, and the whole point of a
+ * transient glyph is that the default costs nothing on screen.
+ */
+const STANCE_ART = {
+  crouch: '<circle cx="8" cy="6.2" r="3"/><path d="M4.3 10.2h7.4a1.8 1.8 0 0 1 1.8 1.8v7.8a1.8 1.8 0 0 1-1.8 1.8H4.3a1.8 1.8 0 0 1-1.8-1.8V12a1.8 1.8 0 0 1 1.8-1.8z"/>',
+  prone: '<circle cx="3.4" cy="16.8" r="3"/><path d="M6.4 14.3h7.4a2.3 2.3 0 0 1 0 5H6.4z"/>',
+  sprint: '<circle cx="10.2" cy="3.4" r="3"/><path d="M6.6 7.4h5.2L8.4 21.6H3.2z"/>',
+  ads: '<path d="M1 8V2h6v2.2H3.2V8zM15 8V2H9v2.2h3.8V8zM1 14v6h6v-2.2H3.2V14zM15 14v6H9v-2.2h3.8V14z"/><circle cx="8" cy="11" r="1.7"/>',
+};
+
 export class VitalsPanel {
   constructor(parent) {
+    // ONE ENCODING. The block used to say the same thing four ways — "100",
+    // "/100", a segmented bar with a lagging ghost, and the word STABLE. A
+    // player reads exactly one of those, and it is the big number; the rest was
+    // dashboard for its own sake. What is left is the numeral, which changes
+    // hue as it falls, and the screen-edge vignette that already exists as the
+    // second, non-textual channel.
     this.node = frag(`
       <div class="bl-bl">
-        <div class="bl-hprow">
-          <span class="bl-hpval bl-num bl-chroma">100</span>
-          <span class="bl-hpmax bl-num">/100</span>
-          <span class="bl-hpstate">STABLE</span>
-        </div>
-        <div class="bl-hpbar"><i class="ghost"></i><i class="fill"></i></div>
-        <div class="bl-stance">
-          <span data-k="sprint">SPRINT</span><span data-k="crouch">CROUCH</span>
-          <span data-k="prone">PRONE</span><span data-k="ads">AIM</span>
-        </div>
+        <span class="bl-hpval bl-num bl-t1">100</span>
+        <div class="bl-stance"><svg viewBox="0 0 16 22" aria-hidden="true"></svg></div>
       </div>`);
     parent.appendChild(this.node);
 
-    // Segment ticks at each quarter give the bar a scale to be read against.
-    const bar = this.node.querySelector('.bl-hpbar');
-    for (let i = 1; i < 4; i++) {
-      bar.appendChild(el('i.seg', { style: `left:${i * 25}%` }));
-    }
-
     this.$val = this.node.querySelector('.bl-hpval');
-    this.$max = this.node.querySelector('.bl-hpmax');
-    this.$state = this.node.querySelector('.bl-hpstate');
-    this.$fill = this.node.querySelector('.fill');
-    this.$ghost = this.node.querySelector('.ghost');
-    this.$stance = [...this.node.querySelectorAll('.bl-stance span')];
+    this.$stance = this.node.querySelector('.bl-stance');
+    this.$stanceArt = this.$stance.querySelector('svg');
 
-    this._hp = -1; this._ghostPct = 100; this._cls = ''; this._state = '';
+    this._hp = -1; this._cls = '';
+    this._stance = 'stand';
+    this._stanceHold = 0;
+  }
+
+  /** Priority order: what you are doing beats what you are standing on. */
+  static _stanceOf(s) {
+    if (s.ads) return 'ads';
+    if (s.prone) return 'prone';
+    if (s.crouching) return 'crouch';
+    if (s.sprinting) return 'sprint';
+    return 'stand';
   }
 
   update(dt, s, vitals) {
@@ -53,31 +67,37 @@ export class VitalsPanel {
     if (hp !== this._hp) {
       this._hp = hp;
       this.$val.textContent = String(Math.max(0, hp));
-      this.$max.textContent = `/${s.maxHealth}`;
-      this.$fill.style.width = `${(ratio * 100).toFixed(1)}%`;
     }
-
-    // The ghost bar chases the real one downward only, and slowly, so the size
-    // of the hit you just took is legible after the fact.
-    const pct = ratio * 100;
-    if (pct < this._ghostPct) this._ghostPct = Math.max(pct, this._ghostPct - dt * 26);
-    else this._ghostPct = pct;
-    this.$ghost.style.width = `${this._ghostPct.toFixed(1)}%`;
 
     const cls = 'bl-bl' + (ratio <= 0.28 ? ' bl-crit' : ratio <= 0.6 ? ' bl-hurt' : '')
       + (vitals?.regenerating && ratio < 1 ? ' bl-regen' : '');
     if (cls !== this._cls) { this.node.className = cls; this._cls = cls; }
 
-    const st = !s.alive ? 'DOWN'
-      : vitals?.regenerating && ratio < 1 ? 'RECOVERING'
-      : ratio <= 0.28 ? 'CRITICAL'
-      : ratio <= 0.6 ? 'WOUNDED' : 'STABLE';
-    if (st !== this._state) { this.$state.textContent = st; this._state = st; }
-
-    const on = { sprint: s.sprinting, crouch: s.crouching, prone: s.prone, ads: s.ads };
-    for (const nodeEl of this.$stance) {
-      const want = !!on[nodeEl.dataset.k];
-      if (nodeEl.classList.contains('on') !== want) nodeEl.classList.toggle('on', want);
+    /* --- stance glyph ------------------------------------------------------ */
+    // Shown on the transition, held briefly, then faded. Aiming is the one
+    // stance held long enough to be worth persisting, and it is accented
+    // because it is the one that changes what the reticle means.
+    const st = VitalsPanel._stanceOf(s);
+    if (st !== this._stance) {
+      this._stance = st;
+      if (st === 'stand') {
+        this._stanceHold = 0;
+        this.$stance.classList.remove('on');
+      } else {
+        this.$stanceArt.innerHTML = STANCE_ART[st];
+        this.$stance.classList.toggle('acc', st === 'ads');
+        this.$stance.classList.add('on');
+        this._stanceHold = 1.6;
+      }
+    }
+    if (this._stanceHold > 0) {
+      // Aiming holds the glyph up for as long as it lasts; everything else is a
+      // momentary confirmation that the input registered.
+      if (st === 'ads') this._stanceHold = 1.6;
+      else {
+        this._stanceHold -= dt;
+        if (this._stanceHold <= 0) this.$stance.classList.remove('on');
+      }
     }
   }
 }
@@ -88,11 +108,11 @@ export class AmmoPanel {
   constructor(parent) {
     this.node = frag(`
       <div class="bl-br">
-        <div class="bl-wname">M4A1</div>
-        <div class="bl-wmode">AUTO · ASSAULT</div>
+        <div class="bl-wname bl-t2">M4A1</div>
+        <div class="bl-wmode bl-t3">AUTO · ASSAULT</div>
         <div class="bl-ammo">
-          <span class="bl-mag bl-num bl-chroma">30</span>
-          <span class="bl-res bl-num">/ 210</span>
+          <span class="bl-mag bl-num bl-t1">30</span>
+          <span class="bl-res bl-num bl-t3">/ 210</span>
         </div>
         <div class="bl-pips"></div>
         <div class="bl-reload"><i></i></div>
@@ -249,19 +269,51 @@ export class Callouts {
 
 /* --------------------------------------------------------------- objective */
 
+/**
+ * The objective is a card, not a banner.
+ *
+ * It used to be pinned to bottom centre and left up for the whole match, where
+ * two things were true of it in every captured frame: the weapon occluded it,
+ * and on the frames where it was visible it said the same eight words it had
+ * said ten minutes earlier. Bottom centre in a first-person game is the
+ * viewmodel's, unconditionally.
+ *
+ * It now sits on the top-centre axis under the score panel, and it dismisses
+ * itself. `set()` is called on a genuine change of objective — round start,
+ * overtime, a streak reward expiring — and each call buys a few seconds of
+ * screen time. An empty text clears it immediately.
+ */
+const OBJECTIVE_DWELL = 7;
+
 export class ObjectiveStrip {
   constructor(parent) {
     this.node = frag('<div class="bl-obj"><b></b><span></span></div>');
     parent.appendChild(this.node);
     this._text = null;
+    this._life = 0;
   }
 
-  set(text, sub = '') {
-    if (text === this._text) return;
+  set(text, sub = '', dwell = OBJECTIVE_DWELL) {
+    if (!text) {
+      this._text = null;
+      this._life = 0;
+      this.node.classList.remove('on');
+      return;
+    }
+    // A repeat of the objective already showing does not restart its clock;
+    // otherwise a module that re-announces on a timer pins it up forever.
+    if (text === this._text && this._life > 0) return;
     this._text = text;
-    this.node.children[0].textContent = text || '';
+    this.node.children[0].textContent = text;
     this.node.children[1].textContent = sub || '';
-    this.node.classList.toggle('on', !!text);
+    this._life = dwell > 0 ? dwell : OBJECTIVE_DWELL;
+    this.node.classList.add('on');
+  }
+
+  update(dt) {
+    if (this._life <= 0) return;
+    this._life -= dt;
+    if (this._life <= 0) this.node.classList.remove('on');
   }
 }
 
@@ -272,8 +324,8 @@ export class RespawnOverlay {
     this.node = frag(`
       <div class="bl-respawn">
         <b>YOU WERE KILLED</b>
-        <div class="n bl-num">4</div>
-        <span>REDEPLOYING</span>
+        <div class="n bl-num bl-t1">4</div>
+        <span class="bl-t3">REDEPLOYING</span>
       </div>`);
     parent.appendChild(this.node);
     this.$n = this.node.querySelector('.n');

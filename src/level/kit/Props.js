@@ -50,8 +50,10 @@ export function protoBarrel() {
   return build((b) => {
     const r = 0.29, h = 0.88;
     b.at(0, h / 2, 0).cyl(r, r, h, 16, 0.02);
+    // Rolling hoops. Unchamfered on purpose: at 55 mm tall the bevel is below
+    // a pixel at any range, and `cyl` now emits one band instead of three.
     for (const y of [h * 0.28, h * 0.5, h * 0.72]) {
-      b.at(0, y, 0).cyl(r + 0.022, r + 0.022, 0.055, 16, 0.012, false, false);
+      b.at(0, y, 0).cyl(r + 0.022, r + 0.022, 0.055, 14, 0, false, false);
     }
     b.at(0, h - 0.012, 0).cyl(r - 0.02, r - 0.02, 0.05, 16, 0.012);
     b.at(0.13, h + 0.012, 0.05).cyl(0.045, 0.045, 0.05, 8, 0.008);
@@ -503,6 +505,103 @@ export function placeLamp(kit, o) {
   m.at(o.x + dx * 0.7, o.y - 0.04, o.z + dz * 0.7, yaw).cyl(0.24, 0.10, 0.16, 10, 0.02);
   e.at(o.x + dx * 0.7, o.y - 0.13, o.z + dz * 0.7).cyl(0.13, 0.13, 0.035, 10, 0.01);
   return [o.x + dx * 0.7, o.y - 0.16, o.z + dz * 0.7];
+}
+
+/**
+ * A beam spanning a street, on corbel brackets at both ends, with optional
+ * cross-joists and a plank deck over part of it.
+ *
+ * This is a composition tool rather than a set piece. Every reference frame
+ * from a shipped military shooter has something dark inside four metres of the
+ * camera that frames the lit street beyond it and gives the eye a black to
+ * measure the midtones against; on this map there was nothing in that band
+ * except the weapon. A beam at 2.7 m does it without costing the player a
+ * single metre of movement.
+ *
+ * @param {object} o
+ *   x0,z0,x1,z1  the span, wall face to wall face
+ *   y            underside of the beam (default 2.7)
+ *   depth        beam depth (default 0.26)
+ *   joists       number of cross members over the span (default 0)
+ *   deck         0..1 fraction of the span planked over (default 0)
+ */
+export function placeSpan(kit, o) {
+  const { batch } = kit;
+  const y = o.y ?? 2.7;
+  const dep = o.depth ?? 0.26;
+  const wid = o.width ?? 0.20;
+  const dx = o.x1 - o.x0, dz = o.z1 - o.z0;
+  const len = Math.hypot(dx, dz) || 1;
+  const yaw = Math.atan2(-dz, dx);
+  const cx = (o.x0 + o.x1) / 2, cz = (o.z0 + o.z1) / 2;
+  const b = batch.at(o.bucket || 'timber', cx, cz);
+  const frame = new THREE.Matrix4().compose(
+    new THREE.Vector3(cx, 0, cz),
+    new THREE.Quaternion().setFromEuler(new THREE.Euler(0, yaw, 0, 'YXZ')),
+    new THREE.Vector3(1, 1, 1));
+  b.frame(frame);
+  b.at(0, y + dep / 2, 0).box(len, dep, wid, 0.03, 0);
+  // Corbels: a beam that meets a wall in a butt joint reads as a floating bar.
+  for (const s of [-1, 1]) {
+    b.at(s * (len / 2 - 0.28), y - 0.10, 0).box(0.5, 0.20, wid + 0.10, 0.025, 0);
+    b.at(s * (len / 2 - 0.16), y - 0.34, 0, 0, 0, s * 0.7).box(0.44, 0.13, wid, 0.02, 0);
+  }
+  const joists = o.joists ?? 0;
+  for (let i = 0; i < joists; i++) {
+    const t = -len / 2 + (len * (i + 1)) / (joists + 1);
+    b.at(t, y + dep * 0.42, 0).box(0.13, 0.13, wid + 0.9, 0.02, 0);
+  }
+  if (o.deck) {
+    const dl = len * o.deck;
+    for (let i = 0; i < 6; i++) {
+      b.at((o.deckOffset ?? 0) * len, y + dep + 0.03, -0.45 + i * 0.18).box(dl, 0.05, 0.16, 0.014, 0);
+    }
+  }
+  b.clearFrame();
+  return { yaw, len };
+}
+
+/**
+ * A run of textiles hung from a wire across a street: rugs, sheets, sacking.
+ * The hem sits at `clear` metres so the player walks under it untouched, and
+ * the sheet occupies the top half of the frame — which is where a near-field
+ * occluder actually has to be to frame the midground.
+ */
+export function placeWashLine(kit, o) {
+  const y = o.y ?? 4.4;
+  const clear = o.clear ?? 2.35;
+  const n = o.count ?? 4;
+  const dx = o.x1 - o.x0, dz = o.z1 - o.z0;
+  const len = Math.hypot(dx, dz) || 1;
+  const yaw = Math.atan2(-dz, dx) + Math.PI / 2;
+  const r = rng(o.seed ?? 13);
+  // A wire has to be attached to something. Where the run crosses a street it
+  // is pinned to the two facades and needs nothing; anywhere else — across a
+  // roof, across open ground — it gets a pole at each end, or it reads as a
+  // line of laundry floating in mid-air.
+  if (o.posts) {
+    const { batch, proxy } = kit;
+    const p = batch.at(o.postBucket || 'timber', o.x0, o.z0);
+    for (const [px, pz] of [[o.x0, o.z0], [o.x1, o.z1]]) {
+      const base = o.postBase ?? 0;
+      p.at(px, (y + 0.1 + base) / 2, pz).box(0.11, y + 0.1 - base, 0.11, 0.02, 0);
+      p.at(px, y + 0.06, pz).box(0.34, 0.08, 0.10, 0.015, 0);
+      if (o.collide !== false) proxy.box(px, (y + base) / 2, pz, 0.2, y - base, 0.2);
+    }
+  }
+  placeCable(kit, [o.x0, y, o.z0], [o.x1, y, o.z1], o.sag ?? 0.35, 0.016);
+  for (let i = 0; i < n; i++) {
+    const t = (i + 0.5) / n + (r() - 0.5) * 0.08;
+    const sag = Math.sin(Math.PI * t) * (o.sag ?? 0.35);
+    const top = y - sag - 0.03;
+    const h = Math.max(0.5, top - clear - r() * 0.35);
+    placeHangingRug(kit, {
+      x: o.x0 + dx * t, z: o.z0 + dz * t, yaw,
+      width: (o.width ?? 1.5) * (0.8 + r() * 0.5),
+      height: h, top, phase: i * 1.9 + (o.seed ?? 0),
+      bucket: o.bucket,
+    });
+  }
 }
 
 /** Scatter of small debris chunks, merged straight into a ground bucket. */

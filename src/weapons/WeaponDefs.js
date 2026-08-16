@@ -108,7 +108,11 @@ export const WEAPONS = {
 
     model: {
       length: 0.34, receiverW: 0.056, receiverH: 0.062,
-      handguard: { len: 0.205, radius: 0.0245, slots: 4 },
+      // Shorter than the barrel by enough to expose the gas journal, the gas
+      // block and the front sight base. A rail that runs to the muzzle hides
+      // all three, which is how the last build ended up with no front sight
+      // and a gas block buried inside the handguard shell.
+      handguard: { len: 0.170, radius: 0.0245, slots: 4 },
       barrel: { len: 0.30, radius: 0.0098, fluted: false, gasBlock: true },
       muzzle: 'flashhider',
       stock: 'carbine',
@@ -178,7 +182,9 @@ export const WEAPONS = {
 
     model: {
       length: 0.235, receiverW: 0.050, receiverH: 0.056,
-      handguard: { len: 0.088, radius: 0.0225, slots: 2 },
+      // The 88 mm handguard reached 21 mm *past* the muzzle crown, swallowing
+      // the barrel whole and leaving the compensator poking out of a tube.
+      handguard: { len: 0.055, radius: 0.0225, slots: 2 },
       barrel: { len: 0.155, radius: 0.0082, fluted: false, gasBlock: false },
       muzzle: 'compensator',
       stock: 'folding',

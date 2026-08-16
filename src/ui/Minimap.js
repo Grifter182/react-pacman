@@ -15,6 +15,31 @@ import { Config, QualityTier } from '../core/Config.js';
  * floorplan is. A second, lighter pass takes the 0.15 m .. 0.62 m band so low
  * cover reads as its own tone.
  *
+ * FROM PROJECTED TRIANGLES TO BUILDING FOOTPRINTS.
+ * Projecting the collider and calling it a floorplan does not produce one. A
+ * building in this level is a shell of separate wall quads with seams between
+ * them, its walls are 20 cm thick, and at the scale the minimap is drawn a 20 cm
+ * wall is a third of a pixel. Rasterising that directly gives what the review
+ * described exactly: scattered confetti, no legible geometry. What is missing is
+ * a *closing* — the morphological operation that turns a set of nearly-touching
+ * marks into the solid region they outline.
+ *
+ * The first half of the answer is that a projected wall has to be STROKED, not
+ * filled — it is a line segment with zero area, and filling it drew literally
+ * nothing. The second half is a *closing*.
+ *
+ * So the projection now feeds a binary mask, and the mask is closed (dilate by
+ * r, then erode by r) before anything is drawn from it. Closing joins anything
+ * separated by less than 2r while leaving the outer boundary where it was, so a
+ * shell of wall quads becomes one filled footprint and an alley wider than 2r
+ * stays open. A final 1 px dilate guarantees that a wall thinner than a pixel
+ * still occupies one. The footprint is then filled as a solid body with a
+ * brighter 2 px edge lifted off it — body reads the shape, edge reads the
+ * boundary, which is how a plan is drawn.
+ *
+ * All of it is offscreen canvas compositing at boot. Per frame nothing changes:
+ * still one rotated `drawImage`.
+ *
  * ORIENTATION. World axes are +X east, +Z north; the camera's forward vector is
  * `(-sin yaw, -cos yaw)`. Map space flips Z so north is up before rotation, and
  * the canvas is then rotated by `PI - yaw`, which is the unique angle that puts
@@ -27,7 +52,22 @@ import { Config, QualityTier } from '../core/Config.js';
  */
 
 const MAP_PX = 512;           // floorplan raster resolution
-const VIEW_RADIUS = 46;       // metres from the player to the map edge
+/* 34 m, not 46. The map disc is 168 CSS px across; at 46 m a three-metre stall
+   was under six pixels wide and a street was indistinguishable from a gap
+   between two marks. Pulling the radius in trades peripheral awareness — which
+   the compass and the contact pings already carry — for a plan that can
+   actually be read at a glance. */
+const VIEW_RADIUS = 34;
+
+/* Closing radius in plan pixels. At 512 px across a ~120 m level this is about
+   1.4 m: wide enough to seal the seams between wall quads and the gap between a
+   building and its own doorframe, narrow enough to leave real streets open. */
+const CLOSE_R = 6;
+
+/* Nominal wall thickness in metres, used as the stroke width when the projected
+   triangles are drawn. See the long note in build(): a vertical wall has zero
+   projected area, so the stroke is what actually puts it on the plan. */
+const WALL_M = 0.42;
 
 const REDRAW_HZ = {
   [QualityTier.LOW]: 20,
@@ -44,7 +84,7 @@ export class Minimap {
           <canvas></canvas>
           <div class="rose"><b>N</b></div>
         </div>
-        <div class="foot"><span class="nm">SUQ AL-HADID</span><span class="uav">UAV</span></div>
+        <div class="foot"><span class="nm bl-t3">SUQ AL-HADID</span><span class="uav bl-t3">UAV</span></div>
       </div>`);
     parent.appendChild(this.node);
 
@@ -78,10 +118,6 @@ export class Minimap {
       span, scale,
     };
 
-    const plan = document.createElement('canvas');
-    plan.width = plan.height = MAP_PX;
-    const g = plan.getContext('2d');
-
     const pos = collider.geometry.getAttribute('position');
     const idx = collider.geometry.getIndex();
     const triCount = Math.floor((idx ? idx.count : pos.count) / 3);
@@ -94,13 +130,18 @@ export class Minimap {
     // often one quad from the floor to a roof six metres up; its centroid sits
     // well above head height, and a centroid test throws away exactly the
     // geometry a floorplan is made of.
+    // Each pass rasterises to its own binary mask; colour is applied later, once
+    // the mask has been closed into footprints.
     const passes = [
-      { lo: 0.18, hi: 0.62, fill: 'rgba(122,152,180,0.30)', capped: true },   // low cover
-      { lo: 0.62, hi: 3.40, fill: 'rgba(178,206,232,0.62)', capped: false },  // walls
+      { lo: 0.18, hi: 0.62, capped: true },    // low cover
+      { lo: 0.62, hi: 3.40, capped: false },   // walls
     ];
 
     for (const pass of passes) {
-      g.fillStyle = pass.fill;
+      const mask = blankPlan();
+      const g = mask.getContext('2d');
+      pass.mask = mask;
+      g.fillStyle = '#fff';
       g.beginPath();
       for (let t = 0; t < triCount; t += step) {
         const base = t * 3;
@@ -115,11 +156,16 @@ export class Minimap {
         // that also reaches the wall band belongs to the wall pass instead.
         if (pass.capped && maxY > 0.62) continue;
 
-        // Near-horizontal triangles are floor and roof slabs; they would flood
-        // the plan solid. Reject on vertical extent vs projected area.
         const dy = maxY - minY;
         const cross = (ax[1] - ax[0]) * (az[2] - az[0]) - (ax[2] - ax[0]) * (az[1] - az[0]);
-        if (dy < 0.12 && Math.abs(cross) * 0.5 > 0.6) continue;
+        const areaM2 = Math.abs(cross) * 0.5;
+        // Near-horizontal triangles are floor and roof slabs; they would flood
+        // the plan solid. Reject on vertical extent vs projected area.
+        if (dy < 0.12 && areaM2 > 0.6) continue;
+        // And anything with a large footprint in the walk band is a ramp, a
+        // mezzanine or a slab however steep it is. A wall cannot have one: see
+        // the note below — a wall's projected area is zero by construction.
+        if (areaM2 > 14) continue;
 
         // Winding matters. Every triangle goes into one path filled with the
         // nonzero rule, and the collider is front-face-only, so projected
@@ -136,8 +182,45 @@ export class Minimap {
         }
         g.closePath();
       }
+      /*
+       * FILLING A PROJECTED WALL DRAWS NOTHING. This is the bug underneath the
+       * "scattered confetti" review, and it is geometric, not cosmetic: a
+       * vertical wall quad projected onto the XZ plane is a *line segment*. Its
+       * two triangles have exactly zero area, and a zero-area path fills zero
+       * pixels. Everything that ever appeared on this plan came from the
+       * incidental non-vertical geometry — chamfers, awnings, the odd sloped
+       * crate lid — which is precisely a scatter of disconnected marks with no
+       * building in it. The walls, the only thing a floorplan is actually made
+       * of, were being drawn and discarded every single boot.
+       *
+       * So the plan is STROKED as well as filled. A stroke of one wall
+       * thickness turns each projected segment into the mark it should always
+       * have been, and the fill still catches the genuinely planar geometry.
+       * Round joins and caps stop the corners of a building from opening up.
+       */
+      g.lineJoin = 'round';
+      g.lineCap = 'round';
+      g.lineWidth = Math.max(1, WALL_M * scale);
       g.fill();
+      g.stroke();
     }
+
+    /* --- masks -> footprints ---------------------------------------------- */
+    // Close, then guarantee a minimum thickness. See the header note: this is
+    // the step that turns projected wall quads into buildings.
+    const cover = dilate(closeMask(passes[0].mask, Math.round(CLOSE_R * 0.6)), 1);
+    const walls = dilate(closeMask(passes[1].mask, CLOSE_R), 1);
+    // The boundary band is the footprint minus its own interior.
+    const edge = subtract(walls, erode(walls, 2));
+
+    const plan = blankPlan();
+    const p = plan.getContext('2d');
+    // Low cover sits under the buildings and stays a tone, not a shape.
+    p.drawImage(tint(cover, 'rgba(104,134,164,0.40)'), 0, 0);
+    // Building body: opaque enough to read as mass against the map ground.
+    p.drawImage(tint(walls, 'rgba(126,158,188,0.78)'), 0, 0);
+    // Boundary: the only bright value on the plan, so the eye reads outlines.
+    p.drawImage(tint(edge, 'rgba(206,228,248,0.92)'), 0, 0);
 
     this.plan = plan;
     console.info('[HUD] minimap plan rasterised in', (performance.now() - t0).toFixed(0),
@@ -195,7 +278,17 @@ export class Minimap {
     c.save();
     // Circular clip: the frame is square but the readable region is a disc.
     c.beginPath(); c.arc(R, R, R - 1, 0, Math.PI * 2); c.clip();
-    c.fillStyle = 'rgba(6,10,14,0.74)';
+    // Not black. A black disc makes every mark on the map a maximum-contrast
+    // speck — which is precisely how a floorplan turns into confetti. The ground
+    // is a dark blue-grey with a slight centre lift, so footprints sit on a
+    // value rather than punching out of a hole.
+    if (!this._ground || this._groundS !== S) {
+      const gr = c.createRadialGradient(R, R, 0, R, R, R);
+      gr.addColorStop(0, 'rgba(19,27,36,0.86)');
+      gr.addColorStop(1, 'rgba(9,13,18,0.90)');
+      this._ground = gr; this._groundS = S;
+    }
+    c.fillStyle = this._ground;
     c.fillRect(0, 0, S, S);
 
     c.translate(R, R);
@@ -216,15 +309,22 @@ export class Minimap {
       c.restore();
     }
 
-    /* --- range rings ------------------------------------------------------- */
-    c.strokeStyle = 'rgba(196,214,232,0.09)';
-    c.lineWidth = Math.max(1, S / 240);
-    for (const m of [15, 30]) { c.beginPath(); c.arc(0, 0, m * ppm, 0, Math.PI * 2); c.stroke(); }
+    /* --- range ring -------------------------------------------------------- */
+    // One ring, not two. The second added a mark without adding a fact.
+    c.strokeStyle = 'rgba(196,214,232,0.08)';
+    c.lineWidth = Math.max(1, S / 260);
+    c.beginPath(); c.arc(0, 0, 17 * ppm, 0, Math.PI * 2); c.stroke();
 
     /* --- blips ------------------------------------------------------------- */
+    // Blips are culled to the disc. Off-map contacts used to be drawn anyway and
+    // then clipped, which cost nothing but also meant the count of marks on the
+    // map bore no relation to what was near the player.
+    const reach = VIEW_RADIUS * 0.97;
     if (state.allies) {
       for (const a of state.allies) {
-        this._blip(c, (a.x - px) * ppm, -(a.z - pz) * ppm, S, 'rgba(99,200,255,0.92)', 1);
+        const dx = a.x - px, dz = a.z - pz;
+        if (dx * dx + dz * dz > reach * reach) continue;
+        this._blip(c, dx * ppm, -dz * ppm, S, 'rgba(120,206,255,0.95)', 1);
       }
     }
 
@@ -233,7 +333,9 @@ export class Minimap {
     if (state.uavActive && state.actors) {
       for (const a of state.actors) {
         if (!a.alive) continue;
-        this._blip(c, (a.position.x - px) * ppm, -(a.position.z - pz) * ppm, S, 'rgba(255,90,65,0.95)', 1.05);
+        const dx = a.position.x - px, dz = a.position.z - pz;
+        if (dx * dx + dz * dz > reach * reach) continue;
+        this._blip(c, dx * ppm, -dz * ppm, S, 'rgba(255,104,80,0.95)', 1.05);
       }
     }
 
@@ -256,27 +358,52 @@ export class Minimap {
 
     c.restore();
 
-    /* --- player marker + view cone (screen space, always pointing up) ------- */
+    /* --- player marker + view cone (screen space, always pointing up) -------
+     * The cone is the second-most important mark on the map after the plan
+     * itself: it is the only thing that says which way the player is facing, and
+     * at 28% alpha with no edge it was invisible against anything. It is now the
+     * real horizontal FOV (±33°, close enough to the 80° base), reaches a third
+     * of the disc, and carries a defined edge on both flanks so the wedge has a
+     * shape rather than a haze. The marker inside it is outlined for the same
+     * reason the crosshair blades are: it has to survive on top of a footprint.
+     */
     c.save();
     c.translate(R, R);
-    const cone = S * 0.17;
+    const cone = S * 0.33;
+    const halfFov = 0.58;
     const grad = c.createLinearGradient(0, 0, 0, -cone);
-    grad.addColorStop(0, 'rgba(221,231,241,0.28)');
-    grad.addColorStop(1, 'rgba(221,231,241,0)');
-    c.fillStyle = grad;
+    grad.addColorStop(0, 'rgba(150,206,246,0.30)');
+    grad.addColorStop(0.55, 'rgba(150,206,246,0.11)');
+    grad.addColorStop(1, 'rgba(150,206,246,0)');
     c.beginPath();
     c.moveTo(0, 0);
-    c.arc(0, 0, cone, -Math.PI / 2 - 0.46, -Math.PI / 2 + 0.46);
+    c.arc(0, 0, cone, -Math.PI / 2 - halfFov, -Math.PI / 2 + halfFov);
     c.closePath();
+    c.fillStyle = grad;
     c.fill();
+    // The two flanks, drawn as lines so the wedge has a boundary. The arc at the
+    // far end is deliberately left open — a closed wedge reads as a fixed range,
+    // which is not what a facing indicator means.
+    c.strokeStyle = 'rgba(168,216,252,0.34)';
+    c.lineWidth = Math.max(1, S / 300);
+    for (const sgn of [-1, 1]) {
+      const a = -Math.PI / 2 + sgn * halfFov;
+      c.beginPath();
+      c.moveTo(0, 0);
+      c.lineTo(Math.cos(a) * cone, Math.sin(a) * cone);
+      c.stroke();
+    }
 
-    c.fillStyle = state.alive ? '#dde7f1' : '#ff5a41';
     c.beginPath();
-    c.moveTo(0, -S * 0.034);
-    c.lineTo(S * 0.024, S * 0.026);
-    c.lineTo(0, S * 0.012);
-    c.lineTo(-S * 0.024, S * 0.026);
+    c.moveTo(0, -S * 0.052);
+    c.lineTo(S * 0.036, S * 0.038);
+    c.lineTo(0, S * 0.016);
+    c.lineTo(-S * 0.036, S * 0.038);
     c.closePath();
+    c.fillStyle = state.alive ? 'rgba(236,244,252,0.96)' : '#ff5a41';
+    c.strokeStyle = 'rgba(4,7,11,0.85)';
+    c.lineWidth = Math.max(1, S / 150);
+    c.stroke();
     c.fill();
     c.restore();
 
@@ -288,8 +415,14 @@ export class Minimap {
       ` ${(Math.cos(this._yaw) * rr).toFixed(1)}px)`;
   }
 
+  /** A contact mark: a filled dot inside a dark ring, so it reads on the plan. */
   _blip(c, x, y, S, colour, scale) {
-    const r = Math.max(1.5, S * 0.016 * scale);
+    const r = Math.max(1.5, S * 0.018 * scale);
+    c.strokeStyle = 'rgba(4,7,11,0.8)';
+    c.lineWidth = Math.max(1, S / 190);
+    c.beginPath();
+    c.arc(x, y, r, 0, Math.PI * 2);
+    c.stroke();
     c.fillStyle = colour;
     c.beginPath();
     c.arc(x, y, r, 0, Math.PI * 2);
@@ -297,6 +430,76 @@ export class Minimap {
   }
 
   dispose() { this.plan = null; }
+}
+
+/* ---------------------------------------------------------------- morphology
+ *
+ * Binary morphology on an alpha channel, done with canvas compositing rather
+ * than pixel loops — `drawImage` at an integer offset is a straight blit with no
+ * resampling, so translating a mask is exact.
+ *
+ *   dilate  = union of translated copies       (source-over)
+ *   erode   = intersection of translated copies (destination-in)
+ *   close   = dilate then erode, which fills gaps without growing the outline
+ *
+ * The structuring element is a SQUARE, and squares are separable: dilating by a
+ * (2r+1) square is a horizontal pass followed by a vertical one, 4r+2 blits
+ * instead of the (2r+1)^2 a two-dimensional kernel needs. At r=6 that is 26
+ * blits per operation rather than 169 — the difference between a boot cost
+ * worth thinking about and one that is not. A disc would be marginally rounder
+ * at the corners of a building; at four plan pixels per metre nobody can see it.
+ */
+
+function blankPlan() {
+  const c = document.createElement('canvas');
+  c.width = c.height = MAP_PX;
+  return c;
+}
+
+/** One separable half-pass. `axis` is 0 for horizontal, 1 for vertical. */
+function sweep(src, r, axis, intersect) {
+  const out = blankPlan();
+  const g = out.getContext('2d');
+  g.drawImage(src, 0, 0);
+  if (intersect) g.globalCompositeOperation = 'destination-in';
+  for (let d = -r; d <= r; d++) {
+    if (d === 0) continue;
+    g.drawImage(src, axis ? 0 : d, axis ? d : 0);
+  }
+  return out;
+}
+
+function dilate(src, r) {
+  if (r <= 0) return src;
+  return sweep(sweep(src, r, 0, false), r, 1, false);
+}
+
+function erode(src, r) {
+  if (r <= 0) return src;
+  return sweep(sweep(src, r, 0, true), r, 1, true);
+}
+
+function closeMask(src, r) { return erode(dilate(src, r), r); }
+
+/** a AND NOT b. */
+function subtract(a, b) {
+  const out = blankPlan();
+  const g = out.getContext('2d');
+  g.drawImage(a, 0, 0);
+  g.globalCompositeOperation = 'destination-out';
+  g.drawImage(b, 0, 0);
+  return out;
+}
+
+/** Flood a mask with one colour, keeping its alpha. */
+function tint(mask, colour) {
+  const out = blankPlan();
+  const g = out.getContext('2d');
+  g.drawImage(mask, 0, 0);
+  g.globalCompositeOperation = 'source-in';
+  g.fillStyle = colour;
+  g.fillRect(0, 0, MAP_PX, MAP_PX);
+  return out;
 }
 
 /** Shortest-arc damping so the map never spins the long way round zero. */
