@@ -161,6 +161,21 @@ export const Config = {
     botCount: 7,
   },
 
+  /**
+   * Authored art assets built by tools/build_assets.py into public/.
+   * `useAuthored: false` falls back to the fully procedural path, which is a
+   * complete implementation rather than a placeholder — useful for comparing
+   * the two, and the automatic behaviour if the files are ever missing.
+   */
+  assets: {
+    useAuthored: true,
+    environment: 'daysky',
+    environmentIntensity: 1.0,
+    /** Metres of world per texture tile, per surface class. */
+    groundTileMetres: 3.0,
+    metalTileMetres: 1.6,
+  },
+
   debug: {
     /** Set by the headless harness; suppresses development-only overlays. */
     captureMode: false,

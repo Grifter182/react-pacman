@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { makeMaterial } from '../materials/TextureFactory.js';
+import { loadTextureSet } from '../materials/AssetLibrary.js';
 import { Config, QualityTier } from '../core/Config.js';
 
 import { ProxySet, rng, fbm2, FACE_ALL, FACE_NY } from './kit/Geo.js';
@@ -136,6 +137,7 @@ export class LevelModule {
     this.detail = { [QualityTier.LOW]: 0, [QualityTier.MEDIUM]: 1, [QualityTier.HIGH]: 2, [QualityTier.ULTRA]: 3 }[tier] ?? 1;
 
     this._buildMaterials();
+    await this._applyAuthoredMaterials();
 
     this.batch = new Batcher(44);
     this.proxy = new ProxySet();
@@ -184,6 +186,68 @@ export class LevelModule {
    * variants deliberately reuse the *same* preset+seed so they share one baked
    * texture set and differ only by material colour — that is free variety.
    */
+  /**
+   * Upgrade selected surfaces from procedural bakes to authored photographic
+   * texture sets.
+   *
+   * The material OBJECTS are mutated in place rather than replaced, because
+   * every mesh, batch and instance built later holds a reference to them —
+   * swapping the reference here would upgrade the catalogue and leave the
+   * world still pointing at the old materials.
+   *
+   * Tiling is inherited from the procedural map it replaces. Those repeats
+   * were chosen against each surface's real size in metres, so reusing them
+   * keeps texel density correct instead of re-deriving it and getting a
+   * different answer.
+   *
+   * Failure is non-fatal: without the files the procedural bake stands, which
+   * is a complete implementation in its own right.
+   */
+  async _applyAuthoredMaterials() {
+    if (Config.assets?.useAuthored === false) return;
+    const M = this.materials;
+
+    const swaps = [
+      { set: 'rock063', targets: ['sand', 'gravel'], normalScale: 1.0 },
+      { set: 'metal053c', targets: ['metal', 'corrugated', 'ironwork'], normalScale: 0.85 },
+    ];
+
+    try {
+      const aniso = this.engine?.maxAnisotropy ?? 8;
+      await Promise.all(swaps.map(async ({ set, targets, normalScale }) => {
+        const src = await loadTextureSet(set, { anisotropy: aniso });
+        for (const key of targets) {
+          const mat = M[key];
+          if (!mat) continue;
+          // Inherit the repeat the procedural map was using.
+          const rep = mat.map?.repeat?.clone() ?? new THREE.Vector2(1, 1);
+          const map = src.map.clone();
+          const normalMap = src.normalMap.clone();
+          const ormMap = src.ormMap.clone();
+          for (const t of [map, normalMap, ormMap]) {
+            t.repeat.copy(rep);
+            t.needsUpdate = true;
+          }
+          mat.map?.dispose?.();
+          mat.map = map;
+          mat.normalMap = normalMap;
+          mat.aoMap = ormMap;
+          mat.roughnessMap = ormMap;
+          mat.metalnessMap = ormMap;
+          // The scalars multiply the maps, so they must be 1 for the packed
+          // channels to survive. Any tint the recipe applied stays on .color.
+          mat.roughness = 1.0;
+          mat.metalness = 1.0;
+          mat.normalScale.set(normalScale, normalScale);
+          mat.userData.authored = set;
+          mat.needsUpdate = true;
+        }
+      }));
+    } catch (err) {
+      console.warn('[level] authored textures unavailable, keeping procedural', err?.message || err);
+    }
+  }
+
   _buildMaterials() {
     const M = this.materials;
     const S = 512;
