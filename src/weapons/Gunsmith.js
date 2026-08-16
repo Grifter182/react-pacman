@@ -963,10 +963,16 @@ export function buildWeapon(def, mats) {
  * Screen targets are in NDC, so they hold at any aspect and any FOV.
  */
 function solveHipPose(meshes, muzzleLocal, rot) {
-  const BUTT_CLEAR = 0.175;   // metres from the eye to the rearmost vertex
-  const BOTTOM_NDC = -1.05;   // lowest vertex, a hair past the bottom edge
-  const RIGHT_NDC = 0.99;     // rightmost vertex, just inside the right edge
-  const MUZZLE_NDC = -0.06;   // muzzle a touch inboard of the crosshair
+  // These targets decide the weapon's APPARENT SIZE, not just whether it fits.
+  // Solving the silhouette out to the frame edges (the previous -1.05 / 0.99
+  // with a 17.5cm butt clearance) is a maximisation, not a framing: it put the
+  // buttstock a hand's width from the eye and let the weapon span the full
+  // diagonal. A viewmodel should read as held at the shoulder and occupy the
+  // lower-right quadrant, leaving the sightline and the upper frame clear.
+  const BUTT_CLEAR = 0.30;    // metres from the eye to the rearmost vertex
+  const BOTTOM_NDC = -0.98;   // lowest vertex, just clipped by the bottom edge
+  const RIGHT_NDC = 0.78;     // keep the silhouette clear of the right edge
+  const MUZZLE_NDC = 0.02;    // muzzle sits fractionally right of the crosshair
   const NEAR = 0.02;
 
   const fovY = THREE.MathUtils.degToRad(Config.camera.viewmodelFov);
