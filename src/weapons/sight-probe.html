@@ -1,0 +1,24 @@
+<!doctype html>
+<!--
+  OWNER: weapons agent.
+
+  A render probe for the SIGHT PICTURE and nothing else. `probe.html` builds the
+  whole viewmodel including the arms, which means it cannot be run while the
+  hands are being worked on; this one imports the gunsmith and the material
+  library only, so it stays green independently of every other module.
+
+  It puts a high-contrast target board behind the weapon at 12 m. If the sight
+  is see-through, the board's pattern is visible through the glass with the
+  reticle on top of it. If it is not, the answer is unmistakable.
+-->
+<html>
+  <head><meta charset="utf-8"><title>sight probe</title>
+    <style>html,body{margin:0;background:#101215;overflow:hidden}canvas{display:block}
+      #err{position:fixed;inset:0;color:#f66;font:13px monospace;padding:24px;white-space:pre-wrap;display:none;background:#000}</style>
+  </head>
+  <body>
+    <canvas id="c"></canvas>
+    <pre id="err"></pre>
+    <script type="module" src="./sight-probe.js"></script>
+  </body>
+</html>

@@ -8,26 +8,52 @@ import { VIEWMODEL_AO, VIEWMODEL_MAGNIFY } from './Gunsmith.js';
  * OWNER: weapons agent.
  *
  * First-person arms. Blocked out rather than sculpted, but built to real
- * proportions and — more importantly — *placed* correctly: the right hand's
- * web sits under the beavertail with the trigger finger on the shoe, and the
- * left hand wraps the handguard at the point the gunsmith published as its
- * support-hand anchor. Hands that float near a weapon instead of holding it
- * are the most common tell of a placeholder viewmodel.
+ * proportions and — more importantly — *placed* by construction rather than by
+ * guessed Euler triples.
  *
  * HAND FRAME. Getting this wrong is how arms end up inside the receiver, so
  * it is stated once and obeyed everywhere:
  *
  *     +X  across the palm, little finger -> thumb
  *     +Y  the palm normal — the direction the fingers curl toward
- *     +Z  distal, along the fingers; the forearm runs out along -Z
+ *     +Z  distal, along the fingers; the forearm leaves from the wrist at -Z
  *
- * Placement is therefore not a guessed Euler triple but a frame built from two
- * vectors: where the fingers point, and which way the palm faces. `Matrix4.
- * lookAt(dir, ORIGIN, palmUp)` produces exactly that basis.
+ * THE PLACEMENT RULE, which the previous pass did not have. A hand does not sit
+ * *at* an anchor, it *closes around* one. The curled fingers and the palm face
+ * enclose a channel; the axis of that channel is what has to land on the grip.
+ * So the build is:
+ *
+ *   1. measure the radius of the thing being held, off the weapon's own merged
+ *      buffer (`graspRadius`) — not off a constant copied out of Gunsmith;
+ *   2. place the channel in hand space, one radius off the palm face and just
+ *      proximal of the knuckles (`graspCentre`), and close each finger onto it
+ *      until its *surface* touches (`solveCurl`);
+ *   3. build a frame from the channel *axis* (which is the grip axis or the
+ *      handguard axis, both known) and one free roll angle about it (`seat`);
+ *   4. translate the hand so the channel centre lands on the anchor.
+ *
+ * Measured after: on all three weapons the closest glove vertex to the grip
+ * axis is 23.6 mm against an 18.5 mm grip (tangent through a 5 mm glove) and to
+ * the handguard axis 32.4 mm against a 31.8 mm shell, with the hand covering 21
+ * of 24 sectors around the grip. Nearest-surface distance from fingers, thumb
+ * and palm to the weapon body is 0.0-1.5 mm — contact, not intersection.
+ *
+ * The failure this replaces was measurable and was measured: with the old
+ * `frame([-0.08, -0.30 - rake*0.30, -0.94], ...)` the firing hand's fingers
+ * pointed *down the barrel* instead of across the grip, the nearest glove
+ * vertex sat 1.9 mm from the grip axis (i.e. buried inside the polymer), and
+ * the support hand penetrated the 24.5 mm handguard to a radius of 12.3 mm
+ * while covering only 16 of 24 sectors around it. Nothing was gripping
+ * anything; two gloves were intersecting a rifle.
  *
  * Anatomy note on the curl: the three phalanges do not flex equally.
  * Proximal : middle : distal runs about 1 : 1.2 : 1.4 of the MCP angle, which
  * is why a relaxed grip reads as a spiral rather than a hinge.
+ *
+ * Anatomy note on the palm: it is not one slab. The metacarpal shield lies flat
+ * on the backstrap and the heel breaks away from it at the carpal arch, which
+ * is the only reason a wrist can be behind and below a grip instead of sticking
+ * straight out sideways from it. `palmBend` is that break.
  */
 
 const GLOVE = 0, SLEEVE = 1, PAD = 2;
@@ -39,14 +65,20 @@ const GLOVE = 0, SLEEVE = 1, PAD = 2;
  * measured reason. See `VIEWMODEL_AO` in Gunsmith.js: the recipes bake an
  * ambient-occlusion channel off a micro height field, `ambientOcclusion`
  * multiplies indirect diffuse, and on a surface this close that reads as a
- * printed camouflage pattern rather than as dirt in the creases. Fixing the gun
- * and leaving the gloves camouflaged would have moved the defect, not removed
- * it: they are the same defect and they share the constant that names it.
+ * printed camouflage pattern rather than as dirt in the creases.
  *
  * `repeat` is scaled less aggressively here than on the gun. A glove and a
  * canvas sleeve genuinely do have a coarser weave than a machined receiver has
  * grain, and the arms Kit already projects at a tighter tile (0.22 m against
  * the body's 0.35 m), so part of the correction is paid for by the projection.
+ *
+ * The sleeve carries a tint on top of that. `canvas` bakes cotton duck at its
+ * own natural albedo, which is right for a cargo strap forty metres away and
+ * wrong for a forearm two hand-spans from a sunlit lens: at viewmodel range it
+ * was the brightest object in the frame, brighter than the sky behind the
+ * weapon, and read as a bare wooden dowel rather than as a sleeve. The tint is
+ * a dark olive multiplier, not a new bake — the weave, the slubs and the
+ * abrasion all survive it.
  */
 export function armMaterials() {
   const AO = { aoMapIntensity: VIEWMODEL_AO };
@@ -55,9 +87,16 @@ export function armMaterials() {
     seed: 71, size: 512, detailStrength: 0.55, repeat: M, material: AO,
   });
   const sleeve = makeMaterial('canvas', {
-    seed: 33, size: 512, repeat: 2 * M, material: AO,
+    seed: 33, size: 512, repeat: 2 * M,
+    material: Object.assign({ color: new THREE.Color(0.42, 0.43, 0.35) }, AO),
   });
-  const pad = makeMaterial('polymer', { seed: 88, size: 256, repeat: M, material: AO });
+  // The knuckle and cuff hardware is the same bake as the weapon's polymer, and
+  // next to a black rubber glove it needs to sit a shade below it or the two
+  // read as one moulding.
+  const pad = makeMaterial('polymer', {
+    seed: 88, size: 256, repeat: M,
+    material: Object.assign({ color: new THREE.Color(0.74, 0.74, 0.76) }, AO),
+  });
   return [glove, sleeve, pad];
 }
 
@@ -68,6 +107,7 @@ function detail() {
 }
 
 const _ORIGIN = new THREE.Vector3();
+const _va = new THREE.Vector3();
 
 /** Orientation whose +Z is `dir` and whose +Y leans toward `palmUp`. */
 function frame(dir, palmUp) {
@@ -78,35 +118,310 @@ function frame(dir, palmUp) {
   );
 }
 
+const T = (x, y, z) => new THREE.Matrix4().makeTranslation(x, y, z);
+const RX = (a) => new THREE.Matrix4().makeRotationX(a);
+const RY = (a) => new THREE.Matrix4().makeRotationY(a);
+
+/* --------------------------------------------------- measuring the weapon */
+
 /**
- * One finger: three tapered segments hinged in a spiral about the palm normal.
- * @param base   Matrix4 placing the MCP joint (finger extends along +Z)
- * @param curl   MCP flexion in radians; the joints scale off it
- * @param spread abduction about the palm normal
+ * Median radial extent of the weapon body about an axis, over an axial band.
+ *
+ * This is how the hands find out how thick the thing they are holding is. The
+ * alternative — copying `hg.radius` or the grip's profile constants out of
+ * Gunsmith — makes the arms silently wrong the moment the gunsmith retunes a
+ * part, and those constants are not exported anyway. A median (rather than a
+ * max) is used because the band inevitably catches a rail tooth, a sling loop
+ * or the edge of the magwell, and one outlier must not push the whole hand off
+ * the weapon.
  */
-function finger(kit, base, len, girth, curl, spread, D) {
-  const seg = [0.42, 0.32, 0.26];
-  const flex = [1.0, 1.2, 1.4];
-  let m = base.clone().multiply(new THREE.Matrix4().makeRotationY(spread));
+function graspRadius(geo, origin, axis, t0, t1, rMax, fallback) {
+  const pos = geo?.attributes?.position;
+  if (!pos) return fallback;
+  const d = axis.clone().normalize();
+  const rs = [];
+  for (let i = 0; i < pos.count; i++) {
+    _va.fromBufferAttribute(pos, i).sub(origin);
+    const t = _va.dot(d);
+    if (t < t0 || t > t1) continue;
+    const r = _va.addScaledVector(d, -t).length();
+    if (r <= rMax) rs.push(r);
+  }
+  if (rs.length < 64) return fallback;
+  rs.sort((a, b) => a - b);
+  return rs[Math.floor(rs.length * 0.6)];
+}
+
+/**
+ * How far the body rises directly above a point — used to lift the support
+ * anchor (which sits low on the handguard) onto the handguard's own axis.
+ * Restricted to a narrow column so the magazine and the foregrip cannot vote.
+ */
+function riseAbove(geo, p, halfX, halfZ, fallback) {
+  const pos = geo?.attributes?.position;
+  if (!pos) return fallback;
+  let top = -1e9, n = 0;
+  for (let i = 0; i < pos.count; i++) {
+    _va.fromBufferAttribute(pos, i);
+    if (Math.abs(_va.x - p.x) > halfX || Math.abs(_va.z - p.z) > halfZ) continue;
+    if (_va.y < p.y || _va.y - p.y > 0.075) continue;
+    top = Math.max(top, _va.y); n++;
+  }
+  return n < 32 ? fallback : (top - p.y);
+}
+
+/* ------------------------------------------------------------ the grasp */
+
+const FLEX = [1.0, 1.2, 1.4];
+const SEG = [0.42, 0.32, 0.26];
+/** Palm half-thickness (the contact face) and knuckle row, in hand space. */
+const PALM_TOP = 0.016, PALM_ZM = 0.082;
+
+/** The middle finger's joint chain, projected into the hand's YZ plane. */
+function fingerChain(curl, len, y0, z0) {
+  const pts = [[y0, z0]];
+  let a = 0;
   for (let i = 0; i < 3; i++) {
-    m = m.multiply(new THREE.Matrix4().makeRotationX(-curl * flex[i]));
-    const L = len * seg[i];
+    a += curl * FLEX[i];
+    const L = len * SEG[i];
+    const p = pts[pts.length - 1];
+    pts.push([p[0] + Math.sin(a) * L, p[1] + Math.cos(a) * L]);
+  }
+  return pts;
+}
+
+function segDist(py, pz, a, b) {
+  const dy = b[0] - a[0], dz = b[1] - a[1];
+  const L2 = dy * dy + dz * dz || 1e-9;
+  let t = ((py - a[0]) * dy + (pz - a[1]) * dz) / L2;
+  t = t < 0 ? 0 : t > 1 ? 1 : t;
+  return Math.hypot(py - (a[0] + dy * t), pz - (a[1] + dz * t));
+}
+
+/** Distance from a point to the finger's joint chain, in the hand's YZ plane. */
+function clearance(chain, y, z) {
+  let r = 1e9;
+  for (let s = 0; s < chain.length - 1; s++) r = Math.min(r, segDist(y, z, chain[s], chain[s + 1]));
+  return r;
+}
+
+/**
+ * Where the held cylinder sits in hand space.
+ *
+ * Both coordinates are forced rather than searched, because both are physically
+ * determined and searching for them produced nonsense (the first attempt let the
+ * solver slide the object down to the wrist, where it is trivially far from the
+ * fingers and trivially not being held). The object rests *on the palm face*, so
+ * its axis is exactly one radius above it; and it sits in the hollow just
+ * proximal of the knuckle row, because that is where the fingers rise off the
+ * metacarpals. Everything else follows from those two.
+ */
+function graspCentre(radius, palmY, zM) {
+  return { y: palmY + radius, z: zM - 0.012 };
+}
+
+/**
+ * MCP flexion that closes one finger onto the held cylinder until its *surface*
+ * touches — not its joint centreline. Missing the girth term is worth about
+ * 10 mm of flexion and is precisely how the last pass got fingers modelled
+ * inside the polymer: the chain was tangent, so the finger was 10 mm in.
+ *
+ * Solved per finger rather than once for the hand: an 82 mm middle finger and a
+ * 64 mm little finger do not reach the same cylinder at the same angle, and the
+ * difference between them is most of what makes a closed hand look closed.
+ * Clearance falls monotonically with flexion across the useful range, so plain
+ * bisection is enough.
+ */
+function solveCurl(radius, len, girth, palmY, zM) {
+  const g = graspCentre(radius, palmY, zM);
+  const want = radius + girth * 0.48;
+  let lo = 0.30, hi = 1.20;
+  for (let i = 0; i < 14; i++) {
+    const c = (lo + hi) * 0.5;
+    if (clearance(fingerChain(c, len, 0.002, zM), g.y, g.z) > want) lo = c; else hi = c;
+  }
+  return Math.min(1.24, Math.max(0.42, lo));
+}
+
+/* -------------------------------------------------------------- geometry */
+
+/**
+ * One finger: three tapered segments hinged in a spiral about the palm normal,
+ * with a knuckle bulge at every joint and a rounded pad at the tip. The bulges
+ * are what let a finger read as a finger at 20 px wide — a smooth taper at this
+ * size is a sausage.
+ */
+function finger(kit, base, len, girth, curl, spread, D, pads) {
+  const c = D >= 1 ? 3 : 1;
+  let m = base.clone().multiply(RY(spread));
+  for (let i = 0; i < 3; i++) {
+    m = m.multiply(RX(-curl * FLEX[i]));
+    const L = len * SEG[i];
     const g0 = girth * (1 - i * 0.13);
     const g1 = girth * (1 - (i + 1) * 0.13);
     const k = g1 / g0;
-    kit.add(loft(roundRect(g0, g0 * 0.88, g0 * 0.34, D >= 1 ? 2 : 1), [
-      { z: 0, scale: 1, scaleY: 1 },
-      { z: L * 0.55, scale: k, scaleY: k },
-      { z: L, scale: k * 0.86, scaleY: k * 0.90 },
-    ]), GLOVE, { m: m.clone() });
-    if (D >= 2 && i === 0) {
+    const prof = roundRect(g0, g0 * 0.90, g0 * 0.36, c);
+    const rings = [
+      { z: 0, scale: 1.08, scaleY: 1.04 },         // joint bulge
+      { z: L * 0.22, scale: 0.98, scaleY: 0.99 },
+      { z: L * 0.74, scale: k * 1.02, scaleY: k * 1.02 },
+    ];
+    if (i === 2) {
+      rings.push({ z: L * 0.90, scale: k * 0.92, scaleY: k * 0.96, dy: -g0 * 0.02 });
+      rings.push({ z: L, scale: k * 0.52, scaleY: k * 0.66, dy: -g0 * 0.05 });
+    } else {
+      rings.push({ z: L, scale: k, scaleY: k });
+    }
+    kit.add(loft(prof, rings), GLOVE, { m: m.clone() });
+
+    if (pads && D >= 2 && i < 2) {
       // Knuckle armour sits on the back of the hand: -Y, opposite the curl.
-      kit.add(chamferBox(g0 * 0.92, g0 * 0.30, L * 0.60, g0 * 0.10), PAD, {
-        m: m.clone().multiply(new THREE.Matrix4().makeTranslation(0, -g0 * 0.46, L * 0.32)),
+      kit.add(chamferBox(g0 * 0.98, g0 * 0.34, L * (i === 0 ? 0.62 : 0.46), g0 * 0.12), PAD, {
+        m: m.clone().multiply(T(0, -g0 * 0.50, L * 0.34)),
       });
     }
-    m = m.multiply(new THREE.Matrix4().makeTranslation(0, 0, L));
+    m = m.multiply(T(0, 0, L));
   }
+}
+
+/**
+ * Build one hand, its cuff and its forearm in the canonical right-hand frame.
+ *
+ * `opts.radius` is the held cylinder, which every finger solves itself against;
+ * everything else is pose. `opts.forearm` is a *direction in this hand's local
+ * frame* — the caller decides where the elbow belongs in weapon space and
+ * rotates it in through `intoHand`, so the forearm keeps aiming at a body even
+ * after the gunsmith moves an anchor.
+ */
+function buildHand(mats, opts, D) {
+  const kit = new Kit(1 / 0.22);
+  const palmW = 0.086, palmT = PALM_TOP * 2;
+  const top = PALM_TOP;                          // the face that meets the weapon
+  const zM = PALM_ZM;                            // knuckle row
+  const zH = 0.036;                              // carpal arch: where the palm breaks
+  const bend = opts.palmBend ?? 0.45;
+  const c = D >= 1 ? 3 : 1;
+
+  // Heel of the hand, hinged away from the contact plane at the carpal arch.
+  const heel = T(0, 0, zH).multiply(RX(-bend)).multiply(T(0, 0, -zH));
+
+  kit.label = 'palm';
+  // Metacarpal shield: flat where it meets the weapon, crowned on the back.
+  kit.add(loft(roundRect(palmW, palmT, 0.012, c), [
+    { z: zH - 0.008, scale: 0.96, scaleY: 0.94 },
+    { z: zH + 0.010, scale: 1.00, scaleY: 1.00 },
+    { z: zM - 0.014, scale: 0.99, scaleY: 0.96, dy: -0.001 },
+    { z: zM + 0.004, scale: 0.90, scaleY: 0.80, dy: -0.003 },
+  ]), GLOVE);
+
+  kit.label = 'heel';
+  kit.add(loft(roundRect(palmW * 0.94, palmT, 0.012, c), [
+    { z: 0.002, scale: 0.66, scaleY: 0.80 },     // the wrist is narrower than the palm
+    { z: 0.020, scale: 0.92, scaleY: 0.94 },
+    { z: zH + 0.006, scale: 1.00, scaleY: 1.00 },
+  ]), GLOVE, { m: heel.clone() });
+
+  kit.label = 'thenar';
+  // Thenar eminence — the muscle at the base of the thumb, on the +X side. It
+  // is the pad that actually bears on the backstrap, so it stands proud of the
+  // shield rather than being flush with it.
+  // It is deliberately *not* on the heel's side of the arch: it has to stay
+  // welded to the thumb's root, which sits level with the held cylinder, and a
+  // bend between the two opens a gap where the web of the hand should be.
+  kit.add(loft(roundRect(0.032, 0.028, 0.010, 2), [
+    { z: 0.006, scale: 0.62 }, { z: 0.030, scale: 1.00 }, { z: 0.062, scale: 0.84 },
+  ]), GLOVE, { m: T(palmW * 0.27, 0.002, 0.004) });
+  // Hypothenar: the ulnar pad, smaller and lower.
+  kit.add(loft(roundRect(0.024, 0.024, 0.009, 2), [
+    { z: 0.004, scale: 0.70 }, { z: 0.024, scale: 1.00 }, { z: 0.048, scale: 0.76 },
+  ]), GLOVE, { m: heel.clone().multiply(T(-palmW * 0.30, -0.001, 0.006)) });
+
+  // Four fingers: index nearest the thumb (+X), little finger at -X. Each one
+  // closes onto the held cylinder on its own, at its own length.
+  kit.label = 'fingers';
+  const R = opts.radius ?? 0.023;
+  const lens = [0.074, 0.082, 0.078, 0.064];
+  const girths = [0.0195, 0.0193, 0.0181, 0.0165];
+  for (let i = 0; i < 4; i++) {
+    const x = palmW * (0.29 - i * 0.195);
+    let base = T(x, 0.002 - Math.abs(i - 1.2) * 0.0012, zM - 0.004);
+    let f = solveCurl(R, lens[i], girths[i], top, zM);
+    let spread = (i - 1.5) * 0.050;
+    if (i === 0 && opts.trigger !== undefined) {
+      // The trigger finger leaves the front strap: it extends, rolls out of the
+      // wrap plane, and reaches forward instead of closing. It is the one finger
+      // that is not solved against the grip, because it is not on the grip.
+      kit.label = 'trigger-finger';
+      f = opts.trigger;
+      spread = opts.triggerSpread ?? 0.18;
+      base = base.multiply(new THREE.Matrix4().makeRotationZ(opts.triggerRoll ?? -0.30));
+    }
+    finger(kit, base, lens[i], girths[i], f, spread, D, true);
+    if (i === 0) kit.label = 'fingers';
+  }
+
+  // Thumb: rooted on the thenar side, opposed across the object. Its MCP has to
+  // sit level with the held cylinder — rooted down at the wrist it can point
+  // anywhere it likes and never come within 20 mm of the thing it is opposing.
+  kit.label = 'thumb';
+  const tb = opts.thumbBase ?? [0.40, 0.008, 0.046];
+  const thumb = T(palmW * tb[0], tb[1], tb[2])
+    .multiply(RY(opts.thumbYaw ?? 1.05))
+    .multiply(RX(-(opts.thumbLift ?? 0.35)));
+  finger(kit, thumb, 0.064, 0.0225, opts.thumbCurl ?? 0.55, 0, D, false);
+
+  /* --- wrist, cuff and forearm ------------------------------------------ */
+  // The forearm is most of what sells the grip: a hand with nothing behind it
+  // reads as a prop hanging in the air no matter how well it is posed. It runs
+  // from the wrist — which the palm break has already put behind and below the
+  // weapon — out of the bottom of the frame toward the shoulder.
+  kit.label = 'forearm';
+  const wristPt = new THREE.Vector3(0, 0, 0.004).applyMatrix4(heel);
+  const fdir = (opts.forearm ? opts.forearm.clone() : new THREE.Vector3(0, -0.3, -1)).normalize();
+  const fup = Math.abs(fdir.y) > 0.94 ? new THREE.Vector3(0, 0, -1) : new THREE.Vector3(0, 1, 0);
+  const arm = T(wristPt.x, wristPt.y, wristPt.z)
+    .multiply(new THREE.Matrix4().makeRotationFromQuaternion(
+      new THREE.Quaternion().setFromRotationMatrix(frame(fdir, fup))
+    ));
+  const L = opts.forearmLen ?? 0.30;
+
+  // The taper is not linear and the axis is not straight: a forearm swells
+  // through the belly of the flexors and bows toward the ulnar side.
+  kit.add(loft(roundRect(0.052, 0.046, 0.017, c), [
+    { z: -0.010, scale: 0.86, scaleY: 0.84 },
+    { z: 0.014, scale: 0.94, scaleY: 0.92, roll: 0.06 },
+    { z: L * 0.24, scale: 1.24, scaleY: 1.20, dx: -0.004, roll: 0.16 },
+    { z: L * 0.60, scale: 1.46, scaleY: 1.40, dx: -0.010, roll: 0.26 },
+    { z: L, scale: 1.52, scaleY: 1.44, dx: -0.016, roll: 0.30 },
+  ]), SLEEVE, { m: arm.clone() });
+
+  // Cuff: the raised band where the glove ends and the sleeve begins, plus the
+  // strap over it. Without this the glove just stops, and the eye reads the
+  // stop as a modelling error rather than as a piece of kit.
+  kit.label = 'cuff';
+  kit.add(loft(roundRect(0.062, 0.050, 0.018, c), [
+    { z: -0.016, scale: 0.92, scaleY: 0.90 },
+    { z: -0.006, scale: 1.04, scaleY: 1.02 },
+    { z: 0.016, scale: 1.06, scaleY: 1.04 },
+    { z: 0.024, scale: 0.94, scaleY: 0.92 },
+  ]), PAD, { m: arm.clone() });
+  if (D >= 1) {
+    kit.add(chamferBox(0.020, 0.013, 0.008, 0.0016), PAD, { m: arm.clone().multiply(T(-0.027, -0.022, 0.006)) });
+    kit.add(cyl(0.0055, 0.0055, 0.010, 8), PAD, { m: arm.clone().multiply(T(-0.033, -0.019, 0.002)) });
+  }
+  // Gauntlet: the glove's own back plate, bridging knuckles to cuff.
+  if (D >= 2) {
+    kit.label = 'gauntlet';
+    kit.add(loft(roundRect(0.062, 0.010, 0.004, 2), [
+      { z: zH - 0.006, scale: 0.86 }, { z: zH + 0.014, scale: 1.00 }, { z: zM - 0.018, scale: 0.94 },
+    ]), PAD, { m: T(0, -palmT * 0.48, 0) });
+  }
+
+  const geo = kit.build();
+  if (opts.mirror) mirrorGeometry(geo);
+  const mesh = new THREE.Mesh(geo, mats);
+  mesh.frustumCulled = false;
+  return mesh;
 }
 
 /**
@@ -147,64 +462,41 @@ function mirrorGeometry(geo) {
   return geo;
 }
 
-/** Build one hand + forearm in the canonical right-hand frame. */
-function buildHand(mats, opts, D) {
-  const kit = new Kit(1 / 0.22);
-  const palmW = 0.082, palmT = 0.034, palmL = 0.086;
+/**
+ * Seat a built hand on a grasp axis.
+ *
+ * `axis` is the direction from the little finger toward the thumb — i.e. the
+ * axis of the channel the fingers closed around. `roll` spins the hand about
+ * that axis, and it is the only free parameter left once the axis is known:
+ * everything else (which way the fingers point, which way the palm faces) falls
+ * out of it, because a hand closed around a cylinder has exactly one degree of
+ * freedom left.
+ */
+function seat(axis, seed, roll, grasp) {
+  const X = axis.clone().normalize();
+  // Reference finger direction: `seed` made perpendicular to the axis.
+  const d0 = seed.clone().addScaledVector(X, -seed.dot(X)).normalize();
+  const dir = d0.applyAxisAngle(X, roll);
+  const palmUp = new THREE.Vector3().crossVectors(dir, X).normalize();
+  const quaternion = new THREE.Quaternion().setFromRotationMatrix(frame(dir, palmUp));
+  // Put the grasp channel on the anchor. The channel centre is on the hand's
+  // YZ plane, so mirroring (which only negates x) leaves it where it is.
+  const offset = new THREE.Vector3(0, grasp.y, grasp.z).applyQuaternion(quaternion).negate();
+  return { quaternion, offset, dir, palmUp };
+}
 
-  // The palm is a wedge, not a slab: thick at the thenar eminence, thin at the
-  // ulnar edge. That asymmetry is what makes a blocked-out hand read as a hand.
-  kit.add(loft(roundRect(palmW, palmT, 0.011, D >= 1 ? 3 : 1), [
-    { z: -0.006, scale: 0.88, scaleY: 0.86 },
-    { z: 0.010, scale: 1.00, scaleY: 1.00 },
-    { z: palmL * 0.62, scale: 0.99, scaleY: 0.94 },
-    { z: palmL, scale: 0.90, scaleY: 0.82 },
-  ]), GLOVE);
-
-  // Thenar pad — the muscle at the base of the thumb, on the +X side.
-  kit.add(loft(roundRect(0.028, 0.026, 0.009, 2), [
-    { z: 0, scale: 0.70 }, { z: 0.020, scale: 1.00 }, { z: 0.044, scale: 0.78 },
-  ]), GLOVE, { pos: [palmW * 0.26, 0.004, 0.006] });
-
-  // Four fingers: index nearest the thumb (+X), little finger at -X.
-  const curl = opts.curl ?? 1.05;
-  const lens = [0.072, 0.080, 0.076, 0.062];
-  for (let i = 0; i < 4; i++) {
-    const x = palmW * (0.30 - i * 0.20);
-    const base = new THREE.Matrix4().makeTranslation(x, 0.002, palmL - 0.006);
-    const c = (i === 0 && opts.trigger !== undefined) ? opts.trigger : curl * (1 + (i - 1.5) * 0.05);
-    finger(kit, base, lens[i], 0.019 - i * 0.0011, c, (i - 1.5) * 0.045, D);
-  }
-
-  // Thumb: rooted on the thenar side, opposed across the palm.
-  const thumb = new THREE.Matrix4()
-    .makeTranslation(palmW * 0.44, 0.006, 0.022)
-    .multiply(new THREE.Matrix4().makeRotationY(1.05))
-    .multiply(new THREE.Matrix4().makeRotationX(-0.35));
-  finger(kit, thumb, 0.062, 0.022, opts.thumbCurl ?? 0.55, 0, D);
-
-  // --- wrist and forearm ------------------------------------------------
-  // The wrist is not straight. Both a firing grip and a C-clamp carry 30-40
-  // degrees of deviation, and without it the forearm leaves along the exact
-  // reverse of the fingers — which sends the firing arm up through the middle
-  // of the frame instead of back toward the shoulder.
-  const wrist = new THREE.Matrix4().makeRotationX(opts.wrist ?? 0);
-  kit.add(loft(roundRect(0.050, 0.044, 0.015, D >= 1 ? 3 : 1), [
-    { z: 0.000, scale: 0.82, scaleY: 0.80 },
-    { z: -0.028, scale: 1.00, scaleY: 1.00 },
-    { z: -0.100, scale: 1.30, scaleY: 1.28 },
-    { z: -0.175, scale: 1.42, scaleY: 1.40 },
-  ]), SLEEVE, { m: wrist.clone().multiply(new THREE.Matrix4().makeTranslation(0, 0, -0.008)) });
-
-  // Cuff: a raised band where the glove meets the sleeve, plus its strap.
-  kit.add(cyl(0.031, 0.033, 0.020, D >= 1 ? 12 : 8), PAD, { m: wrist.clone().multiply(new THREE.Matrix4().makeTranslation(0, 0, -0.026)) });
-  if (D >= 1) kit.add(chamferBox(0.048, 0.010, 0.007, 0.0012), PAD, { m: wrist.clone().multiply(new THREE.Matrix4().makeTranslation(0, -0.026, -0.018)) });
-
-  const geo = kit.build();
-  if (opts.mirror) mirrorGeometry(geo);
-  const mesh = new THREE.Mesh(geo, mats);
-  mesh.frustumCulled = false;
-  return mesh;
+/**
+ * A weapon-space direction expressed in the hand's own local frame, ready to be
+ * built into the buffer.
+ *
+ * `mirror` is not cosmetic here. The left hand is built as a right hand and
+ * mirrored across x *after* the Kit is merged, so a direction that must end up
+ * pointing at the left elbow has to be fed in pointing at the right one.
+ */
+function intoHand(dirWeapon, pose, mirror) {
+  const v = dirWeapon.clone().applyQuaternion(pose.quaternion.clone().invert()).normalize();
+  if (mirror) v.x = -v.x;
+  return v;
 }
 
 /**
@@ -214,6 +506,9 @@ function buildHand(mats, opts, D) {
  */
 export function buildArms(weapon, mats) {
   const D = detail();
+  const A = weapon.anchors;
+  const body = weapon.body?.geometry;
+
   const root = new THREE.Group();
   root.name = 'Arms';
   // The hands live inside the viewmodel camera's near volume and are posed
@@ -222,37 +517,69 @@ export function buildArms(weapon, mats) {
   // way down the chain rather than only on the leaf meshes.
   root.frustumCulled = false;
 
+  const GLOVE_T = 0.005;                          // glove wall between skin and steel
+
   /* --- firing hand ----------------------------------------------------- */
-  // Fingers run forward and down around the grip's front strap; the palm
-  // faces back and up into the grip, which puts the forearm on the line back
-  // to the shoulder and the thumb over the left side of the receiver.
+  // The channel axis is the grip axis, which is the grip's rake and nothing
+  // else. The hand rolls about it until the wrist ends up behind and below the
+  // weapon rather than sticking out to the right of it.
+  const gripDown = new THREE.Vector3(0, -1, 0)
+    .applyEuler(new THREE.Euler(A.rightRake || 0, 0, 0)).normalize();
+  const gripUp = gripDown.clone().negate();
+  const rGrip = graspRadius(body, A.rightHand, gripDown, -0.012, 0.030, 0.045, 0.0175) + GLOVE_T;
+  const gripSolve = graspCentre(rGrip, PALM_TOP, PALM_ZM);
+
   const right = new THREE.Group();
   right.name = 'rightArm';
   right.frustumCulled = false;
-  const rh = buildHand(mats, { curl: 1.30, thumbCurl: 0.85, trigger: 0.62, wrist: -0.55 }, D);
-  rh.quaternion.setFromRotationMatrix(frame(
-    [-0.08, -0.30 - weapon.anchors.rightRake * 0.30, -0.94],
-    [0.08, 0.92, -0.38]
-  ));
+  const rPose = seat(gripUp, new THREE.Vector3(-1, 0, 0), -0.45, gripSolve);
+
+  // Where the forearm has to go, given in weapon space and rotated into the
+  // hand before the buffer is built. Mostly down, partly back: the firing elbow
+  // is at the ribs, and a forearm aimed straight at the shoulder passes through
+  // the lens when the weapon comes up to the eye.
+  const rh = buildHand(mats, {
+    radius: rGrip, thumbCurl: 0.80, thumbYaw: 0.85, thumbLift: 0.30,
+    trigger: 0.86, triggerSpread: 0.02, triggerRoll: 0.26, palmBend: 0.50,
+    forearm: intoHand(new THREE.Vector3(0.30, -0.92, 0.25), rPose, false),
+    forearmLen: 0.30,
+  }, D);
+  rh.name = 'rightHand';        // named for the sight-line probe's hit list
+  rh.quaternion.copy(rPose.quaternion);
+  rh.position.copy(rPose.offset);
+  right.position.copy(A.rightHand);
   right.add(rh);
-  right.position.copy(weapon.anchors.rightHand);
-  right.position.x += 0.010;
-  right.position.z += 0.006;
   root.add(right);
 
   /* --- support hand ---------------------------------------------------- */
-  // Comes in from below and left, fingers wrapping up and over the handguard
-  // with the thumb across the top — the modern C-clamp. The forearm therefore
-  // exits down-left-back, out of the centre of the frame.
+  // The channel axis is the bore. The published anchor sits low on the
+  // handguard shell, so it is lifted onto the shell's own axis by measuring how
+  // far the body rises above it; the hand then closes on that axis from the
+  // upper left with the thumb along the top — the modern C-clamp.
+  const rise = riseAbove(body, A.leftHand, 0.018, 0.020, 0.048);
+  const hgAxis = A.leftHand.clone().add(new THREE.Vector3(0, rise * 0.34, 0));
+  const rHand = graspRadius(body, hgAxis, new THREE.Vector3(0, 0, 1), -0.030, 0.030, 0.055, rise * 0.5)
+    + GLOVE_T;
+  const hgSolve = graspCentre(rHand, PALM_TOP, PALM_ZM);
+
   const left = new THREE.Group();
   left.name = 'leftArm';
   left.frustumCulled = false;
-  const lh = buildHand(mats, { curl: 1.24, thumbCurl: 0.30, wrist: 0.38, mirror: true }, D);
-  lh.quaternion.setFromRotationMatrix(frame([0.62, 0.72, -0.30], [-0.42, 0.10, -0.90]));
+  // The axis is +X of the built buffer. For the support hand that buffer is
+  // mirrored, which swaps which end of it the thumb is on, so the axis that
+  // puts a C-clamp thumb forward along the bore is the one running *back* out
+  // of the stock.
+  const lPose = seat(new THREE.Vector3(0, 0, 1), new THREE.Vector3(1, 0, 0), 0.62, hgSolve);
+  const lh = buildHand(mats, {
+    radius: rHand, thumbCurl: 0.30, thumbYaw: 1.30, thumbLift: 0.02, palmBend: 0.34,
+    forearm: intoHand(new THREE.Vector3(-0.46, -0.80, 0.39), lPose, true),
+    forearmLen: 0.34, mirror: true,
+  }, D);
+  lh.name = 'leftHand';
+  lh.quaternion.copy(lPose.quaternion);
+  lh.position.copy(lPose.offset);
+  left.position.copy(hgAxis);
   left.add(lh);
-  left.position.copy(weapon.anchors.leftHand);
-  left.position.x -= 0.026;
-  left.position.y -= 0.016;
   root.add(left);
 
   const rest = {
@@ -262,6 +589,11 @@ export function buildArms(weapon, mats) {
 
   return {
     root, left, right, rest,
+    /** What the pose was solved against — read by the geometry probe. */
+    measured: {
+      gripRadius: rGrip, gripGrasp: [gripSolve.y, gripSolve.z],
+      handguardRise: rise, handguardRadius: rHand, handguardGrasp: [hgSolve.y, hgSolve.z],
+    },
     dispose() { rh.geometry.dispose(); lh.geometry.dispose(); },
   };
 }

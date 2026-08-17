@@ -62,6 +62,17 @@ import {
  *   sand      0.28-0.42, low var     90 mm anisotropic train   damp vs dry only
  *   polymer   0.03-0.05, v.low var   1.2 mm stipple, flat      edge burnish only
  *   gunmetal  0.04-0.06 + conductor  0.5 mm blast, flat        polish-through
+ *
+ * The five viewmodel surfaces at the bottom of the file play the same game
+ * against each other, on a much tighter pitch — every one of them is a dark
+ * near-neutral, so what has to separate them is process, not colour:
+ *
+ *   recipe             albedo (lin)  rendered rough  identity band  conductor
+ *   receiver_phosphate 0.048 warm    0.96 -> 0.44    3 mm scallops  never
+ *   rail_anodised      0.035 neutral 0.86            4 mm die lines never
+ *   barrel_nitride     0.080 = F0    0.30            5 mm turning   ALWAYS
+ *   furniture_polymer  0.036 warm    0.62 -> 0.36    1.8 mm stipple never
+ *   grip_rubber        0.031 neutral 0.90            1.6 mm pebble  never
  */
 
 /* --------------------------------------------------------- colour helpers */
@@ -157,6 +168,58 @@ const C_GROUT = srgb(0.52, 0.50, 0.47);
 const C_RUBBER = srgb(0.175, 0.175, 0.185);
 const C_CANVAS = srgb(0.39, 0.38, 0.29);
 const C_POLYMER = srgb(0.205, 0.203, 0.205);     // 0.034 linear — glass-filled nylon
+
+/* ------------------------------------------------- weapon-surface palette */
+/*
+ * Five processes, five colours, and they are deliberately NOT five samples of
+ * one grey. A rifle is an assembly, and the eye reads "assembly" from the
+ * *steps* between adjacent parts, not from the wear inside any one of them.
+ *
+ *   part                 linear luma   hue           process
+ *   receiver phosphate      0.048      warm charcoal chemical conversion coat
+ *   rail hard anodising     0.035      neutral       ceramic Al2O3, no metal
+ *   barrel nitride          0.086 F0   neutral       CONDUCTOR, glossy
+ *   furniture nylon         0.036      warm neutral  moulded, satin
+ *   grip overmould          0.031      neutral       moulded, dead matte
+ *
+ * The receiver is authored WARM on purpose. Measured off the round-3 capture,
+ * a 40x20 px patch of unoccluded receiver flat came back rgb 25,26,30 — the
+ * darkest object in a desert frame was also its bluest, which is most of what
+ * "blue-black digital camouflage" actually names. Only +2% of that blue is in
+ * the albedo; the rest is sky IBL, which is nearly all the light a matte dark
+ * dielectric returns. So the coating is biased ~13% red to land neutral once
+ * the sky has been added back, which is also what manganese phosphate looks
+ * like: a warm charcoal, never a blue-black.
+ */
+const C_PHOSPHATE = srgb(0.258, 0.246, 0.232);   // 0.048 linear, warm charcoal
+/**
+ * Phosphate that a hand or a holster has BURNISHED — not stripped.
+ *
+ * 1.6x the coating's reflectance, and that ceiling is the point. The previous
+ * generation blended worn phosphate to `C_WORN` (0.133 linear, 2.8x) and before
+ * that to `C_STEEL` (0.53 linear, 11x); an 11x albedo step scattered in islands
+ * is a camouflage print by construction. Polished phosphate is still phosphate.
+ * Its wear reads through GLOSS, which costs no albedo contrast at all.
+ */
+const C_PHOS_BURNISH = srgb(0.315, 0.305, 0.296);
+const C_ANODISE = srgb(0.210, 0.208, 0.211);     // 0.0345 linear, type-III black
+const C_ANODISE_SCUFF = srgb(0.295, 0.288, 0.276); // oxide dust + substrate
+/**
+ * Nitrided barrel steel, used as CONDUCTOR F0 — not as a diffuse colour.
+ *
+ * Bare steel's real F0 is 0.53-0.58 and putting that on a viewmodel under a sky
+ * environment produces a mirror, which is the single failure mode this file and
+ * Gunsmith.js both already carry warnings about. A QPQ-nitrided, fired barrel is
+ * not bare steel: it is an iron-nitride case that has been carbon-loaded by use,
+ * and 0.086 is a defensible reflectance for it. It also keeps the barrel about
+ * 0.2x the sand's radiance, i.e. clearly the darkest metal in the frame, while
+ * still being the only part with a hard moving highlight.
+ */
+const C_NITRIDE = srgb(0.325, 0.322, 0.320);
+const C_CARBON = srgb(0.140, 0.136, 0.134);      // 0.0165 linear — combustion soot
+const C_FURNITURE = srgb(0.216, 0.212, 0.207);   // 0.036 linear — glass-filled nylon
+const C_FIBRE = srgb(0.40, 0.39, 0.37);          // glass fibre ends in the skin
+const C_OVERMOULD = srgb(0.200, 0.199, 0.200);   // 0.031 linear — grip elastomer
 /**
  * Urban grime. This used to be srgb(0.24, 0.20, 0.15) — a warm brown, and it is
  * mixed into the cavity of nearly every architectural recipe, so every recess,
@@ -1350,6 +1413,18 @@ export const RECIPES = {
   },
 
   /* ============================================================== gun metal */
+  /*
+   * NOT THE VIEWMODEL RECEIVER ANY MORE. `receiver_phosphate` at the bottom of
+   * this file is, and it is authored specifically for a surface held 300 mm
+   * from the eye and for the x1.90 roughness multiplier the viewmodel applies.
+   *
+   * This recipe stays because the LEVEL uses it (`LevelModule.M.chrome`) for
+   * props seen at two to ten metres, where its 20 mm forging form and its 3%
+   * conductor speckle are the right call and its texel budget is a tenth of the
+   * viewmodel's. Retuning it for the gun would have degraded those props, which
+   * belong to another agent; splitting the two uses is the whole reason
+   * `Gunsmith.preset` looks the weapon presets up by name.
+   */
   gunmetal: {
     label: 'Parkerised steel',
     description: 'Manganese-phosphate receiver: a matte DIELECTRIC conversion coating over bead-blast, machining witness marks, and holster wear polishing the arrises back to bare conductor.',
@@ -1497,6 +1572,534 @@ export const RECIPES = {
           r *= 1 - c.cavity * 0.18; g *= 1 - c.cavity * 0.19; b *= 1 - c.cavity * 0.19;
           out[0] = r; out[1] = g; out[2] = b;
           out[3] = clamp(0.66 - burnish * 0.34 - pyr * 0.04 + fleck * 0.16 + c.cavity * 0.08, 0.20, 1.0);
+          out[4] = 0;
+          out[5] = 1;
+        },
+      };
+    },
+  },
+
+  /* ========================================================================
+   * ===================================================== WEAPON SURFACES ==
+   * ========================================================================
+   *
+   * WHY THESE EXIST AS SEPARATE RECIPES, AND WHAT THEY MUST CARRY.
+   *
+   * `Gunsmith.weaponMaterials` asks the library for five presets by name —
+   * `receiver_phosphate`, `rail_anodised`, `barrel_nitride`,
+   * `furniture_polymer`, `grip_rubber` — and falls back to `gunmetal` /
+   * `polymer` / `rubber` plus a compensating *shim* when the library has not
+   * published them. Publishing them here takes the direct branch, and
+   * `Gunsmith.preset` deliberately DROPS THE SHIM when it does, because the
+   * shim's whole job was to bend the wrong recipe into roughly the right
+   * shape. So each recipe below has to stand on its own. Concretely, the shim
+   * used to supply, and these recipes now supply for themselves:
+   *
+   *   rail    a 0.20 m bake scale + a repeat correction  -> worldScale below
+   *           a 0.62 grey colour multiplier              -> C_ANODISE
+   *           `metalness: 0` (DIELECTRIC)                -> out[4] = 0
+   *           `aoMapIntensity: 0.22`                     -> aoStrength 0.14
+   *   barrel  a 0.26 m bake scale + a repeat correction  -> worldScale below
+   *           `metalness: 0.62`, `roughness: 0.46`       -> out[4]/out[3]
+   *           `envMapIntensity: 1.75`                    -> C_NITRIDE F0
+   *           `aoMapIntensity: 0.22`                     -> aoStrength 0.12
+   *
+   * The receiver, furniture and grip keep their caller options (those live in
+   * `opts`, not in the shim) — including the receiver's ROUGHNESS x1.90, which
+   * these recipes are authored against; see `receiver_phosphate`.
+   *
+   * -------------------------------------------------------------------------
+   * AUTHORING FRAME: worldScale IS THE ON-SCREEN SIZE OF ONE TILE.
+   *
+   * The merged viewmodel body is projected at one UV scale for every slot
+   * (`BODY_TILE` = 0.35 m per UV unit), and each slot gets its own metres-per-
+   * tile only by tiling its texture. So the metres a tile actually covers ON
+   * THE GUN is `BODY_TILE / repeat`, and every recipe below sets its
+   * `worldScale` to exactly that number:
+   *
+   *   slot        caller repeat            worldScale = 0.35/repeat   texels
+   *   receiver    2.4                      0.1458 m       1024 ->  0.14 mm
+   *   rail        1 (shim dropped)         0.35   m        512 ->  0.68 mm
+   *   barrel      1 (shim dropped)         0.35   m        512 ->  0.68 mm
+   *   furniture   2.4 x 0.85  = 2.04       0.1716 m        512 ->  0.34 mm
+   *   grip        (0.35/0.5) x 2.4 x 1.6   0.1302 m        512 ->  0.25 mm
+   *              = 2.688
+   *
+   * The payoff is that a millimetre written in one of these recipes is a
+   * millimetre on the weapon. Every previous attempt at this surface reasoned
+   * about feature size through a stack of three multiplied correction factors,
+   * and every review since has called the result a pattern.
+   *
+   * IF THE CALLER'S `repeat` CHANGES, THESE `worldScale` VALUES MUST CHANGE
+   * WITH IT. That is the one coupling this arrangement buys its clarity with.
+   *
+   * -------------------------------------------------------------------------
+   * WHAT THE SCREEN CAN ACTUALLY RESOLVE.
+   *
+   * At full ADS the receiver spans ~600 px for ~180 mm of part, i.e. 3.3 px per
+   * millimetre. That sets the whole feature budget:
+   *
+   *   > 20 mm   66+ px   MUST BE FLAT. Any contrast in this band is a printed
+   *                      pattern; this is the band every "digital camouflage"
+   *                      review has been pointing at.
+   *   5-20 mm   16-66 px process form — forging flow, contact bands. Low
+   *                      contrast, no hard edges.
+   *   1-5 mm    3-16 px  THE IDENTITY BAND. Cutter scallops, mould stipple,
+   *                      pebble grain. This is what says "machined" or
+   *                      "moulded" rather than "generated".
+   *   < 1 mm    < 3 px   Belongs in the shader detail normal, which is
+   *                      resolution-independent — never in the bake, where it
+   *                      is either aliasing or wasted texels.
+   *
+   * The rail and the barrel sit at 0.68 mm per texel, so their bakes carry NO
+   * albedo feature under ~3 mm at all; their close-range character is delivered
+   * entirely by the `brushed` detail normal, which runs at the same on-screen
+   * frequency as the receiver's and therefore hides the 5x texel-density step
+   * between the two parts.
+   *
+   * -------------------------------------------------------------------------
+   * THE MEASUREMENT THAT DROVE ALL OF THIS.
+   *
+   * The receiver's visible pattern was never in the albedo. Baked at full
+   * resolution the previous `gunmetal` measured an 8-bit albedo sd of 6.4 on a
+   * mean of 65 — a 10% surface, genuinely flat. Its ARM map is where the
+   * pattern lives:
+   *
+   *   roughness, after the caller's x1.90:  96.4% of texels in the top decile,
+   *                                         2.2% at 0.30-0.40, nothing between.
+   *
+   * That is a BINARY GLOSS MASK. 96% of the receiver is clipped to dead matte
+   * and a 2% population of isolated, curvature-thresholded islands is the only
+   * thing in the frame reflecting the sky. On a 0.05-albedo surface those
+   * islands are 10-20x the local diffuse, so they render as hard bright specks
+   * scattered over near-black — which is what a 8x crop of the round-3 capture
+   * shows, and which is exactly how a camouflage print is constructed. The
+   * albedo was fixed two rounds ago; the specular never was.
+   *
+   * Hence the two rules every recipe below follows:
+   *
+   *  1. NO THRESHOLDED WEAR. Every wear term is a continuous ramp. `smoothstep`
+   *     appears only to shape a *zone*, never to decide whether a texel is worn.
+   *  2. WEAR IS ANCHORED TO PROCESS GEOMETRY, NOT TO NOISE. The coating thins
+   *     on the crests of the cutter marks, inside the bands a hand and a sling
+   *     actually touch. Both of those are directional and both run along the
+   *     part, so what survives at 3 px reads as a satin sheen with a grain
+   *     direction — not as a field of dots, which has no direction at all and
+   *     is therefore indistinguishable from print.
+   */
+
+  /* ================================================ receiver: phosphated */
+  receiver_phosphate: {
+    label: 'Receiver, manganese phosphate',
+    description: 'Forged and machined receiver under a matte phosphate conversion coating: 3 mm fly-cutter scallops, bead-blast micro, and hand/sling contact bands that burnish the coating to a satin sheen along the part.',
+    tags: ['weapon', 'viewmodel'],
+    // 0.22 mm of relief is roughly 15x what a real cutter scallop measures, and
+    // the exaggeration is deliberate: at 0.14 mm per texel an honest 15 um mark
+    // produces a normal deviation of about one 8-bit code value, i.e. it is
+    // quantised out of existence. The choice is an exaggerated mark or no mark.
+    // It is also bounded — the first pass at this used 0.35 mm, which over a
+    // 3 mm pitch is a 13 degree flank, i.e. corrugated sheet rather than a
+    // machined flat. 0.22 mm keeps the marks under 3 degrees, which reads as a
+    // fine grain at ADS and disappears into the mip chain at hip.
+    minSize: 512, reliefM: 0.00022, masks: 4,
+    // A conversion coating over a machined flat occludes essentially nothing,
+    // and the AO channel is the second-largest contributor to the patterning:
+    // it multiplies indirect diffuse, which under a sky is most of what this
+    // surface returns. The caller already holds it at 0.22 intensity; keeping
+    // the baked field near white as well means the two cannot compound.
+    aoStrength: 0.14, curvGain: 1.0,
+    // detailScale = 0.1458 / 0.0065 = 22.4 tiles per base tile, so one detail
+    // tile is 0.35 / (2.4 x 22.4) = 6.5 mm on the gun and the `brushed` map's
+    // 24 streaks across it land at a 0.27 mm pitch — bead-blast and draw-mark
+    // scale, below what the bake could ever hold. detailAlbedo is pulled right
+    // down from the 0.55 default: a machined surface's micro is GLOSS, and a
+    // +-27% albedo swing at 1 px is the definition of sparkle.
+    detail: 'brushed', detailMetres: 0.0065, detailStrength: 0.42, detailAlbedo: 0.16,
+    macro: 0, triplanar: false, worldScale: 0.1458,
+    build(seed, opts = {}) {
+      const M = metrics(opts, 0.1458);
+      // 3 mm fly-cutter/broach scallops. Resolution-capped via `per`, so the
+      // coarse stages of the refine ladder degrade to a soft ripple rather than
+      // to aliasing. Lines of constant v, i.e. running ALONG the part — u is the
+      // weapon's long axis in the merged body's projection.
+      const MACH = M.per(0.003, 6);
+      const CHAT = M.per(0.012, 6);              // cutter chatter, 12 mm
+      const flow = fbm(seed + 181, M.per(0.045, 10), 2, 0.5);   // forging flow
+      const blast = fbm(seed + 182, M.per(0.0011, 5), 2, 0.5);  // bead blast
+      // Contact bands. Sampled at (u, v*3) so the field is three times shorter
+      // across the part than along it: 16 mm wide bands running fore-and-aft,
+      // which is where a firing hand, a sling and a plate carrier actually rub.
+      // The integer 3 matters — a fractional stretch would break tiling.
+      const zoneN = fbm01(seed + 183, M.per(0.055, 8), 3, 0.55);
+      const foulN = fbm01(seed + 184, M.per(0.028, 8), 3, 0.6);
+      const dingC = worley(seed + 185, M.per(0.009, 6), 1.0);
+      const cA = new Cell();
+      return {
+        sample(u, v, out) {
+          // Phase-jittered so it does not read as corduroy, amplitude-modulated
+          // by the chatter so consecutive cutter passes differ slightly. Both
+          // are what a real fly-cut flat does and both cost one multiply.
+          const chat = Math.cos(v * CHAT * Math.PI * 2 + flow(u, v) * 2.2);
+          const mach = Math.cos(v * MACH * Math.PI * 2 + flow(u, v) * 1.7)
+            * (0.78 + chat * 0.22);
+          dingC(u, v, cA);
+          // Handling dings: rare, shallow, and a bruise in a coating rather
+          // than a hole. Kept at ~4% of cells so they are punctuation.
+          const ding = smoothstep(0.075, 0.02, cA.f1) * (cA.rand(21) > 0.955 ? 1 : 0);
+          // Weights, in the order they matter. The cutter marks lead, because
+          // the fine periodic band has to own the height field — curvature and
+          // AO are both derived from it, and whichever band owns it owns the
+          // wear mask and the occlusion too. But they do not own it OUTRIGHT:
+          // a receiver is bead-blasted before it is coated, and blasting mostly
+          // erases the mill marks. At 0.46/0.15 the surface came out as pure
+          // corduroy; at 0.40/0.22 the marks show *through* a blasted field,
+          // which is what a phosphated receiver actually looks like and which
+          // also stops the whole part reading as one brushed wrap.
+          out[0] = mach * 0.40 + chat * 0.09 + blast(u, v) * 0.22
+            + flow(u, v) * 0.11 - ding * 0.20;
+          out[1] = zoneN(u, v * 3);
+          out[2] = mach * 0.5 + 0.5;             // cutter crest, 0..1 continuous
+          out[3] = ding;
+          out[4] = foulN(u, v);
+        },
+        shade(u, v, c, m, out) {
+          const zoneRaw = m[0], crest = m[1], ding = m[2], foulRaw = m[3];
+
+          // Where the gun is HELD. A zone, so smoothstep is legitimate here —
+          // it decides the extent of a contact band, never whether an
+          // individual texel is worn.
+          const contact = smoothstep(0.46, 0.80, zoneRaw);
+          // Inside a contact band the coating polishes off the crests of the
+          // cutter marks first, and it does it gradually. `crest` is the ripple
+          // itself, so `burnish` is a continuous 3 mm gradient with a direction,
+          // not a thresholded island. That single change is what turns a field
+          // of specular dots into a directional satin sheen.
+          //
+          // The weights matter as much as the shape. `contact` only GATES; the
+          // swing is carried by `crest`, so nearly all of the gloss variance
+          // sits at the 3 mm cutter pitch and only the envelope sits at the
+          // 16-50 mm band size. Measured on the bake, that puts the roughness
+          // sd at 26 in the 2 mm band against 9 in the 36 mm band — a surface
+          // with a grain, rather than a surface with patches.
+          const burnish = clamp01(contact * (0.10 + crest * 1.08));
+
+          // Albedo does almost nothing, and that is correct. A phosphate coat is
+          // a chemical film: its variation is sheen, not value. +-2.5% from the
+          // height field, at most a 1.4x lift where it is burnished through.
+          const t = 0.975 + c.h * 0.05;
+          let r = mix(C_PHOSPHATE[0] * t, C_PHOS_BURNISH[0], burnish * 0.55);
+          let g = mix(C_PHOSPHATE[1] * t, C_PHOS_BURNISH[1], burnish * 0.55);
+          let b = mix(C_PHOSPHATE[2] * t, C_PHOS_BURNISH[2], burnish * 0.55);
+
+          // Combustion residue collects in the scallop troughs and around the
+          // port. Warm-biased, because soot on gunmetal kills the blue first and
+          // a recess on this weapon has no business reading as a sky-coloured
+          // hole.
+          const foul = clamp01(c.cavity * 0.5 + foulRaw * 0.30 - 0.10);
+          r = mix(r, C_CARBON[0], foul * 0.30);
+          g = mix(g, C_CARBON[1], foul * 0.32);
+          b = mix(b, C_CARBON[2], foul * 0.34);
+
+          out[0] = r; out[1] = g; out[2] = b;
+
+          // ROUGHNESS IS AUTHORED AGAINST THE VIEWMODEL'S x1.90 MULTIPLIER.
+          // Gunsmith multiplies this channel by 1.90, so anything written above
+          // 0.526 renders as a flat 1.0 — which is how the previous version put
+          // 96% of the receiver in one bucket and left the remaining 2% as the
+          // only thing in the frame with a specular. The whole range below stays
+          // under that ceiling so the ramp survives:
+          //
+          //   coating          0.505  ->  0.96  dead matte phosphate
+          //   cutter crest    -0.035  ->  0.89  a sheen along the cutter marks
+          //   fully burnished -0.275  ->  0.44  satin, where the hand sits
+          //   floor            0.165  ->  0.31  a genuinely polished arris
+          //
+          // If that 1.90 is ever removed, every number here needs multiplying
+          // by it — the recipe is not wrong, it is pre-divided.
+          out[3] = clamp(0.505 - burnish * 0.275 - crest * 0.035
+            + foul * 0.035 - ding * 0.02, 0.165, 0.54);
+
+          // NO CONDUCTOR MASK, ANYWHERE. Phosphate is a dielectric conversion
+          // coating and it wears by burnishing, not by stripping; the fraction
+          // that is genuinely bare metal on a service weapon is well under 1%
+          // and it reads through gloss, which is above. A thresholded metalness
+          // map on a magnified surface is the documented origin of the
+          // sky-coloured blocks — the viewmodel forces `metalness: 0` for that
+          // reason, and this recipe agrees with it rather than fighting it.
+          out[4] = 0;
+          out[5] = 1 - ding * 0.12;
+        },
+      };
+    },
+  },
+
+  /* ================================================== rail / handguard shell */
+  rail_anodised: {
+    label: 'Rail, type-III hard anodising',
+    description: 'Extruded 6061 under a hardcoat anodic oxide: darker and much rougher than the receiver, longitudinal die flow, corner scuffs to oxide dust, and no bright-steel wear anywhere because there is no steel and no coating to wear through.',
+    tags: ['weapon', 'viewmodel'],
+    minSize: 256, reliefM: 0.00040, masks: 2,
+    // aoMapIntensity is 1.0 on this slot now that the shim is gone, so the
+    // baked AO has to be near white on its own or it comes back as the same
+    // ~20 mm blotch field that started this whole investigation.
+    aoStrength: 0.10, curvGain: 1.0,
+    // 0.35 / 0.016 = 21.9 detail tiles per base tile -> a 16 mm detail tile with
+    // the brushed map's streaks landing at 0.67 mm. This is the ONLY thing
+    // carrying sub-3 mm character on this slot, by design: at 0.68 mm per texel
+    // the bake cannot hold anything finer without aliasing it.
+    detail: 'brushed', detailMetres: 0.016, detailStrength: 0.50, detailAlbedo: 0.12,
+    macro: 0, triplanar: false, worldScale: 0.35,
+    build(seed, opts = {}) {
+      const M = metrics(opts, 0.35);
+      // Die flow: the broad longitudinal banding an extrusion carries, three
+      // times longer along the part than across it. 25 mm across, ~75 mm along.
+      const flowF = fbm(seed + 191, M.per(0.025, 8), 3, 0.55);
+      // 4 mm die lines. Right at the resolution floor (5.8 texels) and no
+      // finer — anything below this belongs to the detail normal.
+      const LINE = M.per(0.004, 6);
+      const scuffN = fbm01(seed + 192, M.per(0.030, 8), 3, 0.6);
+      const grimeN = fbm01(seed + 193, M.per(0.050, 8), 3, 0.55);
+      return {
+        sample(u, v, out) {
+          const flow = flowF(u, v * 3);
+          const line = Math.cos(v * LINE * Math.PI * 2 + flow * 2.4) * 0.5 + 0.5;
+          // THE DIE LINES DOMINATE THE HEIGHT FIELD, NOT THE FLOW. Curvature and
+          // AO are both derived from this field, so whichever band owns it also
+          // owns the wear mask and the occlusion. Letting the 25 mm flow term
+          // dominate is precisely how a rail ends up wearing a 25 mm blotch
+          // field in its AO channel — which is the mechanism behind every
+          // "digital camouflage" review this weapon has collected. Measured on
+          // the bake: with the weights this way round the AO sd above 10 mm is
+          // 3.9 out of 255; with them the other way it was 9.8.
+          out[0] = line * 0.55 + flow * 0.22;
+          out[1] = scuffN(u, v * 2);
+          out[2] = grimeN(u, v);
+        },
+        shade(u, v, c, m, out) {
+          const scuffN = m[0], grimeN = m[1];
+
+          // Anodising does NOT polish to bright metal. It is a ceramic oxide
+          // grown INTO the aluminium, roughly 50 um thick, and when something
+          // drags across a corner hard enough it powders and takes a little of
+          // the substrate with it. So the wear colour is a grey-brown dust,
+          // about 2x the coating, and there is no conductor phase at any point
+          // in the part's life. This is the single clearest way to make the rail
+          // read as a different process from the receiver next to it: same
+          // family of darkness, completely different wear behaviour.
+          const scuff = clamp01(c.edge * (0.30 + scuffN * 0.85) * 0.85);
+
+          const t = 0.97 + c.h * 0.06;
+          let r = mix(C_ANODISE[0] * t, C_ANODISE_SCUFF[0], scuff * 0.45);
+          let g = mix(C_ANODISE[1] * t, C_ANODISE_SCUFF[1], scuff * 0.45);
+          let b = mix(C_ANODISE[2] * t, C_ANODISE_SCUFF[2], scuff * 0.45);
+
+          // A rail is a dust and carbon trap — slots, gaps, screw heads.
+          const grime = clamp01(c.cavity * 0.6 + grimeN * 0.35 - 0.12);
+          r = mix(r, C_CARBON[0], grime * 0.34);
+          g = mix(g, C_CARBON[1], grime * 0.35);
+          b = mix(b, C_CARBON[2], grime * 0.36);
+
+          out[0] = r; out[1] = g; out[2] = b;
+          // No caller multiplier on this slot, so these are the rendered values.
+          // Hardcoat is the roughest thing on the weapon: a porous oxide
+          // scatters almost everything, which is why a rail looks *flat* next to
+          // a barrel even though both are near-black. envMapIntensity is 1.0
+          // here now that the shim's 0.70 is gone, and 0.86 roughness is what
+          // makes that safe — the sky arrives fully diffused, never as an image.
+          out[3] = clamp(0.86 - scuff * 0.18 + grime * 0.04, 0.55, 0.97);
+          // Al2O3 is a dielectric. Not "mostly"; entirely.
+          out[4] = 0;
+          out[5] = 1;
+        },
+      };
+    },
+  },
+
+  /* ================================================ barrel / gas block / can */
+  barrel_nitride: {
+    label: 'Barrel, QPQ nitride',
+    description: 'Turned and salt-bath nitrided steel: the only conductor on the weapon and the only part with a hard moving highlight, near-black, carbon-loaded toward the muzzle.',
+    tags: ['weapon', 'viewmodel'],
+    minSize: 256, reliefM: 0.00025, masks: 2,
+    aoStrength: 0.10, curvGain: 1.0,
+    detail: 'brushed', detailMetres: 0.016, detailStrength: 0.26, detailAlbedo: 0.08,
+    macro: 0, triplanar: false, worldScale: 0.35,
+    build(seed, opts = {}) {
+      const M = metrics(opts, 0.35);
+      // Turning marks. A lathe leaves a helix, which on an unrolled cylinder is
+      // a fine line set — 5 mm here, and the sub-millimetre reality goes to the
+      // detail normal as with the rail.
+      const TURN = M.per(0.005, 6);
+      const runout = fbm(seed + 201, M.per(0.040, 8), 2, 0.5);
+      const sootN = fbm01(seed + 202, M.per(0.060, 8), 3, 0.6);
+      return {
+        sample(u, v, out) {
+          const turn = Math.cos(v * TURN * Math.PI * 2 + runout(u, v) * 1.4) * 0.5 + 0.5;
+          // Same rule as the rail: the fine periodic band owns the height field
+          // so the derived AO and curvature stay at the turning pitch instead of
+          // becoming a 40 mm blotch field.
+          out[0] = turn * 0.55 + runout(u, v) * 0.25;
+          out[1] = sootN(u, v * 2);
+          out[2] = turn;
+        },
+        shade(u, v, c, m, out) {
+          const sootN = m[0], turn = m[1];
+
+          // CONDUCTOR, UNIFORMLY. This is the one part of the weapon where
+          // metalness 1 is correct, and it is safe here precisely because it is
+          // a CONSTANT: the failure mode this file keeps warning about is a
+          // *thresholded* conductor mask, which paints sky-coloured islands
+          // wherever the curvature field happens to be under-resolved. A uniform
+          // 1 cannot do that. What controls how bright the barrel gets is F0 —
+          // see C_NITRIDE — not the metalness channel.
+          const soot = clamp01(sootN * 0.7 + c.cavity * 0.5 - 0.20);
+          const t = 0.94 + c.h * 0.11;
+          let r = mix(C_NITRIDE[0] * t, C_CARBON[0], soot * 0.55);
+          let g = mix(C_NITRIDE[1] * t, C_CARBON[1], soot * 0.55);
+          let b = mix(C_NITRIDE[2] * t, C_CARBON[2], soot * 0.56);
+
+          out[0] = r; out[1] = g; out[2] = b;
+          // The glossiest surface on the weapon by a wide margin — 0.30 against
+          // the receiver's rendered 0.96 and the rail's 0.86. That contrast is
+          // the whole read: a barrel carries a highlight that travels along it
+          // as the weapon moves, and nothing else on the gun does. Carbon
+          // deadens it toward the muzzle, which is the only reason the value
+          // moves at all.
+          out[3] = clamp(0.30 + soot * 0.26 - turn * 0.03, 0.20, 0.68);
+          out[4] = 1;
+          out[5] = 1;
+        },
+      };
+    },
+  },
+
+  /* ============================================== stock / grip / magazine */
+  furniture_polymer: {
+    label: 'Furniture, glass-filled nylon',
+    description: 'Injection-moulded polyamide: a regular 1.8 mm tool stipple, a parting line off the mould halves, glass fibre breaking the skin, and a satin sheen that goes glossy only where a hand rides.',
+    tags: ['weapon', 'viewmodel'],
+    minSize: 256, reliefM: 0.00090, masks: 4,
+    // The caller runs this slot at aoMapIntensity 0.44 — twice the metal slots,
+    // because a 1 mm moulded stipple genuinely does self-shadow. Measured off
+    // the old `polymer` bake, 25% of texels sat below AO 0.4, and at 0.44
+    // intensity that is the pale checker visible on the magazine face in the
+    // round-3 capture. The stipple keeps its occlusion; the low-frequency part
+    // of the field does not.
+    aoStrength: 0.28, curvGain: 1.1,
+    detail: 'pit', detailMetres: 0.0075, detailStrength: 0.45, detailAlbedo: 0.20,
+    macro: 0, triplanar: false, worldScale: 0.1716,
+    build(seed, opts = {}) {
+      const M = metrics(opts, 0.1716);
+      // 1.8 mm tool stipple: 5.4 texels per cell, which is the smallest cell
+      // this slot can hold without it turning into a dither.
+      const stip = worley(seed + 211, M.per(0.0018, 5), 1.0);
+      const flowF = fbm(seed + 212, M.per(0.035, 8), 3, 0.5);   // mould flow
+      const fibreC = worley(seed + 213, M.per(0.0026, 5), 1.0, 3.2);
+      const wearN = fbm01(seed + 214, M.per(0.030, 8), 3, 0.6);   // contact field
+      const seamW = fbm(seed + 215, M.per(0.060, 8), 2, 0.5);
+      const cA = new Cell(), cB = new Cell();
+      return {
+        sample(u, v, out) {
+          stip(u, v, cA);
+          // Truncated pyramids, flat-topped and hard-edged: an EDM-textured
+          // tool prints a facet, not a dome. That flat top is why moulded nylon
+          // has a sheen at all and why it is not just "rough plastic".
+          const pyr = Math.min(1, clamp01(1 - cA.f1 / 0.30) * 1.7);
+          fibreC(u, v, cB);
+          const fibre = smoothstep(0.20, 0.04, cB.f1) * (cB.rand(17) > 0.66 ? 1 : 0);
+          // The parting line where the two mould halves met: one flashed ridge
+          // running along the part, 1.4 mm wide because that is four texels at
+          // this slot's density and a physically honest 0.4 mm one would be a
+          // single texel of dashed noise. The most unambiguous "this was
+          // moulded rather than machined" cue available, and it costs two lines.
+          const sy = v + seamW(u, v) * 0.02;
+          const seam = smoothstep(0.004, 0.0, Math.abs(sy - 0.5));
+          out[0] = pyr * 0.42 + flowF(u, v) * 0.10 + fibre * 0.05 + seam * 0.16;
+          out[1] = pyr; out[2] = fibre; out[3] = wearN(u, v * 4); out[4] = seam;
+        },
+        shade(u, v, c, m, out) {
+          const pyr = m[0], fibre = m[1], wearN = m[2], seam = m[3];
+          const t = 0.965 + c.h * 0.07;
+          let r = C_FURNITURE[0] * t, g = C_FURNITURE[1] * t, b = C_FURNITURE[2] * t;
+
+          // Glass fibre ends breaking the moulded skin — the one thing that
+          // stops a black polymer part being a flat colour swatch in a
+          // photograph. Held to a 1.35x lift: the previous recipe used 2.1x,
+          // which at 0.34 mm per texel is a one-pixel sparkle, i.e. the same
+          // defect as the receiver's specular speckle in a different channel.
+          r = mix(r, r * 1.35, fibre * 0.6);
+          g = mix(g, g * 1.35, fibre * 0.6);
+          b = mix(b, b * 1.34, fibre * 0.6);
+
+          // Hands ride the grip and the magwell, and what they do to nylon is
+          // polish the flat tops of the stipple. Same weighting rule as the
+          // receiver, and for the same measured reason: `contact` only GATES,
+          // the swing is carried by `pyr`, so the gloss variance lives at the
+          // 1.8 mm stipple pitch instead of forming 30-50 mm clouds. Rendered
+          // as a roughness map, those clouds are indistinguishable from the
+          // camouflage this whole exercise is about — the first version of this
+          // recipe had them and they are plainly visible in a dump of the
+          // channel. The contact field is stretched 4:1 along the part on top
+          // of that, so what is left of the envelope is a band, not a blob.
+          const contact = smoothstep(0.44, 0.82, wearN);
+          const burnish = clamp01(contact * (0.08 + pyr * 1.05));
+          r = mix(r, r * 1.18, burnish); g = mix(g, g * 1.18, burnish); b = mix(b, b * 1.19, burnish);
+          r *= 1 - c.cavity * 0.16; g *= 1 - c.cavity * 0.17; b *= 1 - c.cavity * 0.17;
+
+          out[0] = r; out[1] = g; out[2] = b;
+          // Satin, and clearly duller than the barrel but clearly glossier than
+          // the rail — three parts, three specular registers. The seam is a
+          // touch glossier than the field because it is skin that never touched
+          // the textured part of the tool.
+          out[3] = clamp(0.62 - burnish * 0.20 - seam * 0.10 - pyr * 0.05
+            + fibre * 0.12 + c.cavity * 0.06, 0.26, 0.86);
+          out[4] = 0;
+          out[5] = 1;
+        },
+      };
+    },
+  },
+
+  /* ============================================== grip panels / butt pad */
+  grip_rubber: {
+    label: 'Grip overmould, elastomer',
+    description: 'Moulded santoprene overmould: 1.6 mm diamond pebble from the tool, dead matte, dust in the pores, and a low satin only on the crowns a palm has worked.',
+    tags: ['weapon', 'viewmodel'],
+    minSize: 256, reliefM: 0.00110, masks: 2,
+    aoStrength: 0.30, curvGain: 1.0,
+    detail: 'pit', detailMetres: 0.0057, detailStrength: 0.55, detailAlbedo: 0.25,
+    macro: 0, triplanar: false, worldScale: 0.1302,
+    build(seed, opts = {}) {
+      const M = metrics(opts, 0.1302);
+      const peb = worley(seed + 221, M.per(0.0016, 5), 1.0);
+      const micro = fbm(seed + 222, M.per(0.0007, 6), 2, 0.5);
+      const wearN = fbm01(seed + 223, M.per(0.028, 8), 3, 0.6);
+      const cA = new Cell();
+      return {
+        sample(u, v, out) {
+          peb(u, v, cA);
+          const pebble = Math.pow(clamp01(1 - cA.f1 / 0.33), 0.55);
+          out[0] = pebble * 0.52 + micro(u, v) * 0.12;
+          out[1] = pebble; out[2] = wearN(u, v * 4);
+        },
+        shade(u, v, c, m, out) {
+          const pebble = m[0], wearN = m[1];
+          const t = 0.955 + c.h * 0.09;
+          let r = C_OVERMOULD[0] * t, g = C_OVERMOULD[1] * t, b = C_OVERMOULD[2] * t;
+          // A palm polishes the pebble crowns and packs dust into the valleys
+          // between them. Both are continuous in the pebble field, so the whole
+          // story sits at 1.6 mm — the frequency the eye reads as *grain*.
+          const contact = smoothstep(0.42, 0.82, wearN);
+          const polish = clamp01(contact * (0.07 + pebble * 1.05));
+          r = mix(r, r * 1.22, polish); g = mix(g, g * 1.22, polish); b = mix(b, b * 1.23, polish);
+          const dust = c.cavity * 0.7;
+          r = mix(r, C_DIRT[0] * 0.55, dust * 0.22);
+          g = mix(g, C_DIRT[1] * 0.55, dust * 0.22);
+          b = mix(b, C_DIRT[2] * 0.56, dust * 0.22);
+          out[0] = r; out[1] = g; out[2] = b;
+          // The most matte surface on the weapon, which is what stops the grip
+          // and the polymer furniture next to it reading as one moulding.
+          out[3] = clamp(0.90 - polish * 0.20 + dust * 0.04, 0.55, 0.98);
           out[4] = 0;
           out[5] = 1;
         },
