@@ -49,11 +49,27 @@ export class TouchControls {
 
   _build(parent) {
     this.node = el('div.bl-touch');
+    // THE HIT SURFACE MUST BE A REAL ELEMENT.
+    //
+    // `.bl-touch` is `pointer-events: none` so the HUD never eats taps, and the
+    // stick/look handlers were bound to it — which meant they never fired at
+    // all, because an element with `pointer-events: none` does not receive
+    // pointer events, they pass through to the canvas. The buttons worked
+    // (they are children with `pointer-events: auto`) while moving and looking
+    // were completely dead, with nothing on screen to explain why.
+    //
+    // This surface is full-screen, transparent, and explicitly hit-testable.
+    // It is the FIRST child so the button clusters stack above it, and they
+    // stopPropagation, so a thumb on a button never also drags the view.
     this.node.innerHTML = `
+      <div class="tc-surface" id="tc-surface"></div>
       <div class="tc-stick" id="tc-stick"><i class="ring"></i><i class="knob"></i></div>
       <div class="tc-right">
         <button class="tc-btn tc-fire" id="tc-fire" aria-label="Fire"></button>
         <button class="tc-btn tc-ads" id="tc-ads" aria-label="Aim">ADS</button>
+      </div>
+      <div class="tc-top">
+        <button class="tc-btn" id="tc-menu" aria-label="Menu">MENU</button>
       </div>
       <div class="tc-left-btns">
         <button class="tc-btn tc-sm" id="tc-jump" aria-label="Jump">JUMP</button>
@@ -62,6 +78,7 @@ export class TouchControls {
       </div>`;
     parent.appendChild(this.node);
 
+    this.$surface = this.node.querySelector('#tc-surface');
     this.$stick = this.node.querySelector('#tc-stick');
     this.$knob = this.node.querySelector('.knob');
     this.$fire = this.node.querySelector('#tc-fire');
@@ -127,7 +144,7 @@ export class TouchControls {
     };
 
     const opts = { passive: false };
-    this.node.addEventListener('pointerdown', this._onDown, opts);
+    this.$surface.addEventListener('pointerdown', this._onDown, opts);
     window.addEventListener('pointermove', this._onMove, opts);
     window.addEventListener('pointerup', this._onUp);
     window.addEventListener('pointercancel', this._onUp);
@@ -168,6 +185,26 @@ export class TouchControls {
     this.node.querySelector('#tc-reload').addEventListener('pointerdown', (e) => {
       e.preventDefault(); e.stopPropagation();
       key('KeyR', true); setTimeout(() => key('KeyR', false), 40);
+    }, opts);
+
+    // The pause menu is normally reached by releasing pointer lock, which a
+    // phone never takes. Go through the HUD's own screen transition rather than
+    // synthesising Escape, because that path also drops the held inputs, stops
+    // the match clock and puts the HUD in the right state.
+    this.node.querySelector('#tc-menu').addEventListener('pointerdown', (e) => {
+      e.preventDefault(); e.stopPropagation();
+      // Release everything first: a menu that opens with fire still latched
+      // leaves the weapon firing behind it.
+      stickEnd(this._stickId);
+      this._lookId = null;
+      if (this._adsLatched) {
+        this._adsLatched = false;
+        this.$ads.classList.remove('down');
+        bus.emit('input:ads', { down: false });
+      }
+      bus.emit('input:fire', { down: false });
+      this.$fire.classList.remove('down');
+      this.engine.get('hud')?.showPause?.();
     }, opts);
   }
 
