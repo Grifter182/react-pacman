@@ -2295,6 +2295,18 @@ export class LevelModule {
     const instMeshes = this.inst.flush(this.root, this.batch);
     const meshes = this.batch.flush(this.root);
 
+    // Wall off the seams between building shells before the collider is frozen.
+    // A player reported "narrow corridors between buildings that feel like a
+    // flaw"; measurement found 147 m2 of walkable space at or under 1.5 m wide
+    // in 79 dead-end clusters, the narrowest half a metre. This seals the
+    // cul-de-sacs and deliberately leaves anything that connects two open areas,
+    // so doorways and stairwell mouths — which are also about a metre wide —
+    // survive by construction rather than by an exception list. See
+    // ProxySet.sealDeadCracks.
+    const seal = this.proxy.sealDeadCracks();
+    console.info(`[Level] sealed ${seal.sealed} dead cracks (${seal.sealedAreaM2} m2, `
+      + `${seal.boxes} boxes); spared ${seal.sparedCount} narrow gaps that connect open areas`);
+
     const collider = this.proxy.toMesh();
     engine.get('collision').build(collider);
     this.collider = collider;
