@@ -58,7 +58,16 @@ export class MuzzleFlash {
       blending: THREE.AdditiveBlending,
       transparent: true,
       depthWrite: false,
-      depthTest: false,
+      // depthTest STAYS ON. It was disabled so the flash could never be
+      // swallowed by the barrel it comes out of, which is a real concern for a
+      // sprite pivoted at the crown — but the cost was measured and it is far
+      // worse: at ADS the star composites straight over the ocular bell and
+      // whites out the bottom third of the sight picture, in the exact frame
+      // where the player is engaging. A flash that blinds you through your own
+      // optic is worse than one clipped by its own muzzle. The renderOrder and
+      // depthWrite:false below already keep it drawing after the weapon without
+      // polluting the depth buffer.
+      depthTest: true,
       opacity: 1,
     }));
     this.star.frustumCulled = false;
@@ -71,7 +80,7 @@ export class MuzzleFlash {
       blending: THREE.AdditiveBlending,
       transparent: true,
       depthWrite: false,
-      depthTest: false,
+      depthTest: true,   // see the note on the star, above
       opacity: 1,
     }));
     this.core.frustumCulled = false;
@@ -90,7 +99,7 @@ export class MuzzleFlash {
       blending: THREE.AdditiveBlending,
       transparent: true,
       depthWrite: false,
-      depthTest: false,
+      depthTest: true,   // see the note on the star, above
       side: THREE.DoubleSide,
       toneMapped: true,
     });

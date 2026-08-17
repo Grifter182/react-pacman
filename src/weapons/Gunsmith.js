@@ -2090,12 +2090,14 @@ const _cQ2 = new THREE.Quaternion();
  *
  * The replacement keeps the physics and drops the cliff:
  *
- *  - **The dot is clamped onto the aperture** rather than allowed to wander off
- *    the glass. This is what a collimator does anyway — the dot you see is
- *    formed by the objective, so it cannot appear outside it. While the axis is
- *    inside the window the clamp is inactive and the dot slides across the
- *    glass exactly as before, holding its world point; once outside, it parks
- *    at the rim instead of vanishing mid-transition.
+ *  - **The dot is never repositioned.** An earlier revision clamped it onto the
+ *    aperture so it parked at the rim instead of vanishing mid-transition. That
+ *    was wrong and it was measured wrong: the dot rendered 34 px — 1.8 degrees —
+ *    from the point of aim. A collimated reticle is parallax-free, so its
+ *    direction is the optical axis and moving it anywhere else makes the sight
+ *    lie about where the barrel points. Losing sight of the dot outside the
+ *    eyebox is the fade's job, not the geometry's. See the note at the clamp
+ *    site below.
  *  - **The fade is measured against the tube, not the lens.** A dot is lost
  *    when the eye leaves the eyebox, which for a tube sight is when the axis
  *    walks out past the housing — a couple of apertures, not 0.9 of one. At hip
@@ -2133,12 +2135,26 @@ export function collimate(build, cam, adsBlend = 0, scope = null) {
   const off = P.distanceTo(G);
   const R = build.sight.glassR;
 
-  // Clamp onto the aperture: the objective forms the dot, so the dot cannot be
-  // outside it. `k < 1` only once the axis has already left the glass.
-  const rim = R * 0.88;
-  if (off > rim && off > 1e-6) {
-    P.sub(G).multiplyScalar(rim / off).add(G);
-  }
+  // NO POSITIONAL CLAMP. There used to be one here, pulling `P` back onto the
+  // glass whenever the axis wandered off it, justified as "the objective forms
+  // the dot, so the dot cannot appear outside it".
+  //
+  // That confuses VISIBILITY with POSITION. It is true that you cannot SEE the
+  // dot once your eye leaves the eyebox — which is what the fade below is for.
+  // It is not true that the dot moves: a collimated reticle is parallax-free by
+  // construction, its apparent direction is the sight's optical axis and nothing
+  // else, which is the entire reason `P` is placed along `A`. Dragging `P`
+  // toward the glass centre steers the dot off that axis, so the sight stops
+  // indicating where the barrel points.
+  //
+  // Measured cost of the clamp: the dot rendered 34 px from the point of aim —
+  // 1.8 degrees, a 3.1 m miss at 100 m — parked 7 px inside the edge of the
+  // glass, having previously measured 0.8 px off the optic axis. It traded an
+  // honest dot that disappears for a visible one that lies, and a sight that
+  // confidently points 1.8 degrees away from the impact is worse than no sight.
+  //
+  // If the dot is off the glass, the eyebox fade is the mechanism that removes
+  // it. Leave the geometry alone.
 
   // Eyebox falloff, measured in apertures. Full brightness while the axis is
   // anywhere on the glass, gone once it is well outside the housing.
