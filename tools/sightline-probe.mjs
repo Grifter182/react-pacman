@@ -237,7 +237,142 @@ for (const id of WEAPONS) {
   }, FAR);
   say(`${id}: fan ${fan.blocked}/${fan.rays} rays obstructed`);
 
-  const r = { weapon: id, ...ads, ...axial, fan };
+  /* --- 5. the sight picture, in screen space --------------------------- */
+  //
+  // WHY THIS STAGE EXISTS. Stages 3 and 4 answer "is the bore clear" — they
+  // cast rays at the glass disc, in metres, at the optic. That is not the
+  // player's complaint. The player said "nothing renders through the scope",
+  // which is a claim about PIXELS: of the screen area inside the optic's
+  // rendered rim, how much shows the world and how much shows gun?
+  //
+  // The old fan reported a clear aperture while a sixth of the sight picture
+  // was dead, because a cone aimed at the glass never touches the tube wall
+  // that vignettes it further forward. This stage samples the disc the player
+  // actually looks at, at the resolution they look at it, and it is the only
+  // number that may be quoted as "the sight is usable".
+  const picture = await page.evaluate((far) => {
+    const T = window.__T;
+    const e = window.__engine;
+    const cam = e.viewmodelCamera;
+    const b = e.get('weapons').weapon;
+    cam.updateMatrixWorld(true);
+    const origin = new T.V3().setFromMatrixPosition(cam.matrixWorld);
+    const W = e.width, H = e.height;
+    const toPx = (v) => {
+      const n = v.clone().project(cam);
+      return { x: (n.x * 0.5 + 0.5) * W, y: (-n.y * 0.5 + 0.5) * H, ndc: [n.x, n.y] };
+    };
+
+    // The rim of the sight picture is the FRONT element: it is the far end of
+    // the tube, so it is what clips the view, not the rear glass at the eye.
+    let front = null, reticle = null;
+    e.viewmodelScene.traverseVisible((o) => {
+      if (!o.isMesh) return;
+      if (/lensFront/i.test(o.name)) front = o;
+      if (/^reticle/i.test(o.name)) reticle = o;
+    });
+    const axis = b.sight ? b.sight.group : null;
+    if (!axis) return { error: 'weapon has no sight group' };
+    axis.updateMatrixWorld(true);
+    const centreWorld = new T.V3().setFromMatrixPosition((front || axis).matrixWorld);
+    // THE RADIUS MUST MATCH THE PLANE. `glassR` is SIGHT_CLEAR * eyeRelief —
+    // the cone's radius at the REAR glass, next to the eye. The rim of the
+    // sight picture is the FRONT element, further down the same widening cone,
+    // where the radius is `frontGlassR`. Measuring the front plane with the
+    // rear radius samples a disc smaller than the one the player looks through
+    // and reports a clear picture while the rim is dead — which is exactly how
+    // the earlier fan came back 0/49 clear with a sixth of the bore blocked.
+    // ...and it must not be a config field, either. Only some weapons publish
+    // `frontGlassR`; on the rest this fell back to the rear radius and measured
+    // the front plane with the wrong disc all over again. Take the radius from
+    // the front lens MESH — its own bounding sphere, in world units — so the
+    // number describes the geometry actually on screen no matter what the
+    // builder chose to export.
+    const rimIsFront = !!front;
+    let R = b.sight.glassR ?? 0.010;
+    let rSource = 'sight.glassR (no front lens mesh)';
+    if (front) {
+      front.updateMatrixWorld(true);
+      const g = front.geometry;
+      if (!g.boundingSphere) g.computeBoundingSphere();
+      const s = new T.V3().setFromMatrixScale(front.matrixWorld);
+      R = g.boundingSphere.radius * Math.max(s.x, s.y);
+      rSource = 'lensFront mesh bounding sphere';
+    } else if (b.sight.frontGlassR != null) {
+      R = b.sight.frontGlassR; rSource = 'sight.frontGlassR';
+    }
+    const right = new T.V3(1, 0, 0).applyQuaternion(cam.getWorldQuaternion(new T.Q()));
+    const c = toPx(centreWorld);
+    const rim = toPx(centreWorld.clone().addScaledVector(right, R));
+    const radiusPx = Math.hypot(rim.x - c.x, rim.y - c.y);
+
+    // Sample the disc on a grid sized to land near 1200 interior samples: dense
+    // enough that a spoke or a screw head cannot hide between samples, cheap
+    // enough to finish under software rasterisation.
+    const step = Math.max(1, radiusPx * 2 / 40);
+    const meshes = window.__vmMeshes();
+    const rc = new T.RC(origin, new T.V3(0, 0, -1), 0, far);
+    rc.firstHitOnly = false;
+    const bands = [0, 0, 0, 0], bandN = [0, 0, 0, 0];
+    const clock = {}, clockN = {}, blockers = {};
+    let n = 0, blocked = 0;
+    for (let py = c.y - radiusPx; py <= c.y + radiusPx; py += step) {
+      for (let px = c.x - radiusPx; px <= c.x + radiusPx; px += step) {
+        const dx = px - c.x, dy = py - c.y;
+        const rr = Math.hypot(dx, dy) / radiusPx;
+        if (rr > 1) continue;
+        const ndc = new T.V3((px / W) * 2 - 1, -((py / H) * 2 - 1), 0.5);
+        rc.set(origin, ndc.unproject(cam).sub(origin).normalize());
+        n++;
+        const band = Math.min(3, Math.floor(rr * 4));
+        bandN[band]++;
+        // 12 o'clock is up, 3 is the shooter's right. Screen y grows downward.
+        const cl = ((Math.round((Math.atan2(dx, -dy) / (Math.PI * 2)) * 12) + 12) % 12) || 12;
+        clockN[cl] = (clockN[cl] || 0) + 1;
+        let solid = null;
+        for (const h of rc.intersectObjects(meshes, false).map(window.__label)) {
+          if (h.kind === 'BLOCKER') { solid = h; break; }
+        }
+        if (solid) {
+          blocked++; bands[band]++;
+          clock[cl] = (clock[cl] || 0) + 1;
+          const k = `${solid.mesh}/${solid.part || '-'}`;
+          blockers[k] = (blockers[k] || 0) + 1;
+        }
+      }
+    }
+
+    // Where the reticle actually lands. At full ADS the optic axis is on the
+    // screen centre by measurement, so any reticle offset from centre is the
+    // reticle being mounted wrong, not the pose being wrong.
+    const centreOff = { x: +(c.x - W / 2).toFixed(1), y: +(c.y - H / 2).toFixed(1) };
+    const ret = reticle ? toPx(new T.V3().setFromMatrixPosition(reticle.matrixWorld)) : null;
+    return {
+      viewport: [W, H],
+      rimPlane: rimIsFront ? 'front element' : 'sight group origin (no lensFront mesh found)',
+      rimRadiusM: +R.toFixed(5),
+      rimRadiusFrom: rSource,
+      rearGlassR: +(b.sight.glassR ?? 0).toFixed(5),
+      frontGlassR: b.sight.frontGlassR != null ? +b.sight.frontGlassR.toFixed(5) : null,
+      discCentrePx: [+c.x.toFixed(1), +c.y.toFixed(1)],
+      discRadiusPx: +radiusPx.toFixed(1),
+      // A sight picture smaller than this is unusable regardless of occlusion:
+      // you cannot identify a target through a 20-pixel hole.
+      discDiameterPct: +((radiusPx * 2 / H) * 100).toFixed(1),
+      samples: n,
+      blockedPct: n ? +((blocked / n) * 100).toFixed(1) : null,
+      byBandPct: bands.map((v, i) => (bandN[i] ? +((v / bandN[i]) * 100).toFixed(0) : null)),
+      byClockPct: Object.fromEntries(Object.keys(clockN).sort((a, z) => a - z)
+        .map((k) => [k, +(((clock[k] || 0) / clockN[k]) * 100).toFixed(0)])),
+      blockers,
+      opticAxisOffsetPx: centreOff,
+      reticleOffsetPx: ret ? { x: +(ret.x - W / 2).toFixed(1), y: +(ret.y - H / 2).toFixed(1) } : null,
+      reticleVsAxisPx: ret ? +Math.hypot(ret.x - c.x, ret.y - c.y).toFixed(1) : null,
+    };
+  }, FAR);
+  say(`${id}: sight picture ${picture.discRadiusPx}px radius, ${picture.blockedPct}% blocked`);
+
+  const r = { weapon: id, ...ads, ...axial, fan, picture };
   results.push(r);
 
   console.log(`\n=== ${id} — full ADS (animator blend ${r.adsBlend}) ===`);
@@ -254,6 +389,25 @@ for (const id of WEAPONS) {
   for (const [k, v] of Object.entries(fan.blockers)) {
     console.log(`       ${k}  ${v.rays} rays  clock ${Object.keys(v.clock).sort((a, b) => a - b).join(',')}  aperture ${Object.keys(v.frac).join(',')}`);
   }
+
+  const q = r.picture;
+  if (q.error) { console.log(`  sight picture: ${q.error}`); continue; }
+  console.log(`  SIGHT PICTURE (what the player sees, ${q.viewport.join('x')}):`);
+  console.log(`       rim = ${q.rimPlane}, radius ${q.rimRadiusM} m from ${q.rimRadiusFrom}`);
+  console.log(`            (sight.glassR ${q.rearGlassR}, sight.frontGlassR ${q.frontGlassR})`);
+  console.log(`       disc r=${q.discRadiusPx}px (${q.discDiameterPct}% of frame height), ${q.samples} samples`);
+  console.log(`       BLOCKED ${q.blockedPct}%   centre->rim bands ${q.byBandPct.map((v) => `${v}%`).join(' ')}`);
+  const hot = Object.entries(q.byClockPct).filter(([, v]) => v > 0)
+    .sort((a, z) => z[1] - a[1]).map(([k, v]) => `${k}o'clock ${v}%`);
+  console.log(`       worst clock: ${hot.length ? hot.slice(0, 5).join('  ') : 'nothing obstructing'}`);
+  for (const [k, v] of Object.entries(q.blockers).sort((a, z) => z[1] - a[1])) {
+    console.log(`       ${k}: ${((v / q.samples) * 100).toFixed(1)}% of the picture`);
+  }
+  console.log(`       optic axis off screen centre ${q.opticAxisOffsetPx.x}, ${q.opticAxisOffsetPx.y} px`);
+  if (q.reticleOffsetPx) {
+    console.log(`       reticle off screen centre ${q.reticleOffsetPx.x}, ${q.reticleOffsetPx.y} px  (${q.reticleVsAxisPx} px off the optic axis)`);
+  }
+  console.log(`       USABLE: ${q.blockedPct < 8 && q.discDiameterPct > 12 ? 'yes' : 'NO'}`);
 }
 
 await writeFile(path.join(OUT, 'sightline.json'), JSON.stringify({ far: FAR, results, logs }, null, 2));

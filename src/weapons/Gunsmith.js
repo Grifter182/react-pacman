@@ -211,19 +211,49 @@ export function weaponMaterials() {
     material: Object.assign({ roughness: 1.90, aoMapIntensity: VIEWMODEL_AO }, DIELECTRIC),
   });
 
-  // Rail, handguard and optic housings: type-III hard anodising. Darker than
-  // the receiver and markedly rougher — anodising is a ceramic oxide, not a
-  // coating, and it scatters rather than reflecting. Finer grain too, because
-  // these are small extruded sections rather than a forging.
-  //
-  // `repeat` is not decoration. `worldScale` is the frequency the recipe BAKES
-  // at, and the contract in TextureFactory is that a UV-mapped caller sets its
-  // UV scale to match. The Kit projects the whole weapon at one scale
-  // (1/BODY_TILE) because the parts share a merged buffer and a single UV
-  // channel, so the only way to give a slot its own metres-per-tile is to tile
-  // its texture. Without this the anodised grain was baked for a 0.20 m tile
-  // and then stretched across a 0.35 m one — 1.75x too coarse, on the part that
-  // sits nearest the eye in ADS.
+  /* Rail, handguard and optic housings: type-III hard anodising. Darker than
+   * the receiver and markedly rougher — anodising is a ceramic oxide, not a
+   * coating, and it scatters rather than reflecting.
+   *
+   * READ THIS BEFORE CHANGING THE COLOUR HERE, BECAUSE IT IS NOT WHAT IT LOOKS
+   * LIKE. The fourth argument is a SHIM and `preset` deliberately DROPS IT when
+   * the named recipe exists. `getMaterialCatalog()` publishes `rail_anodised`
+   * today — checked, in Node, against the live catalog — so the whole of the
+   * object below is dead on every code path the game takes, and the rail's
+   * rendered colour and roughness come out of `Recipes.rail_anodised`:
+   * `C_ANODISE = srgb(0.210, 0.208, 0.211)`, i.e. 0.0345 linear, type-III
+   * black, at roughness 0.86 and `metalness 0`. That is already near-black
+   * hardcoat with no bright-steel wear anywhere, which is what the part is.
+   *
+   * A review of this line read `new THREE.Color(0.62, 0.63, 0.66)` as "a light
+   * neutral grey", and it is worth being precise about why that reading is
+   * wrong even on the dead path: `material.color` MULTIPLIES the recipe's
+   * albedo map, and `gunmetal` bakes at 0.04-0.06. 0.62 x 0.05 is 0.031 linear
+   * — darker than the receiver next to it, not lighter. There has never been a
+   * bare-aluminium rail on this weapon; there was a number that looked like one
+   * if you read it as an absolute.
+   *
+   * What the shim IS still for is the day someone unpublishes the recipe. So it
+   * is kept, and its numbers are now the fallback that lands closest to the
+   * live recipe rather than an older guess. The colour multiplier is 0.70 x
+   * `gunmetal`'s 0.05 = 0.035 linear against C_ANODISE's 0.0345, biased warm by
+   * about 9% (a loaded oxide goes slightly brown, never blue — the old figure
+   * was biased the wrong way, which is the one substantive thing about it that
+   * was wrong). The roughness multiplier is 3.0 rather than 1.22: gunmetal's
+   * gloss floor is 0.17 and the receiver's x1.90 lifts it to 0.32, which leaves
+   * the fallback rail GLOSSIER than the recipe's 0.86 — the opposite of
+   * hardcoat. x3.0 puts the floor at 0.51 and saturates the matte majority, so
+   * the rail stays the flattest metal on the gun on either path.
+   *
+   * `worldScale` / `repeat`: `worldScale` is the frequency the recipe BAKES at,
+   * and the contract in TextureFactory is that a UV-mapped caller sets its UV
+   * scale to match. The Kit projects the whole weapon at one scale
+   * (1/BODY_TILE) because the parts share a merged buffer and a single UV
+   * channel, so the only way to give a slot its own metres-per-tile is to tile
+   * its texture. `rail_anodised` bakes at 0.35 m for exactly this reason and
+   * therefore needs no `repeat` at all — see the worldScale table in Recipes.js,
+   * and note that changing `repeat` here obliges a matching change there.
+   */
   const rail = preset('rail_anodised', 'gunmetal', {
     seed: 137, size: half, detailStrength: 0.58,
   }, {
@@ -231,7 +261,7 @@ export function weaponMaterials() {
     repeat: (BODY_TILE / 0.20) * VIEWMODEL_MAGNIFY * 0.55,
     envMapIntensity: 0.70,
     material: Object.assign(
-      { color: new THREE.Color(0.62, 0.63, 0.66), roughness: 1.22, aoMapIntensity: VIEWMODEL_AO },
+      { color: new THREE.Color(0.70, 0.67, 0.64), roughness: 3.00, aoMapIntensity: VIEWMODEL_AO },
       DIELECTRIC),
   });
 
@@ -657,7 +687,25 @@ function barrelAssembly(kit, M, D, hg, opticFitted) {
     }
   }
 
-  // Muzzle device.
+  /* --- muzzle device -----------------------------------------------------
+   * THE MUZZLE DEVICE HAD NO BODY. All three of these `lathe()` calls passed
+   * `seg` — the module-level *function* `seg(kind, D)` — where the radial
+   * segment count goes. `THREE.LatheGeometry` does `segments = Math.floor(
+   * segments)`, `Math.floor(aFunction)` is NaN, and its build loop is
+   * `for (i = 0; i <= segments; i++)`, which never runs against NaN. Verified
+   * in isolation: `new LatheGeometry(pts, () => 1)` yields a geometry with
+   * ZERO vertices, against 50 for the same profile at 24 segments.
+   *
+   * So every weapon shipped with the flash hider / compensator / brake BODY
+   * absent and only its prongs and ports present — four 4 mm bars floating in
+   * space off the end of a barrel that stopped at the crown. That is the whole
+   * of "the muzzle is not in frame": it was in frame, it was not there. It is
+   * `sgB` (= SEG.barrel[D]) that belongs here, the same count the barrel itself
+   * is turned at, so the device and the barrel share a silhouette.
+   *
+   * `muzzleTop` was computed from the intended radii and pushed onto `skyline`
+   * regardless, so the sight cone has always cleared a device that was not
+   * being drawn; nothing about the optic's height changes with this fix. */
   let tipZ, muzzleTop;
   if (M.muzzle === 'flashhider') {
     tipZ = zM - 0.040;
@@ -666,7 +714,7 @@ function barrelAssembly(kit, M, D, hg, opticFitted) {
       [0, zM + 0.001], [R * 1.35, zM + 0.001], [R * 1.35, zM - 0.006],
       [R * 1.20, zM - 0.008], [R * 1.20, tipZ], [R * 0.62, tipZ],
       [R * 0.62, tipZ + 0.016], [0, tipZ + 0.016],
-    ], seg), S_BARREL, { pos: [0, 0.010, 0] });
+    ], sgB), S_BARREL, { pos: [0, 0.010, 0] });
     // Four prongs with the classic open slots between them.
     for (let i = 0; i < 4; i++) {
       const a = (i / 4) * Math.PI * 2 + Math.PI / 4;
@@ -676,28 +724,48 @@ function barrelAssembly(kit, M, D, hg, opticFitted) {
           .multiply(new THREE.Matrix4().makeTranslation(0, R * 1.16, 0)),
       });
     }
+    // Crush washer behind the shroud: the joint that says the device is threaded
+    // onto a barrel rather than continuous with it. A `tube` rather than an open
+    // lathe strip, so its section is closed, and its bore is set INSIDE the
+    // barrel's 0.93R shank so the inner wall is buried rather than floating.
+    kit.add(tube(R * 1.28, R * 0.90, zM + 0.0015, zM + 0.0075, sgB), S_BARREL, { pos: [0, 0.010, 0] });
   } else if (M.muzzle === 'compensator') {
     tipZ = zM - 0.028;
     muzzleTop = 0.010 + R * 1.45;
     kit.add(lathe([
       [0, zM + 0.001], [R * 1.45, zM + 0.001], [R * 1.45, tipZ + 0.002], [R * 1.10, tipZ],
       [R * 0.55, tipZ], [R * 0.55, tipZ + 0.012], [0, tipZ + 0.012],
-    ], seg), S_BARREL, { pos: [0, 0.010, 0] });
+    ], sgB), S_BARREL, { pos: [0, 0.010, 0] });
     for (let i = 0; i < 3; i++) {
       kit.mirrored((k) => k.add(chamferBox(0.0016, 0.010, 0.0042, 0.0004), S_BARREL,
         { pos: [R * 1.4, 0.010, zM - 0.006 - i * 0.007] }));
     }
+    // Two upward gas ports — a compensator vents up, that is what it is for,
+    // and they are the detail the muzzle flash lights from inside.
+    for (let i = 0; i < 2; i++) {
+      kit.add(chamferBox(0.0075, 0.0016, 0.0042, 0.0004), S_BARREL,
+        { pos: [0, 0.010 + R * 1.40, zM - 0.008 - i * 0.009] });
+    }
+    kit.add(tube(R * 1.34, R * 0.90, zM + 0.0015, zM + 0.0075, sgB), S_BARREL, { pos: [0, 0.010, 0] });
   } else {
     tipZ = zM - 0.052;
     muzzleTop = 0.010 + R * 1.62;
     kit.add(lathe([
       [0, zM + 0.001], [R * 1.60, zM + 0.001], [R * 1.60, tipZ + 0.004], [R * 1.25, tipZ],
       [R * 0.55, tipZ], [R * 0.55, tipZ + 0.018], [0, tipZ + 0.018],
-    ], seg), S_BARREL, { pos: [0, 0.010, 0] });
+    ], sgB), S_BARREL, { pos: [0, 0.010, 0] });
     for (let i = 0; i < 3; i++) {
       kit.mirrored((k) => k.add(chamferBox(0.0022, 0.014, 0.0060, 0.0005), S_BARREL,
         { pos: [R * 1.55, 0.010, zM - 0.010 - i * 0.012], rot: [0.22, 0, 0] }));
     }
+    // Baffle slots cut through the top of the can, between the side ports. A
+    // brake with solid walls between its ports reads as a machined slug; these
+    // are the openings the eye needs to believe gas leaves through them.
+    for (let i = 0; i < 3; i++) {
+      kit.add(chamferBox(0.0090, 0.0018, 0.0055, 0.0004), S_BARREL,
+        { pos: [0, 0.010 + R * 1.56, zM - 0.016 - i * 0.012] });
+    }
+    kit.add(tube(R * 1.48, R * 0.90, zM + 0.0015, zM + 0.0085, sgB), S_BARREL, { pos: [0, 0.010, 0] });
   }
   // The muzzle device is the furthest thing downrange, so it needs the least
   // height to intrude on the sight line — sample it at both ends of its body.
@@ -926,26 +994,6 @@ function magazineMesh(M, mats, D) {
  */
 
 /**
- * Fraction of the frame HEIGHT the optic housing may subtend when aimed. A
- * scope is allowed more because the player is meant to be looking *through* it;
- * a red dot is meant to be looked *past*.
- */
-const OPTIC_FRAME_FRAC = { reddot: 0.19, reflex: 0.19, scope: 0.27 };
-
-/**
- * Solve eye relief so a housing of radius `r` lands on its frame fraction.
- * Measured against the ADS field of view, not the hip one: CameraRig narrows
- * the viewmodel FOV by `ADS_FOV_SCALE` while aiming, and that is the frame the
- * optic is actually judged in. Getting this wrong by that factor is a 16% error
- * in the only number the complaint was about.
- */
-const ADS_FOV_SCALE = 0.86;
-function eyeReliefFor(r, kind) {
-  const fov = Config.camera.viewmodelFov * ADS_FOV_SCALE;
-  const tanY = Math.tan(THREE.MathUtils.degToRad(fov) * 0.5);
-  return r / ((OPTIC_FRAME_FRAC[kind] ?? OPTIC_FRAME_FRAC.reddot) * tanY);
-}
-/**
  * THE SIGHT PICTURE — the clear half-angle, in radians, of the cone the player
  * has to be able to see the world through.
  *
@@ -965,9 +1013,7 @@ function eyeReliefFor(r, kind) {
  *  1. **The bores were cylinders.** The eye is a point, so the pencil of rays
  *     that reaches it through a tube widens downrange. A straight bore of
  *     radius r and length L with the eye d behind it clips the cone at the
- *     FRONT rim — half-angle r/(d+L), not r/d. On the red dot that turned a
- *     15.2 mm aperture into an effective 10.9 mm one and filled 48% of the
- *     visible hole with tube wall seen end-on. `boredTube` now lays every bore
+ *     FRONT rim — half-angle r/(d+L), not r/d. `boredTube` now lays every bore
  *     ON the cone instead, which is exactly why a real objective bell is wider
  *     than its ocular.
  *  2. **The scope's rings and its ocular bell were solid `cyl()` plugs**
@@ -977,23 +1023,161 @@ function eyeReliefFor(r, kind) {
  *  3. **The mounts were far too short.** A 21 mm axis-over-rail on a 30 mm tube
  *     leaves 2 mm of mount, which is not a mount; more to the point it puts the
  *     rifle's own handguard rail, gas block and muzzle device inside the sight
- *     cone, because that cone drops 32 mm over the 530 mm to the front of the
- *     rail. Mount height is now SOLVED against the gun's own skyline rather
+ *     cone. Mount height is now SOLVED against the gun's own skyline rather
  *     than picked, which is why `handguard()` and `barrelAssembly()` report
  *     where their tallest points are.
  *
- * 0.060 rad is 74% of the red dot's own subtended radius, so the sight reads as
- * a rim around a clear field rather than as a peephole, and the tube walls no
- * longer vignette at the eye relief actually in use — the raycast fan is clear
- * to 96% of the lens radius at every quality tier.
+ * ------------------------------------------------------------------------
+ * WHY IT IS 0.084 AND NOT 0.060, AND WHAT THAT COST
  *
- * Raising it further is not free, and the cost falls in a place that is easy to
- * miss: the cone DROPS at this angle as it runs downrange, so every extra
- * milliradian pushes the optic another half-centimetre up its riser to keep the
- * muzzle out of the picture. 0.060 lands the red dot on a 34 mm mount, which is
- * a normal riser; 0.085 would need 51 mm, which is a stilt.
+ * At 0.060 the bore was clear and the sight was still not usable, because a
+ * clear bore is only half the question — the other half is HOW BIG the hole is,
+ * and 0.060 made it far too small to identify a target in. The screen-space
+ * probe (`tools/sightline-probe.mjs`, output in `shots/sightline/sightline.json`)
+ * measured the rendered rim at 61.7 px radius on all three weapons: a sight
+ * picture 13.7% of the frame height, about a sixth of the frame, at 1600x900.
+ *
+ * That figure is not a coincidence of three different optics landing on the
+ * same number, and it is not governed by eye relief or by the optic's internal
+ * diameter. Every clear radius on this weapon is derived from the cone, so
+ * `rClear = SIGHT_CLEAR * d` at every plane, and the projected radius of any of
+ * them is
+ *
+ *     discDiameterPct = 100 * SIGHT_CLEAR / tan(fovAds / 2)
+ *
+ * — the distance cancels. Eye relief cancels. The bell diameter cancels. THE
+ * SIGHT PICTURE IS THIS CONSTANT AND THE ADS FIELD OF VIEW, AND NOTHING ELSE.
+ * (Checked against the probe: 100 * 0.060 / tan(23.65 deg) = 13.71, and the
+ * probe reported 13.7 on rifle, SMG and DMR alike.) The ADS FOV is
+ * `Config.camera.viewmodelFov * 0.86` and lives in CameraRig, so on this side
+ * of the fence SIGHT_CLEAR is the only lever there is.
+ *
+ * 0.084 puts the picture at 19.2% of frame height — a shipped-console-optic
+ * sight picture rather than a peephole — and it is paid for in two places:
+ *
+ *  1. THE OPTIC IS BIGGER ON SCREEN. It has to be. The housing subtends
+ *     `OPTIC_FRAME_FRAC`; the picture inside it subtends this constant over
+ *     tan(fovAds/2). Their ratio is fixed, so a 19.2% picture inside a 19%
+ *     housing is a tube with zero wall thickness — algebraically impossible,
+ *     which is why the frame fractions below had to go up with it. The red dot
+ *     now reads 23.5% of frame height instead of 19%, with the ring around the
+ *     picture 2.2% of frame height (~19 px at 900p) per side.
+ *  2. THE RISER IS TALLER. The cone DROPS at this angle as it runs downrange,
+ *     so the axis has to clear the gun's own handguard rail, gas block and
+ *     muzzle device by 40% more at every z. Measured, HIGH tier, rail deck to
+ *     optical axis:
+ *
+ *                    riser         over bore    eye relief
+ *       rifle  35.7 -> 44.0 mm  65 -> 73 mm   238 -> 184 mm
+ *       smg    34.8 -> 42.7 mm  62 -> 70 mm   210 -> 188 mm
+ *       dmr    38.0 -> 53.0 mm  70 -> 86 mm   182 -> 191 mm
+ *
+ *     1.73" of riser on the carbine sits between the two heights a real one
+ *     actually ships with (1.54" and 1.93"), so it reads as a deliberate mount
+ *     rather than a stilt. The DMR's 2.09" is the expensive one — its 255 mm
+ *     handguard carries a full-length rail a long way downrange, where the cone
+ *     has dropped furthest — and a high scope mount on a marksman rifle is
+ *     still a thing that exists. The riser is drawn, not implied: `solveOpticAxis`
+ *     feeds the column and clamp foot, so a taller answer builds a taller part.
+ *
+ * Do not "fix" this back down without re-reading the identity above: lowering
+ * it shrinks the sight picture proportionally and nothing else changes.
  */
-const SIGHT_CLEAR = 0.060;
+export const SIGHT_CLEAR = 0.084;
+
+/**
+ * Fraction of the frame HEIGHT the optic housing may subtend when aimed. A
+ * scope is allowed more because the player is meant to be looking *through* it;
+ * a red dot is meant to be looked *past*.
+ *
+ * THESE ARE A TARGET, NOT A GUARANTEE, and the reason matters. The clear picture
+ * inside the housing subtends `SIGHT_CLEAR / tan(fovAds/2)` of the frame height —
+ * 19.2% at the default 55-degree viewmodel FOV — so a fraction at or below that
+ * describes a housing thinner than its own aperture, which is not a look, it is
+ * an impossibility. `Config.camera.viewmodelFov` is a PLAYER SETTING with a
+ * 35-90 degree range (`InputMap`), and at the narrow end everything subtends
+ * more of the frame: at 35 degrees the picture alone is 31% of frame height and
+ * no fraction below that can be honoured. `eyeReliefForWall` therefore treats
+ * these as a floor on the housing and lets it grow when the FOV demands it — see
+ * `WALL_RATIO_MIN` there. It must not throw: this runs inside `buildWeapon`
+ * during `WeaponModule.init`, and a throw there is a black screen.
+ */
+const OPTIC_FRAME_FRAC = { reddot: 0.235, reflex: 0.26, scope: 0.30 };
+
+/**
+ * Housing wall between the clear aperture and the outside of the optic, at the
+ * plane nearest the eye — the ocular rim of a tube, the rear frame of a reflex.
+ *
+ * THIS IS THE AUTHORED NUMBER AND THE RADIUS IS DERIVED FROM IT, not the other
+ * way round, for the same reason the bell's outside is derived from its bore:
+ * with the aperture solved from the sight cone, authoring the outside diameter
+ * means the wall thickness is whatever is left over, and at a wide enough cone
+ * what is left over is negative. A 30 mm red-dot body really is about 3.4 mm of
+ * aluminium at the ocular; a scope ocular bell is much thicker; a reflex's rear
+ * frame is a 4.2 mm rail plus clearance.
+ */
+const OPTIC_WALL = { reddot: 0.0034, reflex: 0.0056, scope: 0.0077 };
+
+/**
+ * Solve eye relief from the housing WALL thickness rather than from its outside
+ * radius, so the solve cannot be circular.
+ *
+ * Measured against the ADS field of view, not the hip one: CameraRig narrows
+ * the viewmodel FOV by `ADS_FOV_SCALE` while aiming, and that is the frame the
+ * optic is actually judged in. Getting this wrong by that factor is a 16% error
+ * in the only number the complaint was about.
+ *
+ * The algebra. Let `F = FRAME_FRAC * tan(fovAds/2)` and `k = SIGHT_CLEAR`. The
+ * housing's outer radius at the eye-side plane must satisfy `rOuter / E = F`
+ * (that is what the frame fraction means) and its aperture `rClear / E = k`
+ * (that is what the cone means), so
+ *
+ *     wall / E = F - k     ->     E = wall / (F - k)
+ *
+ * and the outer radius falls out as `k * E + wall`. Authoring `rOuter` instead
+ * and solving `E = rOuter / F` — which is what this used to do — quietly
+ * disagrees with the cone by `k * E`, and once `k` grew that disagreement was
+ * larger than the wall: the red dot's bore came out WIDER than its own housing.
+ *
+ * `setback` is the distance from the rear GLASS plane (where eye relief is
+ * measured, because that is where `sightGroup` sits and therefore what the ADS
+ * pose is derived from) forward to the eye-side RIM of the housing, which is
+ * the ring that actually subtends the frame fraction. On a scope that is 28 mm
+ * of ocular bell and ignoring it made the tube 17% larger on screen than the
+ * fraction claimed.
+ *
+ * `F - k` is a difference of two numbers that are close together and one of them
+ * is under the player's control, so it can go to zero or negative — see the note
+ * on OPTIC_FRAME_FRAC. `WALL_RATIO_MIN` floors it. It is expressed as a fraction
+ * of `SIGHT_CLEAR` rather than as an absolute so it means the same thing at every
+ * FOV: "the housing wall is at least this fraction of the aperture radius". 0.18
+ * is a little under what the authored fractions give at the default 55-degree FOV
+ * (0.22), so at 55 degrees this floor is inactive and the fractions above are
+ * exactly honoured; below about 47 degrees it takes over and the optic simply
+ * gets bigger on screen, which is what a narrower FOV means.
+ */
+const ADS_FOV_SCALE = 0.86;
+const WALL_RATIO_MIN = 0.18;
+/**
+ * Shortest eye relief the solve may return, at the wide end of the FOV slider.
+ *
+ * At 90 degrees the frame fraction alone asks for 37 mm, which would put the
+ * rear glass 37 mm from the camera and shrink the whole optic to a 12 mm tube.
+ * The geometry stays self-consistent there (the housing is derived from the cone
+ * at whatever relief it gets) but 50 mm is about the shortest a real cheek weld
+ * ever is, so this floors it and lets the optic subtend more than its fraction
+ * instead. Inactive at any FOV at or below about 70 degrees.
+ */
+const EYE_RELIEF_MIN = 0.075;
+function adsTanY() {
+  return Math.tan(THREE.MathUtils.degToRad(Config.camera.viewmodelFov * ADS_FOV_SCALE) * 0.5);
+}
+function eyeReliefForWall(kind, setback = 0) {
+  const F = (OPTIC_FRAME_FRAC[kind] ?? OPTIC_FRAME_FRAC.reddot) * adsTanY();
+  const wall = OPTIC_WALL[kind] ?? OPTIC_WALL.reddot;
+  const room = Math.max(F - SIGHT_CLEAR, SIGHT_CLEAR * WALL_RATIO_MIN);
+  return Math.max(wall / room, EYE_RELIEF_MIN) + setback;
+}
 
 /** Bore radius carried over the cone, so a facet chord never eats into it. */
 const BORE_SLACK = 0.0007;
@@ -1033,26 +1217,33 @@ function opticAssembly(kit, M, D, kind, railY, zc, skyline = []) {
   if (kind === 'scope') {
     const zR = zc + 0.075, zF = zc - 0.115;
     const rearZ = zR - 0.028, frontZ = zF + 0.006;
-    const eyeRelief = eyeReliefFor(0.0215, 'scope');
+    const eyeRelief = eyeReliefForWall('scope', zR - rearZ);
     const zEye = rearZ + eyeRelief;
     const cone = (z) => SIGHT_CLEAR * (zEye - z);
     /* The bore is the cone everywhere EXCEPT inside the ocular, where it opens
      * back out toward the eye. Nothing downstream of the last element can widen
      * the field, so the flare buys no extra sight picture — what it buys is the
-     * look. A cylindrical bore behind a 43 mm ocular presents 20 mm of wall
+     * look. A cylindrical bore behind a wide ocular presents a ring of wall
      * seen almost exactly end-on, which shades to black and reads as a plugged
      * scope; a bell catches the same light at 25 degrees and reads as the
-     * inside of an eyepiece, which is what it is. */
-    const bore = (z) => Math.max(cone(z), 0.0193 - (zR - z) * 0.45);
+     * inside of an eyepiece, which is what it is.
+     *
+     * The flare is stated as a clearance INSIDE the ocular rim rather than as
+     * an absolute radius. Authored absolutely (it was 19.3 mm) it silently
+     * became a stop the moment the cone grew past it, i.e. a black ring inside
+     * the eyepiece — the exact defect the cone was introduced to remove. */
+    const rOc = cone(zR) + OPTIC_WALL.scope;
+    // The flare peaks 3.8 mm inside the rim — half the 7.7 mm ocular wall, less
+    // the 0.7 mm of BORE_SLACK the tube carries, so the rim keeps ~3 mm of metal.
+    const bore = (z) => Math.max(cone(z), rOc - 0.0038 - (zR - z) * 0.45);
 
-    // Stations along the tube. The ocular's outside diameter is held at the
-    // authored 21.5 mm because that is what `eyeReliefFor` sizes the whole ADS
-    // frame against — it is the nearest and therefore largest-subtending ring
-    // on the optic, so the silhouette is unchanged by everything below.
+    // Stations along the tube. The ocular's outside radius is the one the ADS
+    // frame is sized against — it is the nearest and therefore largest-
+    // subtending ring on the optic, so it sets the silhouette and everything
+    // below is derived from the cone.
     const zOc1 = zR - 0.026, zT0 = zR - 0.036;
     const zS0 = zc + 0.006, zS1 = zc - 0.026, zT1 = zS1 - 0.006;
     const zB0 = zF + 0.050, zB1 = zF + 0.026;
-    const rOc = 0.0215;
     const rTubeR = cone(zS0) + 0.0024;
     const rSad = cone(zS1) + 0.0058;
     const rTubeF = cone(zB0) + 0.0024;
@@ -1121,34 +1312,60 @@ function opticAssembly(kit, M, D, kind, railY, zc, skyline = []) {
   }
 
   if (kind === 'reflex') {
+    /* A CLOSED-EMITTER REFLEX — glass at BOTH ends, which is the fix for the
+     * measurement trap the sight-line probe fell into on this weapon.
+     *
+     * It used to be an open emitter: a shroud with one canted reflector at the
+     * rear and nothing at the front. `tools/sightline-probe.mjs` reported
+     * `rimPlane: "sight group origin (no lensFront mesh found)"` for it and fell
+     * back to measuring the sight picture at the REAR glass, on a plane 42 mm
+     * behind the one that actually clips the view. Every other weapon was
+     * measured at its front element. Two of the three optics being measurable
+     * and one not is how three rounds of wrong conclusions happened, and the
+     * cure is not a special case in the probe — it is for every optic on the
+     * gun to have the same two planes.
+     *
+     * A closed emitter (Aimpoint ACRO, Steiner MPS, Holosun 509T) is the real
+     * part that has them: the same reflector, sealed behind a front window, in a
+     * box rather than an open frame. So the shroud gets a floor and a front
+     * element, and `frontGlassR` is published like the tube optics'. */
     const rearZ = zc + 0.020, frontZ = zc - 0.022;
-    const eyeRelief = eyeReliefFor(0.0175, 'reflex');
+    // The rear frame IS the eye-side rim on a reflex — no ocular bell to set
+    // back through, unlike the tube optics.
+    const eyeRelief = eyeReliefForWall('reflex', 0);
     const zEye = rearZ + eyeRelief;
     const bore = (z) => SIGHT_CLEAR * (zEye - z);
 
-    // An open-emitter reflex has no tube, so its "bore" is the rectangle framed
-    // by the shroud. Size it on the cone at the FRONT of the shroud, which is
-    // where the cone is widest and where the old arms were 4 mm too close in.
+    // The window is the rectangle framed by the shroud. Size it on the cone at
+    // the FRONT of the shroud, which is where the cone is widest and where the
+    // old arms were 4 mm too close in.
     const zS0 = zc + 0.020, zS1 = zc - 0.026;
     const w = bore(zS1) + 0.0014;
-    const drop = w + 0.0125;
+    // Underside of the sealed body: floor plate, then the emitter block under it.
+    const FLOOR = 0.0052, EMIT = 0.0110;
+    const drop = w + FLOOR + EMIT;
     const axisY = solveOpticAxis(railY, zEye, drop, skyline);
     const zSc = (zS0 + zS1) * 0.5, zSl = zS0 - zS1;
 
     kit.mirrored((k) => {
-      k.add(chamferBox(0.0042, w * 1.9, zSl, 0.0010), S_RAIL, { pos: [w + 0.0021, axisY + 0.001, zSc] });
+      // 2.1x rather than 1.9x: the front window is a circle of the cone's
+      // radius at that plane, and at 1.9 the glass overhung the side walls.
+      k.add(chamferBox(0.0042, w * 2.1, zSl, 0.0010), S_RAIL, { pos: [w + 0.0021, axisY, zSc] });
       if (D >= 1) k.add(cyl(0.0020, 0.0017, 0.0026, sgT), S_RAIL, { pos: [w + 0.0042, axisY - w * 0.55, zSc + 0.012], rot: [0, Math.PI / 2, 0] });
     });
     kit.add(chamferBox(w * 2 + 0.0104, 0.0052, zSl, 0.0010), S_RAIL, { pos: [0, axisY + w + 0.0026, zSc] });
-    kit.add(chamferBox(w * 2 + 0.0070, 0.0110, 0.021, 0.0012), S_RAIL, { pos: [0, axisY - w - 0.0055, zc + 0.008] });   // emitter housing
-    kit.add(chamferBox(w * 2 + 0.0040, 0.0070, 0.012, 0.0010), S_RAIL, { pos: [0, axisY - w - 0.0035, zc - 0.026] });   // front hood lip
+    // Floor plate: what makes this a sealed body rather than an open frame, and
+    // what the front window needs to seat against.
+    kit.add(chamferBox(w * 2 + 0.0104, FLOOR, zSl, 0.0010), S_RAIL, { pos: [0, axisY - w - FLOOR * 0.5, zSc] });
+    kit.add(chamferBox(w * 2 + 0.0070, EMIT, 0.021, 0.0012), S_RAIL, { pos: [0, axisY - w - FLOOR - EMIT * 0.5, zc + 0.008] });   // emitter block
+    kit.add(chamferBox(w * 2 + 0.0040, 0.0070, 0.012, 0.0010), S_RAIL, { pos: [0, axisY - w - FLOOR - 0.0035, zc - 0.026] });    // front hood lip
     if (D >= 1) {
-      kit.add(cyl(0.0058, 0.0050, 0.0075, sgT), S_RAIL, { pos: [w + 0.0030, axisY - w - 0.0055, zc + 0.014], rot: [0, Math.PI / 2, 0] });  // battery cap
-      kit.mirrored((k) => k.add(chamferBox(0.0028, 0.0060, 0.0028, 0.0006), S_RAIL, { pos: [0.0075, axisY - w - 0.0120, zc + 0.012] }));    // adjust buttons
+      kit.add(cyl(0.0058, 0.0050, 0.0075, sgT), S_RAIL, { pos: [w + 0.0030, axisY - w - FLOOR - EMIT * 0.5, zc + 0.014], rot: [0, Math.PI / 2, 0] });  // battery cap
+      kit.mirrored((k) => k.add(chamferBox(0.0028, 0.0060, 0.0028, 0.0006), S_RAIL, { pos: [0.0075, axisY - w - FLOOR - EMIT, zc + 0.012] }));          // adjust buttons
     }
 
     // Riser: a clamp foot on the rail and a column up to the emitter housing.
-    const bodyBot = axisY - w - 0.0110;
+    const bodyBot = axisY - w - FLOOR - EMIT;
     const riseH = Math.max(0.004, bodyBot - railY);
     kit.add(chamferBox(0.019, riseH, 0.030, 0.0014), S_RAIL, { pos: [0, railY + riseH * 0.5, zc + 0.004] });
     kit.add(chamferBox(0.031, 0.0085, 0.034, 0.0012), S_RAIL, { pos: [0, railY + 0.0042, zc + 0.004] });
@@ -1157,19 +1374,30 @@ function opticAssembly(kit, M, D, kind, railY, zc, skyline = []) {
     return {
       axisY, rearZ, frontZ,
       glassR: SIGHT_CLEAR * eyeRelief,
-      housingR: w + 0.0042, eyeRelief, flat: true,
+      frontGlassR: SIGHT_CLEAR * (zEye - frontZ),
+      housingR: w + 0.0042, eyeRelief,
+      // `flat` no longer means "one element" — it means "no tube", i.e. the rear
+      // element is a canted reflector in a box rather than a lens in a bore.
+      // The front window exists either way; see `frontGlassR` above.
+      flat: true,
     };
   }
 
   // ----------------------------------------------------------- 30 mm red dot
   const zR = zc + 0.038, zF = zc - 0.040, zH = zF - 0.014;
   const rearZ = zR - 0.004, frontZ = zF + 0.004;
-  const eyeRelief = eyeReliefFor(0.0198, 'reddot');
+  const eyeRelief = eyeReliefForWall('reddot', zR - rearZ);
   const zEye = rearZ + eyeRelief;
   const cone = (z) => SIGHT_CLEAR * (zEye - z);
-  // Ocular bell: see the note on the scope's. Six millimetres of flare is
-  // enough on a 30 mm tube, because the clear cone already fills 74% of it.
-  const bore = (z) => Math.max(cone(z), 0.0165 - (zR - z) * 0.35);
+  // Ocular rim: derived from the cone plus its wall, never authored — see
+  // `eyeReliefForWall`. The flare behind it is likewise stated as a clearance
+  // inside the rim rather than as an absolute radius, so it can never become a
+  // stop when the cone grows.
+  const rOc = cone(zR) + OPTIC_WALL.reddot;
+  // Flare peaks 2.2 mm inside the rim, against a 3.4 mm wall and 0.7 mm of
+  // BORE_SLACK: about 1.5 mm of metal at the very rim, which is what a 30 mm
+  // red-dot body actually is there.
+  const bore = (z) => Math.max(cone(z), rOc - 0.0022 - (zR - z) * 0.35);
 
   /* Tube, turret saddle and sun hood as ONE closed surface of revolution.
    *
@@ -1180,14 +1408,14 @@ function opticAssembly(kit, M, D, kind, railY, zc, skyline = []) {
    * curved thing in the ADS frame viewed almost down its own axis, showed up as
    * a stippled, eaten-away bell rim.
    *
-   * The second is new: the OUTSIDE is derived from the inside, not the other way
+   * The second is: the OUTSIDE is derived from the inside, not the other way
    * round. Each station's wall thickness is added to the clear cone at that z,
    * so the housing widens toward the objective exactly as fast as the sight
-   * picture does. The ocular rim is the one exception — it is pinned at the
-   * authored 19 mm because `eyeReliefFor` sizes the whole ADS frame against it,
-   * and it is the nearest ring on the optic, so it is what sets the apparent
-   * size. The bell is now wider in metres and still smaller on screen. */
-  const rOc = 0.0190;
+   * picture does. That now includes the ocular rim, which used to be the one
+   * exception at an authored 19 mm — and which, once the cone widened, was
+   * NARROWER than its own bore. `eyeReliefForWall` inverts the relation so the
+   * rim is `cone + wall` and the eye relief is what makes that rim land on its
+   * frame fraction; see the algebra there. */
   const rBody0 = cone(zc + 0.014) + 0.0024;
   const rSad = cone(zc) + 0.0034;
   const rBody1 = cone(zc - 0.016) + 0.0024;
@@ -1224,8 +1452,20 @@ function opticAssembly(kit, M, D, kind, railY, zc, skyline = []) {
   if (D >= 1) {
     kit.addParts(knurl(D >= 2 ? 18 : 12, 0.0074, 0.0105), S_RAIL, { pos: [0, axisY + rSad + 0.0040, zc + 0.002], rot: [-Math.PI / 2, 0, 0] });
     kit.addParts(knurl(D >= 2 ? 16 : 10, 0.0082, 0.0080), S_RAIL, { pos: [-rSad - 0.0055, axisY - 0.0010, zc + 0.002], rot: [0, -Math.PI / 2, 0] });
-    // Brightness rocker on the left of the saddle.
-    kit.add(chamferBox(0.0030, 0.0140, 0.0165, 0.0006), S_RAIL, { pos: [-rSad + 0.0006, axisY + 0.0060, zc - 0.020] });
+    /* Brightness rocker on the left of the saddle. Placed against the cone at
+     * its OWN FORWARD END, not against `rSad`.
+     *
+     * `rSad` is the saddle radius at `zc`, and this part runs 8 mm forward of
+     * there, where the cone is wider — so a face set at `rSad - 0.0006` was
+     * 1.1 mm inside the bore at its front corner. The fan probe caught it as a
+     * single blocked ray at 9 o'clock on the outermost ring, hitting the optic
+     * at 0.234 m, and it is the same failure the turret caps carried before
+     * they were moved onto the saddle: a part positioned from a radius measured
+     * at a different z. Anything mounted on this tube has to be placed against
+     * `cone()` sampled where the part actually is. */
+    const zRk = zc - 0.020, lRk = 0.0165;
+    kit.add(chamferBox(0.0030, 0.0140, lRk, 0.0006), S_RAIL,
+      { pos: [-(cone(zRk - lRk * 0.5) + 0.0030), axisY + 0.0060, zRk] });
   }
   return {
     axisY, rearZ, frontZ,
@@ -1425,16 +1665,20 @@ export function buildWeapon(def, mats) {
   rearGlass.frustumCulled = false;
   sightGroup.add(rearGlass);
 
-  let frontGeo = null;
-  if (!optic.flat) {
-    frontGeo = new THREE.CircleGeometry(optic.frontGlassR ?? optic.glassR, seg('optic', D) + 4);
-    const frontGlass = new THREE.Mesh(frontGeo, mats[S_GLASS]);
-    frontGlass.name = 'lensFront';
-    frontGlass.position.z = optic.frontZ - optic.rearZ;
-    frontGlass.renderOrder = 3;
-    frontGlass.frustumCulled = false;
-    sightGroup.add(frontGlass);
-  }
+  /* EVERY OPTIC GETS A FRONT ELEMENT. It used to be gated on `!optic.flat`, so
+   * the SMG's reflex had glass at one end only — and the screen-space probe,
+   * which finds the rim of the sight picture by looking for a mesh called
+   * `lensFront`, silently fell back to the sight group origin and measured that
+   * weapon's picture on a plane 42 mm behind the one that clips it. An optic
+   * that cannot be measured the same way as its neighbours is a trap, not a
+   * design choice; the reflex is a closed emitter now and has the window. */
+  const frontGeo = new THREE.CircleGeometry(optic.frontGlassR ?? optic.glassR, seg('optic', D) + 4);
+  const frontGlass = new THREE.Mesh(frontGeo, mats[S_GLASS]);
+  frontGlass.name = 'lensFront';
+  frontGlass.position.z = optic.frontZ - optic.rearZ;
+  frontGlass.renderOrder = 3;
+  frontGlass.frustumCulled = false;
+  sightGroup.add(frontGlass);
 
   // The reticle is deliberately NOT parented here. A collimated sight puts its
   // dot at optical infinity, so WeaponModule re-places it every frame on the
@@ -1467,12 +1711,13 @@ export function buildWeapon(def, mats) {
     rot: new THREE.Euler(0, 0, 0),
   };
 
-  // Everything that will actually be drawn: the merged body plus the magazine,
-  // which hangs 17 cm below the bore and is the part that decides where the
-  // bottom of the frame falls.
+  // Everything that will actually be drawn: the merged body plus the magazine.
+  // The magazine is `soft` — it hangs 17 cm below the bore and a shipped
+  // viewmodel lets it run off the bottom edge, where the trigger guard and grip
+  // must not. See the target table in `solveHipPose`.
   const hipPose = solveHipPose([
     { array: bodyGeo.attributes.position.array, offset: null },
-    { array: mag.geometry.attributes.position.array, offset: mag.position },
+    { array: mag.geometry.attributes.position.array, offset: mag.position, soft: true },
   ], muzzle.position, sightGroup.position, { rx: 0, ry: 0.26, rz: 0.045 });
 
   const anchors = {
@@ -1486,6 +1731,41 @@ export function buildWeapon(def, mats) {
     root, body, parts, muzzle, ejectPort, reticle,
     sight: {
       group: sightGroup, glassR: optic.glassR, eyeRelief: optic.eyeRelief, flat: !!optic.flat,
+      /**
+       * Clear radius at the FRONT element, and the plane it belongs to.
+       *
+       * `glassR` is the cone's radius at the REAR glass, next to the eye.
+       * `frontGlassR` is its radius at the front element, further down the same
+       * widening cone. THEY ARE DIFFERENT PLANES AND DIFFERENT NUMBERS, and the
+       * rim of the sight picture — what the player actually looks through — is
+       * the front one.
+       *
+       * This was computed by `opticAssembly` and then not exported, so every
+       * consumer that reached for `sight.frontGlassR` got `undefined`, fell back
+       * to the rear radius, and measured the front plane with a disc 23-46%
+       * too small. That is the bug that reported a clear aperture with a sixth
+       * of the bore dead, and it cost three rounds of wrong conclusions. If a
+       * radius is published here it names its plane; do not add one that does not.
+       */
+      frontGlassR: optic.frontGlassR ?? null,
+      frontZ: optic.frontZ, rearZ: optic.rearZ,
+      /**
+       * The clear half-angle of the sight cone, in radians — `SIGHT_CLEAR`.
+       *
+       * Published so anything that has to stay OUT of the sight line can solve
+       * against the same number the optic was placed with, instead of guessing
+       * from a lens radius. The cone's bottom edge at any weapon-space z is
+       *
+       *     y = sight.group.position.y - clearAngle * (zEye - z)
+       *     zEye = sight.rearZ + sight.eyeRelief
+       *
+       * and its half-width at that z is `clearAngle * (zEye - z)`. THE SUPPORT
+       * HAND IS THE CURRENT CONSUMER: the screen-space probe measures 25% of the
+       * rifle's sight picture as 'leftHand/fingers' at 5-8 o'clock, with hit
+       * distances of 0.45-0.51 m against a front lens at 0.31 m, i.e. fingers
+       * standing up through the line of sight forward of the optic.
+       */
+      clearAngle: SIGHT_CLEAR,
       /**
        * Housing radius, and the reference the EYEBOX is measured in — see
        * `collimate`. It has to be separate from `glassR` now that the clear
@@ -1539,48 +1819,79 @@ export function buildWeapon(def, mats) {
  * So the pose is solved from the weapon's own geometry against the actual
  * viewmodel frustum:
  *   1. push it out until the OPTIC sits `SIGHT_DIST` from the eye, never
- *      letting the rearmost vertex come nearer than `BUTT_MIN`;
- *   2. raise it until *every* vertex clears the bottom edge;
+ *      letting the rearmost vertex come nearer than `BUTT_MIN`, and then FURTHER
+ *      if that is what it takes to keep the top of the optic off the crosshair;
+ *   2. raise it until the body clears the bottom edge and the magazine — which
+ *      is allowed past it — clears its own looser floor;
  *   3. slide it right until the muzzle sits just inboard of centre — the bore
  *      converging toward the point of aim, which is what hip fire looks like —
  *      but no further right than keeps every vertex inside the right edge,
  *      leaving the receiver, magwell and stock filling the bottom-right
  *      quadrant behind it.
  *
- * Steps 2 and 3 are solved over the real vertices, not over the bounding box.
- * A rifle's AABB corner at (lowest y, rearmost z) is the magazine floor
+ * Every step is solved over the real vertices, not over the bounding box. A
+ * rifle's AABB corner at (lowest y, rearmost z) is the magazine floor
  * teleported back to the butt pad — a point that exists on no part of the gun,
  * two hundred millimetres nearer the eye than the thing it claims to bound. In
  * perspective that error is not conservative in a useful direction: it lifts
- * the whole weapon a third of a screen. Both constraints are linear in the
- * offset being solved (`ndc = (t + p)/(tan * depth)`, and depth depends only on
- * `tz`), so the exact answer is a single max/min over vertices — one pass, no
- * iteration, ~50k points at build time.
+ * the whole weapon a third of a screen.
+ *
+ * Steps 2 and 3 are exact in one pass, because both are linear in the offset
+ * being solved (`ndc = (t + p)/(tan * depth)`, and depth depends only on `tz`) —
+ * a single max/min over vertices, no search. Step 1's extra push is the one
+ * place a search is needed, because the top constraint couples `ty` and `tz`;
+ * see the note on the bisection below.
  *
  * Screen targets are in NDC, so they hold at any aspect and any FOV.
  */
 function solveHipPose(meshes, muzzleLocal, sightLocal, rot) {
-  // These targets decide the weapon's APPARENT SIZE, not just whether it fits.
-  //
-  // The previous solve set depth from BUTT CLEARANCE: push the gun out until
-  // the rearmost vertex is 0.30 m from the eye. That is the wrong control
-  // variable, and it fails in a way that is invisible until you change the
-  // geometry. Apparent size is set by the distance to the part of the weapon
-  // the eye actually reads — the receiver and the optic — but butt clearance
-  // measures the distance to the part *furthest from* it. Shorten the stock and
-  // the gun gets closer and therefore BIGGER, which is the opposite of what
-  // shortening a stock is supposed to do; lengthen it and the gun shrinks even
-  // though nothing about the part the player looks at has changed.
-  //
-  // So depth is solved against the sight instead: put the optic SIGHT_DIST from
-  // the eye and everything else falls where the weapon's own proportions put
-  // it. Butt clearance survives as a *floor* (the near plane is 5 mm and
-  // geometry inside it eats the bottom of the frame), not as the target.
+  /* THE TARGETS. Measured before and after with a node probe that projects
+   * every drawn triangle to NDC against the real viewmodel frustum at 16:9 and
+   * rasterises the silhouette into a 160x90 grid, so "how much of the frame"
+   * is a number rather than an impression. At HIGH tier, hip rest pose:
+   *
+   *              BEFORE (x range / y range / frame coverage)
+   *   rifle   x[ 0.02, 0.48]  y[-1.03, -0.06]   4.7%
+   *   smg     x[ 0.02, 0.31]  y[-1.03, -0.04]   3.3%
+   *   dmr     x[ 0.01, 0.61]  y[-1.03,  0.00]   6.6%
+   *
+   * Two things in that table, and they point in OPPOSITE directions.
+   *
+   * The weapon does not eat the frame. It covers 3-7% of it; a shipped console
+   * viewmodel covers rather more. Moving it further out to "fit" would make a
+   * gun that already reads small read smaller, so depth is NOT the control used
+   * below — and `SIGHT_DIST` stays where it was.
+   *
+   * What is actually wrong is the VERTICAL placement, at both ends:
+   *
+   *  - The top. The DMR's scope reaches y = 0.00 — the tube crosses the
+   *    horizontal centreline, i.e. the HUD crosshair sits on the optic at hip
+   *    fire. (This got worse, not better, when the sight picture was widened:
+   *    a wider clear cone needs a taller riser, so the optic climbed.) That is
+   *    the constraint that has to be solved, and none of the old three targets
+   *    expressed it.
+   *  - The bottom. `BOTTOM_NDC` was -1.03: the solver deliberately pushed the
+   *    lowest vertex 3% of the frame height PAST the bottom edge. Note what it
+   *    did and did not do, because the obvious reading is wrong — the target
+   *    only ever moved `ty`, so it never made the weapon larger or nearer; it
+   *    simply cut the magazine floor off.
+   *
+   * So the bottom is now two constraints instead of one, split by what the part
+   * is. A shipped viewmodel DOES run its magazine off the bottom edge — that is
+   * what anchors the weapon to the frame instead of floating it — but it never
+   * cuts the trigger guard or the grip. `meshes` entries marked `soft` (the
+   * magazine) get the loose floor; the body gets the strict one. Splitting them
+   * is what buys the ~0.13 NDC of vertical room the top cap needs, WITHOUT
+   * pushing the weapon away and shrinking it.
+   */
   const SIGHT_DIST = 0.56;    // metres from the eye to the optical axis origin
   const BUTT_MIN = 0.20;      // rearmost vertex may come no nearer than this
-  const BOTTOM_NDC = -1.03;   // lowest vertex, just inside the bottom edge
-  const RIGHT_NDC = 0.72;     // keep the silhouette clear of the right edge
-  const MUZZLE_NDC = 0.03;    // muzzle sits fractionally right of the crosshair
+  const BOTTOM_NDC = -0.99;   // lowest vertex of the BODY, just inside the edge
+  const MAG_FLOOR_NDC = -1.18; // the magazine may hang off; not more than this
+  const TOP_NDC = -0.09;      // nothing above this — keeps the crosshair clear
+  const RIGHT_NDC = 0.86;     // keep the silhouette just inside the right edge
+  const MUZZLE_NDC = 0.06;    // muzzle sits fractionally right of the crosshair
+  const PUSH_MAX = 0.34;      // metres the top cap may push the weapon out by
   const NEAR = 0.02;
 
   const fovY = THREE.MathUtils.degToRad(Config.camera.viewmodelFov);
@@ -1590,40 +1901,108 @@ function solveHipPose(meshes, muzzleLocal, sightLocal, rot) {
   const tanX = tanY * (16 / 9);
 
   const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(rot.rx, rot.ry, rot.rz, 'YXZ'));
-  const v = new THREE.Vector3();
-  const each = (fn) => {
-    for (const { array, offset } of meshes) {
+
+  /* Rotate every vertex ONCE into a flat buffer. The solve below reads the set
+   * a couple of dozen times (see the bisection) and re-rotating 25k vertices
+   * per pass would turn a 1 ms build step into a 30 ms one.
+   *
+   * A MESH'S OWN POSITION IS ROTATED WITH IT. This used to read
+   * `applyQuaternion(q)` and *then* `add(offset)`, which is the wrong order —
+   * the world position of a magazine vertex is `q * (vert + magPos) + t`, not
+   * `q * vert + magPos`. With a 24 mm offset and a 15-degree yaw that put every
+   * magazine vertex about 2 mm from where it actually renders, so the bottom
+   * constraint was solved against a magazine that does not exist. */
+  let total = 0;
+  for (const m of meshes) total += m.array.length;
+  const P = new Float32Array(total);
+  const SOFT = new Uint8Array(total / 3);
+  {
+    const v = new THREE.Vector3();
+    let w = 0, s = 0;
+    for (const { array, offset, soft } of meshes) {
+      const flag = soft ? 1 : 0;
       for (let i = 0; i < array.length; i += 3) {
-        v.set(array[i], array[i + 1], array[i + 2]).applyQuaternion(q);
+        v.set(array[i], array[i + 1], array[i + 2]);
         if (offset) v.add(offset);
-        fn(v);
+        v.applyQuaternion(q);
+        P[w++] = v.x; P[w++] = v.y; P[w++] = v.z;
+        SOFT[s++] = flag;
       }
     }
-  };
+  }
+  const N = SOFT.length;
 
   let maxZ = -Infinity;
-  each((p) => { if (p.z > maxZ) maxZ = p.z; });
+  for (let i = 2; i < total; i += 3) if (P[i] > maxZ) maxZ = P[i];
   const sightZ = sightLocal.clone().applyQuaternion(q).z;
-  const tz = Math.min(-(sightZ + SIGHT_DIST), -(maxZ + BUTT_MIN));
 
-  let ty = -Infinity, txCap = Infinity;
-  each((p) => {
-    const d = -(tz + p.z);
-    if (d < NEAR) return;
-    const y = BOTTOM_NDC * tanY * d - p.y;
-    if (y > ty) ty = y;
-    const x = RIGHT_NDC * tanX * d - p.x;
+  /* Raise the weapon until BOTH floors are satisfied. Linear in `ty` for a
+   * fixed `tz`, so it is still one exact max over vertices — no search. */
+  const solveTy = (tz) => {
+    let ty = -Infinity;
+    for (let i = 0, j = 0; i < N; i++, j += 3) {
+      const d = -(tz + P[j + 2]);
+      if (d < NEAR) continue;
+      const y = (SOFT[i] ? MAG_FLOOR_NDC : BOTTOM_NDC) * tanY * d - P[j + 1];
+      if (y > ty) ty = y;
+    }
+    return Number.isFinite(ty) ? ty : 0;
+  };
+  const topAt = (tz, ty) => {
+    let top = -Infinity;
+    for (let i = 0, j = 0; i < N; i++, j += 3) {
+      const d = -(tz + P[j + 2]);
+      if (d < NEAR) continue;
+      const t = (P[j + 1] + ty) / (tanY * d);
+      if (t > top) top = t;
+    }
+    return top;
+  };
+
+  /* Depth. The near limit is the authored one — the optic at `SIGHT_DIST`, with
+   * butt clearance as a floor because geometry inside the 5 mm near plane eats
+   * the bottom of the frame. If the top cap is violated there, push out.
+   *
+   * This is the one place the solve needs a search rather than a max, and the
+   * reason is that the top constraint couples the two unknowns: `ty` depends on
+   * `tz` through the floors, and the top NDC depends on both. It is monotone —
+   * further away is always a lower top, because the bottom stays pinned to the
+   * edge while the angular span shrinks — so bisection is exact to the limit of
+   * the iteration count, and 26 halvings of a 340 mm interval resolves to five
+   * microns. Two passes over 25k vertices per halving is about 1 ms at build. */
+  const tzNear = Math.min(-(sightZ + SIGHT_DIST), -(maxZ + BUTT_MIN));
+  let tz = tzNear;
+  if (topAt(tzNear, solveTy(tzNear)) > TOP_NDC) {
+    let lo = tzNear, hi = tzNear - PUSH_MAX;      // hi is FURTHER (more negative)
+    if (topAt(hi, solveTy(hi)) > TOP_NDC) {
+      tz = hi;                                   // cannot be satisfied; take the best
+    } else {
+      for (let i = 0; i < 26; i++) {
+        const mid = (lo + hi) * 0.5;
+        if (topAt(mid, solveTy(mid)) > TOP_NDC) lo = mid; else hi = mid;
+      }
+      tz = hi;
+    }
+  }
+  const ty = solveTy(tz);
+
+  // Slide right until the muzzle sits just off the crosshair, but never so far
+  // that the silhouette crosses the right edge. The muzzle CROWN is the target,
+  // not a bounding-box corner: X is aimed at the bore line, so a wide optic or
+  // a stock cannot drag the point of aim sideways.
+  let txCap = Infinity;
+  for (let i = 0, j = 0; i < N; i++, j += 3) {
+    const d = -(tz + P[j + 2]);
+    if (d < NEAR) continue;
+    const x = RIGHT_NDC * tanX * d - P[j];
     if (x < txCap) txCap = x;
-  });
-
-  // The muzzle crown itself, not a bounding-box corner: X is aimed at the bore
-  // line, so a wide optic or stock cannot drag the point of aim sideways.
+  }
   const front = muzzleLocal.clone().applyQuaternion(q);
   const dFront = Math.max(NEAR, -(tz + front.z));
   const tx = Math.min(MUZZLE_NDC * tanX * dFront - front.x, txCap);
 
   return {
-    pos: new THREE.Vector3(tx, Number.isFinite(ty) ? ty : 0, tz),
+    pos: new THREE.Vector3(tx, ty, tz),
     rot: new THREE.Euler(rot.rx, rot.ry, rot.rz, 'YXZ'),
   };
 }

@@ -40,12 +40,33 @@ import { Config, QualityTier } from '../core/Config.js';
  * All of it is offscreen canvas compositing at boot. Per frame nothing changes:
  * still one rotated `drawImage`.
  *
- * ORIENTATION. World axes are +X east, +Z north; the camera's forward vector is
- * `(-sin yaw, -cos yaw)`. Map space flips Z so north is up before rotation, and
- * the canvas is then rotated by `PI - yaw`, which is the unique angle that puts
- * the player's forward vector on screen-up. Everything else — blips, the north
- * pip, the view cone — derives from those two facts rather than from a fudge
- * factor.
+ * ORIENTATION, AND THE BUG THAT LIVED HERE.
+ *
+ * A top-down plan is a view from ABOVE. That is a constraint, not a convention:
+ * looking down -Y, the screen basis must satisfy `right x up = +Y`, or you have
+ * drawn the view from underneath the level. This map used `+X` to the right and
+ * `+Z` up, and `(+X) x (+Z) = -Y` — so every plan it ever drew was MIRRORED.
+ *
+ * That failure hides, because the obvious test passes. The rotation angle was
+ * right, so the player's forward vector really did point at screen-up at every
+ * yaw; what was wrong is that everything to their right was drawn on their left,
+ * and turning right spun the plan the same way as the turn instead of against
+ * it. Measured before the fix (tools/map-orient-probe.mjs): forward drawn UP at
+ * 4/4 yaws, right drawn LEFT at 4/4 yaws, and a landmark dead ahead swinging
+ * +6.4 across the disc on a right turn when it must swing negative.
+ *
+ * So: screen-right is `-X`, screen-up is `+Z`, and `(-X) x (+Z) = +Y`. The
+ * camera's forward vector is `(-sin yaw, -cos yaw)`, which lands on screen-up
+ * when the canvas is rotated by `yaw - PI`. Blips, the north pip and the view
+ * cone all derive from those two facts rather than from a fudge factor.
+ *
+ * NAMING, so nobody "fixes" this back. The level's side codes — n/s/e/w in
+ * `parapetSides: 'nse'` and friends — are GEOMETRY labels for +Z/-Z/+X/-X, and
+ * they are internally left-handed, so they cannot all be compass bearings at
+ * once. Navigation is defined here and in Compass.js: north is +Z (which is the
+ * level's NORTH spawn, so dev notes about the north end still read true) and
+ * compass east is -X. If you find yourself wanting +X on the right, re-read the
+ * cross product above first.
  *
  * Per frame this is one rotated `drawImage` plus a handful of arcs, redrawn at
  * a tier-gated rate. No DOM is touched and nothing is allocated.
@@ -176,8 +197,10 @@ export class Minimap {
         const flip = cross < 0;
         for (let i = 0; i < 3; i++) {
           const k = flip ? 2 - i : i;
-          const px = (ax[k] - this.origin.x) * scale;
-          const py = (span - (az[k] - this.origin.z)) * scale;   // flip Z: north up
+          // Mirror X and flip Z: screen-right is -X, screen-up is +Z, which is
+          // the only pairing that is a view from above. See the header note.
+          const px = (span - (ax[k] - this.origin.x)) * scale;
+          const py = (span - (az[k] - this.origin.z)) * scale;
           if (i === 0) g.moveTo(px, py); else g.lineTo(px, py);
         }
         g.closePath();
@@ -266,7 +289,10 @@ export class Minimap {
     // A hard-locked rotation jitters under mouse micro-movement; damping the
     // yaw the map uses keeps north readable without feeling laggy.
     this._yaw = dampAngle(this._yaw, state.yaw, 18, step);
-    const rot = Math.PI - this._yaw;
+    // `yaw - PI`, not `PI - yaw`. Both put forward on screen-up, which is why
+    // the sign error survived; only this one also rotates the world AGAINST the
+    // player's turn, on a plan whose X axis is mirrored to face upward.
+    const rot = this._yaw - Math.PI;
 
     const c = this.ctx;
     const S = this.canvas.width;
@@ -302,7 +328,7 @@ export class Minimap {
       c.save();
       c.scale(k, k);
       c.translate(
-        -(px - this.origin.x) * this.origin.scale,
+        -(this.origin.span - (px - this.origin.x)) * this.origin.scale,
         -(this.origin.span - (pz - this.origin.z)) * this.origin.scale,
       );
       c.drawImage(this.plan, 0, 0);
@@ -324,7 +350,7 @@ export class Minimap {
       for (const a of state.allies) {
         const dx = a.x - px, dz = a.z - pz;
         if (dx * dx + dz * dz > reach * reach) continue;
-        this._blip(c, dx * ppm, -dz * ppm, S, 'rgba(120,206,255,0.95)', 1);
+        this._blip(c, -dx * ppm, -dz * ppm, S, 'rgba(120,206,255,0.95)', 1);
       }
     }
 
@@ -335,7 +361,7 @@ export class Minimap {
         if (!a.alive) continue;
         const dx = a.position.x - px, dz = a.position.z - pz;
         if (dx * dx + dz * dz > reach * reach) continue;
-        this._blip(c, dx * ppm, -dz * ppm, S, 'rgba(255,104,80,0.95)', 1.05);
+        this._blip(c, -dx * ppm, -dz * ppm, S, 'rgba(255,104,80,0.95)', 1.05);
       }
     }
 
@@ -345,7 +371,7 @@ export class Minimap {
       if (b.t <= 0) { this._blips.splice(i, 1); continue; }
       const k = b.t / b.dur;
       const rgb = b.kind === 'explosion' ? '255,181,69,' : '255,90,65,';
-      const bx = (b.x - px) * ppm, by = -(b.z - pz) * ppm;
+      const bx = -(b.x - px) * ppm, by = -(b.z - pz) * ppm;
       // The contact pings outward once and fades: motion pulls the eye to the
       // edge of the map without needing a brighter dot.
       c.strokeStyle = `rgba(${rgb}${(k * 0.5).toFixed(3)})`;
@@ -407,11 +433,11 @@ export class Minimap {
     c.fill();
     c.restore();
 
-    // North pip orbits the frame edge. North is (0,-1) in map space, so after
-    // the rotation it lands at (sin yaw, cos yaw) on screen.
+    // North pip orbits the frame edge. North is +Z, which is (0,-1) in map
+    // space, so after `rotate(yaw - PI)` it lands at (-sin yaw, cos yaw).
     const rr = (this._cssRadius || 84) * 0.82;
     this.rose.style.transform =
-      `translate(-50%,-50%) translate(${(Math.sin(this._yaw) * rr).toFixed(1)}px,` +
+      `translate(-50%,-50%) translate(${(-Math.sin(this._yaw) * rr).toFixed(1)}px,` +
       ` ${(Math.cos(this._yaw) * rr).toFixed(1)}px)`;
   }
 

@@ -493,6 +493,12 @@ export const UI_CSS = /* css */`
     radial-gradient(ellipse at 120% 110%, rgba(96,58,26,.30), transparent 58%);
   backdrop-filter: blur(5px) saturate(.72) brightness(.78);
   pointer-events: auto;
+  /* ABOVE THE TOUCH LAYER. The touch controls own a full-screen, hit-testable
+     drag surface at z-index 30; with no z-index of its own this menu stacked
+     below it, so on a phone every tap on DEPLOY landed on the look surface
+     instead and the front end was unreachable. Below the loading screen (40),
+     which must stay on top while the map builds. */
+  z-index: 35;
   opacity: 0; transition: opacity var(--t-med) var(--ease);
 }
 .bl-menu.on { display: flex; opacity: 1; }
@@ -715,6 +721,10 @@ export const UI_CSS = /* css */`
    browser's collapsing address bar cannot push a control off screen. */
 .bl-touch { position: fixed; inset: 0; z-index: 30; pointer-events: none; touch-action: none; }
 .bl-touch > * { pointer-events: auto; }
+/* The drag surface for move and look. Full-screen and explicitly hit-testable:
+   the container above is pointer-events:none so the HUD never eats taps, which
+   means the gestures need a real element of their own to land on. */
+.tc-surface { position: absolute; inset: 0; pointer-events: auto; touch-action: none; }
 
 .tc-stick {
   position: fixed; width: 132px; height: 132px; margin: -66px 0 0 -66px;
@@ -758,6 +768,22 @@ export const UI_CSS = /* css */`
   left: max(18px, env(safe-area-inset-left)); bottom: max(22px, env(safe-area-inset-bottom));
 }
 .tc-sm { width: 74px; height: 40px; }
+
+/* The way back into the front end. A phone has no ESC and never takes pointer
+   lock, so without this button a touch player who deploys can never reach the
+   loadout, the settings or the mixer again for the rest of the session. Top
+   centre-right, clear of both thumbs' arcs. */
+.tc-top {
+  position: fixed; display: flex; gap: 10px;
+  top: max(12px, env(safe-area-inset-top)); right: max(18px, env(safe-area-inset-right));
+}
+.tc-top .tc-btn { width: 62px; height: 32px; font-size: 10px; opacity: .72; }
+
+/* Nothing in the touch layer may show through or under a front-end screen: the
+   scrim is deliberately translucent on its right-hand side, so the fire button
+   would ghost through it. Removing the layer also releases a latched stick,
+   because the pointerup still arrives on window. */
+body:has(.bl-menu.on) .bl-touch { display: none; }
 
 /* On a phone the HUD has to give up room: the keybind legend is meaningless
    without a keyboard, and the minimap competes with the left thumb. */
