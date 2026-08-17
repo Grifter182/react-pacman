@@ -171,9 +171,22 @@ export function sealDeadCracks(proxy, bounds, opts = {}) {
     const at = [+(minX + x0 * cell).toFixed(1), +(minZ + z0 * cell).toFixed(1)];
     const rec = { at, areaM2: +areaM2.toFixed(1), runM: +runM.toFixed(1), touches: touches.size };
 
-    if (areaM2 > MAX_AREA) { spared.push({ ...rec, reason: `${areaM2.toFixed(1)} m2 — a space, not a crack` }); continue; }
     const culDeSac = touches.size <= 1;
     const tooLongToBeAnOpening = runM > MAX_OPENING_RUN;
+
+    // THE AREA GUARD APPLIES ONLY TO COMPACT CUL-DE-SACS, and getting this
+    // wrong is what made the previous revision seal 135 m2 and still leave
+    // every named crack open. The guard exists so a genuine ROOM is never
+    // walled off — but a room is WIDE, so it never enters the narrow set in the
+    // first place. Applied to everything, the guard instead spared the biggest
+    // catch in the level: the map perimeter is a continuous sub-metre band, it
+    // merges into one cluster of many tens of square metres, and that single
+    // spare took several of the named cracks with it. A large NARROW region is
+    // by definition long and thin, which is precisely a crack network.
+    if (culDeSac && !tooLongToBeAnOpening && areaM2 > MAX_AREA) {
+      spared.push({ ...rec, reason: `compact pocket of ${areaM2.toFixed(1)} m2 — a space, not a crack` });
+      continue;
+    }
     if (!culDeSac && !tooLongToBeAnOpening) {
       spared.push({ ...rec, reason: `opening ${runM.toFixed(1)} m long joining ${touches.size} areas — a doorway` });
       continue;
