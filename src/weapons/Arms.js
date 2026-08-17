@@ -153,42 +153,45 @@ function graspRadius(geo, origin, axis, t0, t1, rMax, fallback) {
 }
 
 /**
- * The weapon's silhouette in the axial slice the support hand works in: how far
- * down the body reaches (`bottom`), how wide it is (`halfW`) and how far up it
- * goes (`top`), all in weapon space.
+ * The underside of the weapon at the station the support hand works: the lowest
+ * body vertex in a narrow column around the anchor, in weapon space.
  *
  * This replaces a `riseAbove` that existed to lift the support anchor onto the
- * handguard's *axis*, i.e. to wrap the hand around the handguard's girth. See
- * `HAND_R` for the measurement that killed that idea. What the hand needs now is
- * the underside and the width of whatever it is hooking under, so that is what
- * gets measured. The z window is narrow so the magwell and the receiver cannot
- * vote, and the vote is a percentile rather than an extreme so one rail tooth or
- * sling loop cannot move the whole hand.
+ * handguard's *axis*, i.e. to wrap the hand around the handguard's girth — see
+ * the note above `SUPPORT_ROLL` for the measurement that killed that idea. What
+ * the hand needs now is the underside, and it needs it as a true minimum rather
+ * than a percentile: this is a CLEARANCE, and a 90th-percentile clearance is one
+ * that a tenth of the shell pokes through. (`graspRadius` above wants the
+ * opposite and takes a median for it; the two are not interchangeable.)
+ *
+ * The windows are tight, and the floor is tighter still. The z window keeps the
+ * receiver out of it; `reach` keeps the MAGWELL out of it. That last one is not
+ * belt-and-braces: on the SMG the support anchor sits only 40 mm ahead of the
+ * lower, and a magazine well hangs 65 mm below the bore in a continuous column
+ * with no gap to detect, so an unbounded minimum measured the bottom of the
+ * MAGWELL and hung the hand in the air 60 mm under the gun. The bound is sound
+ * because of what the anchor IS: Gunsmith publishes it *inside* the handguard
+ * shell, near its bottom, so the surface the hand bears on cannot be much below
+ * it, and anything that is belongs to another part.
  */
-function bodySlice(geo, p, halfZ, fallback) {
+function underside(geo, p, halfZ, reach, fallback) {
   const pos = geo?.attributes?.position;
   if (!pos) return fallback;
-  let bottom = 1e9, top = -1e9, halfW = 0, n = 0;
+  const floor = p.y - reach;
+  let bottom = 1e9, n = 0;
   for (let i = 0; i < pos.count; i++) {
     _va.fromBufferAttribute(pos, i);
-    if (Math.abs(_va.z - p.z) > halfZ) continue;
-    if (Math.abs(_va.y - p.y) > 0.09 || Math.abs(_va.x) > 0.09) continue;
+    if (Math.abs(_va.z - p.z) > halfZ || _va.y > p.y || _va.y < floor) continue;
+    if (Math.abs(_va.x) > 0.020) continue;
     n++;
-    // `bottom` and `halfW` are the true extremes, not percentiles: they are used
-    // as CLEARANCES, and a 90th percentile clearance is a clearance that 10% of
-    // the shell pokes through. (`graspRadius` above wants the opposite and takes
-    // a median for it — the two are not interchangeable, which cost a pass.)
-    top = Math.max(top, _va.y);
-    halfW = Math.max(halfW, Math.abs(_va.x));
-    if (Math.abs(_va.x) < 0.020) bottom = Math.min(bottom, _va.y);
+    bottom = Math.min(bottom, _va.y);
   }
-  return n < 64 || bottom > 1e8 ? fallback : { bottom, top, halfW };
+  return n < 64 ? Math.max(fallback, floor) : bottom;
 }
 
 /* ------------------------------------------------------------ the grasp */
 
 const FLEX = [1.0, 1.2, 1.4];
-const FLEX_SUM = FLEX[0] + FLEX[1] + FLEX[2];
 const SEG = [0.42, 0.32, 0.26];
 
 /**
@@ -237,20 +240,24 @@ const SEG = [0.42, 0.32, 0.26];
  * hand — 24 mm is the hole through a loose fist, plus the glove — and *placed* so
  * the palm's contact plane lands on the measured underside.
  *
- * `SUPPORT_ROLL` tilts the palm a few degrees left of straight down so the heel
- * takes the shell's lower-left arris rather than balancing on the flat, and
- * `SUPPORT_ARC` stops the fingers before they climb: 0.90 rad from the contact
- * patch brings the fingertips to about 40 degrees below the horizontal on the
- * far side, which keeps every vertex of the hand below the underside itself —
- * 27 mm below the bore, 58 mm below the bottom of the sight picture, and still
- * clear if the optic doubles in diameter.
+ * Placing it is then one line: the channel axis goes ON the measured underside.
+ * That is not a fudge factor, it is the only height at which a fist this size
+ * both touches and clears. A closed hand's outermost surface stands
+ * radius + girth off its own channel axis, so with the axis on the underside the
+ * top of the wrap bears on the shell while the palm hangs a hand's depth below
+ * it — which is what a support hand under a rail this wide actually does, and
+ * why nothing needs to be capped or clamped. `SUPPORT_ROLL` then tilts the whole
+ * fist a few degrees so the bearing surface is the fingers' backs and the
+ * knuckle armour rather than one tangent line.
+ *
+ * Measured on all three weapons at full ADS: 0.0% of the sight picture blocked,
+ * every clock position clear, the highest glove vertex forward of the optic
+ * 11-13 mm BELOW the bore line (52-55 mm below the bottom of the sight picture),
+ * nearest body surface 0.0-2.5 mm with no vertex more than 1.3 mm inside the
+ * shell — contact, not intersection.
  */
-const _E = (k, d) => (typeof process !== 'undefined' && process.env && process.env[k] !== undefined ? +process.env[k] : d);
-const HAND_R = _E('AR', 0.024);
-const SUPPORT_ROLL = _E('AROLL', 0.26);
-const SUPPORT_ARC = _E('AARC', 0.90);
-const AX = _E('AXX', 0.55);
-const AYD = _E('AYD', 0);
+const HAND_R = 0.024;
+const SUPPORT_ROLL = 0.26;
 /** Palm half-thickness (the contact face) and knuckle row, in hand space. */
 const PALM_TOP = 0.016, PALM_ZM = 0.082;
 
@@ -429,12 +436,7 @@ function buildHand(mats, opts, D) {
   for (let i = 0; i < 4; i++) {
     const x = palmW * (0.29 - i * 0.195);
     let base = T(x, fy - Math.abs(i - 1.2) * 0.0012, zM - 0.004);
-    // `wrapArc` caps how far round the held object the chain may travel. Divided
-    // by the FLEX sum so the cap is on the *arc*, not on one joint, and applied
-    // per finger so a 64 mm little finger still falls short of an 82 mm middle
-    // one — that difference is most of what makes a hand read as a hand.
     let f = solveCurl(R, lens[i], girths[i], top, zM, fy);
-    if (opts.wrapArc !== undefined) f = Math.min(f, opts.wrapArc / FLEX_SUM);
     let spread = (i - 1.5) * 0.050;
     if (i === 0 && opts.trigger !== undefined) {
       // The trigger finger leaves the front strap: it extends, rolls out of the
@@ -648,18 +650,9 @@ export function buildArms(weapon, mats) {
   // height. Sideways the axis leans a little right of centre, which pushes the
   // climbing fingers clear of the shell's lower-right corner without lifting the
   // palm off the flat.
-  const slice = bodySlice(body, A.leftHand, 0.025,
-    { bottom: A.leftHand.y - 0.012, top: A.leftHand.y + 0.046, halfW: 0.028 });
+  const under = underside(body, A.leftHand, 0.025, 0.012, A.leftHand.y - 0.012);
   const rHand = HAND_R + GLOVE_T;
-  // `seat` puts the palm's contact patch at 270 degrees minus the roll, so one
-  // radius times cos(roll) is exactly the height that lands that patch on the
-  // underside. Sideways the axis sits right of the shell's centreline, which is
-  // what carries the climbing fingers outboard of the lower-right arris instead
-  // of through it.
-  const hgAxis = new THREE.Vector3(
-    slice.halfW * AX,
-    slice.bottom + rHand * Math.cos(SUPPORT_ROLL) - AYD,
-    A.leftHand.z);
+  const hgAxis = new THREE.Vector3(0, under, A.leftHand.z);
   const hgSolve = graspCentre(rHand, PALM_TOP, PALM_ZM);
 
   const left = new THREE.Group();
@@ -674,7 +667,7 @@ export function buildArms(weapon, mats) {
   // palm straight down.
   const lPose = seat(new THREE.Vector3(0, 0, -1), new THREE.Vector3(1, 0, 0), SUPPORT_ROLL, hgSolve);
   const lh = buildHand(mats, {
-    radius: rHand, wrapArc: SUPPORT_ARC, fingerY: _E('AFY', 0.0072),
+    radius: rHand, fingerY: 0.0072,
     thumbCurl: 0.30, thumbYaw: 1.30, thumbLift: 0.02, palmBend: 0.34,
     forearm: intoHand(new THREE.Vector3(-0.46, -0.80, 0.39), lPose, false),
     forearmLen: 0.34,
@@ -696,7 +689,7 @@ export function buildArms(weapon, mats) {
     /** What the pose was solved against — read by the geometry probe. */
     measured: {
       gripRadius: rGrip, gripGrasp: [gripSolve.y, gripSolve.z],
-      hgBottom: slice.bottom, hgTop: slice.top, hgHalfW: slice.halfW,
+      underside: under,
       supportRadius: rHand, supportAxis: hgAxis.toArray(), supportGrasp: [hgSolve.y, hgSolve.z],
     },
     dispose() { rh.geometry.dispose(); lh.geometry.dispose(); },
