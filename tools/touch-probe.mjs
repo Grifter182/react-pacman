@@ -52,6 +52,7 @@ const ctx = await browser.newContext({
   viewport: { width: 844, height: 390 }, hasTouch: true, isMobile: true, deviceScaleFactor: 1,
 });
 const page = await ctx.newPage();
+const cdp = await ctx.newCDPSession(page);
 const errors = [];
 page.on('pageerror', (e) => errors.push(e.message));
 
@@ -107,39 +108,51 @@ const park = () => page.evaluate(() => {
 
 /**
  * Hold the floating stick from `from` toward `to` and report the displacement.
- * The pointer position is re-asserted every 400ms: a resting thumb sends no
- * events, so the stick has to latch, and re-sending the same coordinate proves
- * it does without changing the deflection.
+ *
+ * THE GESTURE IS REAL TOUCH, NOT A SYNTHETIC EVENT. This used to dispatch
+ * `PointerEvent`s with `el.dispatchEvent`, which proves the handlers work when
+ * handed events but says nothing about whether a device delivers them — it
+ * skips hit-testing against `touch-action`, gesture disambiguation and
+ * `pointercancel`. The shipped layer now takes native touch events on any
+ * device that has them, so a synthetic PointerEvent would not even reach the
+ * stick and this test would fail while the game worked. Both reasons point the
+ * same way: drive CDP `Input.dispatchTouchEvent` and let Chromium's real touch
+ * pipeline do the delivering.
+ *
+ * The touch is NOT re-sent while held. A resting thumb sends nothing, so the
+ * stick has to latch on its own, and a probe that keeps nudging the finger hides
+ * a latch bug.
  */
 const holdStick = async (fromX, fromY, toX, toY) => {
   await park();
   await page.waitForTimeout(1200);
-  return page.evaluate(async ({ fromX, fromY, toX, toY, HOLD_MS }) => {
-    const el = document.elementFromPoint(fromX, fromY);
-    const e = window.__engine, s = e.get('player').state, inp = e.get('player').input;
-    const p0 = { x: s.position.x, z: s.position.z }, f0 = e.frame;
-    const mkw = (t, x, y) => window.dispatchEvent(new PointerEvent(t,
-      { pointerId: 55, clientX: x, clientY: y, bubbles: true, pointerType: 'touch', isPrimary: true }));
-    el.dispatchEvent(new PointerEvent('pointerdown',
-      { pointerId: 55, clientX: fromX, clientY: fromY, bubbles: true, pointerType: 'touch', isPrimary: true }));
-    mkw('pointermove', toX, toY);
-    let peakMove = 0, peakSpeed = 0;
-    const deadline = performance.now() + HOLD_MS;
-    while (performance.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 400));
-      mkw('pointermove', toX, toY);
-      peakMove = Math.max(peakMove, Math.hypot(inp.moveX, inp.moveY));
-      peakSpeed = Math.max(peakSpeed, Math.hypot(s.velocity.x, s.velocity.z));
-    }
-    mkw('pointerup', toX, toY);
+  const before = await page.evaluate(() => {
+    const s = window.__engine.get('player').state;
+    window.__peak = { move: 0, speed: 0 };
+    return { x: s.position.x, z: s.position.z, frame: window.__engine.frame };
+  });
+  await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: fromX, y: fromY, id: 7 }] });
+  await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: toX, y: toY, id: 7 }] });
+  const deadline = Date.now() + HOLD_MS;
+  while (Date.now() < deadline) {
+    await page.waitForTimeout(400);
+    await page.evaluate(() => {
+      const e = window.__engine, s = e.get('player').state, inp = e.get('player').input;
+      window.__peak.move = Math.max(window.__peak.move, Math.hypot(inp.moveX, inp.moveY));
+      window.__peak.speed = Math.max(window.__peak.speed, Math.hypot(s.velocity.x, s.velocity.z));
+    });
+  }
+  await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+  return page.evaluate(({ before }) => {
+    const e = window.__engine, s = e.get('player').state;
     return {
-      hitElement: `${el.tagName}.${el.className}`,
-      frames: e.frame - f0,
-      peakInputMove: +peakMove.toFixed(2), peakSpeed: +peakSpeed.toFixed(2),
-      dx: +(s.position.x - p0.x).toFixed(2), dz: +(s.position.z - p0.z).toFixed(2),
-      metres: +Math.hypot(s.position.x - p0.x, s.position.z - p0.z).toFixed(2),
+      hitElement: (document.elementFromPoint(180, 250) || {}).className || '(none)',
+      frames: e.frame - before.frame,
+      peakInputMove: +window.__peak.move.toFixed(2), peakSpeed: +window.__peak.speed.toFixed(2),
+      dx: +(s.position.x - before.x).toFixed(2), dz: +(s.position.z - before.z).toFixed(2),
+      metres: +Math.hypot(s.position.x - before.x, s.position.z - before.z).toFixed(2),
     };
-  }, { fromX, fromY, toX, toY, HOLD_MS });
+  }, { before });
 };
 
 // yaw = PI, so forward is +Z and right is -X.
@@ -149,19 +162,21 @@ say('stickRight', await holdStick(180, 250, 250, 250));
 /* --- 3. look drag on the right half -------------------------------------- */
 await park();
 await page.waitForTimeout(800);
-say('lookDrag', await page.evaluate(async () => {
-  const el = document.elementFromPoint(640, 200);
+const look0 = await page.evaluate(() => {
   const s = window.__engine.get('player').state;
-  const y0 = s.yaw, p0 = s.pitch;
-  const mkw = (t, x, y) => window.dispatchEvent(new PointerEvent(t,
-    { pointerId: 43, clientX: x, clientY: y, bubbles: true, pointerType: 'touch', isPrimary: true }));
-  el.dispatchEvent(new PointerEvent('pointerdown',
-    { pointerId: 43, clientX: 640, clientY: 200, bubbles: true, pointerType: 'touch', isPrimary: true }));
-  for (let i = 1; i <= 10; i++) { mkw('pointermove', 640 + i * 12, 200 - i * 4); await new Promise((r) => setTimeout(r, 120)); }
-  mkw('pointerup', 760, 160);
-  await new Promise((r) => setTimeout(r, 2500));
-  return { hitElement: `${el.tagName}.${el.className}`, yawDelta: +(s.yaw - y0).toFixed(3), pitchDelta: +(s.pitch - p0).toFixed(3) };
-}));
+  return { yaw: s.yaw, pitch: s.pitch, el: (document.elementFromPoint(640, 200) || {}).className || '(none)' };
+});
+await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: 640, y: 200, id: 8 }] });
+for (let i = 1; i <= 10; i++) {
+  await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: 640 + i * 12, y: 200 - i * 4, id: 8 }] });
+  await page.waitForTimeout(90);
+}
+await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+await page.waitForTimeout(2500);
+say('lookDrag', await page.evaluate(({ look0 }) => {
+  const s = window.__engine.get('player').state;
+  return { hitElement: look0.el, yawDelta: +(s.yaw - look0.yaw).toFixed(3), pitchDelta: +(s.pitch - look0.pitch).toFixed(3) };
+}, { look0 }));
 
 /* --- 4. action buttons ---------------------------------------------------- */
 say('buttons', await page.evaluate(async () => {

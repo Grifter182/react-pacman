@@ -85,7 +85,35 @@ await page.evaluate(() => {
 const snap = () => page.evaluate(() => {
   const e = window.__engine;
   const inp = e.get('player').input, hud = e.get('hud'), s = e.get('player').state;
+  // WHERE IS THE RING? `.tc-stick` is position:fixed with NO default left/top,
+  // so if it ever gets its `.on` class without those being assigned it parks at
+  // the top-left corner, shifted further out by its own -66px margin. A player
+  // seeing a ring stuck in the corner is seeing exactly that, so the element's
+  // real geometry is reported rather than inferred from the handler state.
+  const st = document.querySelector('#tc-stick');
+  let ring = null;
+  if (st) {
+    const r = st.getBoundingClientRect();
+    const cs = getComputedStyle(st);
+    ring = {
+      rect: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)],
+      inlineLeft: st.style.left || '(unset)',
+      inlineTop: st.style.top || '(unset)',
+      computed: `${cs.left} / ${cs.top}`,
+      opacity: cs.opacity,
+      hasOn: st.classList.contains('on'),
+      position: cs.position,
+    };
+  }
   return {
+    // Duplicate HUD layers would mean the positioned ring and the visible ring
+    // are different elements, which looks identical to a positioning bug.
+    counts: {
+      stick: document.querySelectorAll('#tc-stick').length,
+      surface: document.querySelectorAll('.tc-surface').length,
+      touchLayer: document.querySelectorAll('.bl-touch').length,
+    },
+    ring,
     stick: hud.touch ? { ...hud.touch.move } : null,
     stickId: hud.touch ? hud.touch._stickId : null,
     move: [+inp.moveX.toFixed(2), +inp.moveY.toFixed(2)],
