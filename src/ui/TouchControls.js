@@ -63,6 +63,7 @@ export class TouchControls {
     // stopPropagation, so a thumb on a button never also drags the view.
     this.node.innerHTML = `
       <div class="tc-surface" id="tc-surface"></div>
+      <div class="tc-hint" id="tc-hint">MOVE</div>
       <div class="tc-stick" id="tc-stick"><i class="ring"></i><i class="knob"></i></div>
       <div class="tc-right">
         <button class="tc-btn tc-fire" id="tc-fire" aria-label="Fire"></button>
@@ -90,6 +91,15 @@ export class TouchControls {
     this._stickOrigin = { x: 0, y: 0 };
     this._lastLook = { x: 0, y: 0 };
     this._adsLatched = false;
+
+    this._counts = {};
+    this._lastAt = '-';
+    this.$dbg = null;
+    if (new URLSearchParams(location.search).has('touchdebug')) {
+      this.$dbg = el('div.tc-dbg');
+      this.$dbg.textContent = 'waiting for input...';
+      this.node.appendChild(this.$dbg);
+    }
   }
 
   _bind() {
@@ -100,11 +110,19 @@ export class TouchControls {
     /* --- movement: floating stick on the left half ----------------------- */
     const stickStart = (e) => {
       if (this._stickId !== null || e.clientX > half()) return;
+      if (e.target?.closest?.('.tc-btn')) return;   // buttons own their own gesture
       this._stickId = e.pointerId;
       this._stickOrigin = { x: e.clientX, y: e.clientY };
-      this.$stick.style.left = `${e.clientX}px`;
-      this.$stick.style.top = `${e.clientY}px`;
+      // Positioned by transform, not by left/top. `.tc-stick` is fixed with no
+      // default offsets, so any path that added `.on` without also assigning
+      // left/top parked the ring in the top-left corner, shifted further out by
+      // its own negative margin — which is precisely what a player reported
+      // seeing. A transform cannot leave it in the corner: the CSS now carries a
+      // sane resting position and this only displaces it from there.
+      this.$stick.style.transform = `translate(${e.clientX}px, ${e.clientY}px)`;
       this.$stick.classList.add('on');
+      // Retire the MOVE hint once the control has actually been used.
+      this.node.classList.add('used');
       this._stickMove(e);
     };
     const stickEnd = (id) => {
@@ -123,8 +141,21 @@ export class TouchControls {
       this._lastLook = { x: e.clientX, y: e.clientY };
     };
 
-    this._onDown = (e) => { stickStart(e); lookStart(e); };
+    this._onDown = (e) => {
+      // preventDefault MATTERS HERE. Without it the browser is free to decide
+      // this drag is a scroll or a system gesture, and it then fires
+      // `pointercancel` — which the release handler correctly reads as "thumb
+      // lifted", killing the stick mid-drag. Nothing in a synthetic-event test
+      // reproduces that, because synthetic events never get cancelled.
+      if (e.cancelable) e.preventDefault();
+      // Capture keeps the moves coming to this element even when the thumb
+      // slides off the surface or over a button.
+      try { this.$surface.setPointerCapture?.(e.pointerId); } catch { /* not supported */ }
+      this._dbg('pointerdown', e.clientX, e.clientY);
+      stickStart(e); lookStart(e);
+    };
     this._onMove = (e) => {
+      this._dbg('pointermove', e.clientX, e.clientY);
       if (e.pointerId === this._stickId) { this._stickMove(e); return; }
       if (e.pointerId === this._lookId) {
         const dx = e.clientX - this._lastLook.x;
@@ -139,15 +170,81 @@ export class TouchControls {
     // pointer on scroll, notification pull-down and app switch, and without
     // this the player keeps walking after their thumb is gone.
     this._onUp = (e) => {
+      this._dbg(e.type, e.clientX, e.clientY);
       stickEnd(e.pointerId);
       if (e.pointerId === this._lookId) this._lookId = null;
     };
 
     const opts = { passive: false };
-    this.$surface.addEventListener('pointerdown', this._onDown, opts);
-    window.addEventListener('pointermove', this._onMove, opts);
-    window.addEventListener('pointerup', this._onUp);
-    window.addEventListener('pointercancel', this._onUp);
+
+    /*
+     * TWO INPUT PATHS, AND WHY.
+     *
+     * Pointer Events are the right abstraction and they are what the desktop
+     * and the emulator use. On real phone browsers they are also where this
+     * layer is most likely to be let down: `touch-action` is honoured
+     * inconsistently, a drag can be reclassified as a scroll and cancelled, and
+     * some engines withhold `pointermove` for touch until a gesture threshold
+     * is crossed. Every one of those failures looks identical to the player —
+     * the stick appears and does nothing — and none of them reproduce under
+     * synthetic events or in Chromium's device emulation, which is exactly the
+     * situation this code found itself in.
+     *
+     * Touch Events are older, narrower and universally implemented on phones,
+     * and `preventDefault` on `touchstart` reliably stops the browser taking
+     * the gesture. So when the device has them, they drive the stick and the
+     * look drag, and the pointer path is left to desktop and `?touch=1`.
+     *
+     * Both paths funnel into the same `stickStart` / `_stickMove` / `stickEnd`
+     * and the same `addLook`, so there is one behaviour with two transports.
+     */
+    const hasTouchEvents = 'ontouchstart' in window;
+    this._transport = hasTouchEvents ? 'touch' : 'pointer';
+
+    if (hasTouchEvents) {
+      // Touch identifiers stand in for pointer ids. A Touch has clientX/clientY
+      // and `identifier`, so it is adapted rather than special-cased.
+      const adapt = (t) => ({ pointerId: t.identifier, clientX: t.clientX, clientY: t.clientY, target: t.target });
+      this._onTouchStart = (e) => {
+        if (e.cancelable) e.preventDefault();
+        for (const t of e.changedTouches) {
+          this._dbg('touchstart', t.clientX, t.clientY);
+          const a = adapt(t);
+          stickStart(a); lookStart(a);
+        }
+      };
+      this._onTouchMove = (e) => {
+        if (e.cancelable) e.preventDefault();
+        for (const t of e.changedTouches) {
+          this._dbg('touchmove', t.clientX, t.clientY);
+          const a = adapt(t);
+          if (a.pointerId === this._stickId) { this._stickMove(a); continue; }
+          if (a.pointerId === this._lookId) {
+            const dx = a.clientX - this._lastLook.x;
+            const dy = a.clientY - this._lastLook.y;
+            this._lastLook = { x: a.clientX, y: a.clientY };
+            input?.addLook?.(dx * LOOK_SENS, dy * LOOK_SENS);
+          }
+        }
+      };
+      this._onTouchEnd = (e) => {
+        for (const t of e.changedTouches) {
+          this._dbg(e.type, t.clientX, t.clientY);
+          stickEnd(t.identifier);
+          if (t.identifier === this._lookId) this._lookId = null;
+        }
+      };
+      this.$surface.addEventListener('touchstart', this._onTouchStart, opts);
+      // On window, so a thumb that slides beyond the surface keeps steering.
+      window.addEventListener('touchmove', this._onTouchMove, opts);
+      window.addEventListener('touchend', this._onTouchEnd, opts);
+      window.addEventListener('touchcancel', this._onTouchEnd, opts);
+    } else {
+      this.$surface.addEventListener('pointerdown', this._onDown, opts);
+      window.addEventListener('pointermove', this._onMove, opts);
+      window.addEventListener('pointerup', this._onUp);
+      window.addEventListener('pointercancel', this._onUp);
+    }
 
     /* --- action buttons --------------------------------------------------- */
     const hold = (node, down, up) => {
@@ -229,6 +326,35 @@ export class TouchControls {
   /** Called by InputMap each frame; returns -1..1 axes, screen convention. */
   axes() {
     return this.enabled ? this.move : null;
+  }
+
+  /**
+   * On-screen input readout, enabled with `?touchdebug=1`.
+   *
+   * This exists because a touch fault that cannot be reproduced on the
+   * development machine cannot be fixed by reasoning. Chromium's device
+   * emulation delivered every event correctly and walked the player 11.5 m while
+   * a real phone did nothing, so the only way to tell which of the candidate
+   * causes is real — events not arriving, arriving at the wrong element,
+   * arriving with useless coordinates, or being cancelled — is to have the
+   * device itself say so. Counts and last coordinates are enough to separate all
+   * four.
+   */
+  _dbg(type, x, y) {
+    if (!this.$dbg) return;
+    this._counts[type] = (this._counts[type] || 0) + 1;
+    this._lastAt = `${Math.round(x)},${Math.round(y)}`;
+    if (this._dbgPending) return;
+    this._dbgPending = true;
+    requestAnimationFrame(() => {
+      this._dbgPending = false;
+      const inp = this.engine.get('player')?.input;
+      const tally = Object.entries(this._counts).map(([k, v]) => `${k.replace('pointer', 'p').replace('touch', 't')} ${v}`).join('  ');
+      this.$dbg.textContent =
+        `transport ${this._transport} | last ${this._lastAt} | half ${Math.round(window.innerWidth * 0.5)}\n`
+        + `stickId ${this._stickId} lookId ${this._lookId} | stick ${this.move.x.toFixed(2)},${this.move.y.toFixed(2)}\n`
+        + `input move ${inp ? `${inp.moveX.toFixed(2)},${inp.moveY.toFixed(2)}` : 'n/a'} | ${tally}`;
+    });
   }
 
   dispose() {

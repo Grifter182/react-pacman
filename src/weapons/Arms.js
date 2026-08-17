@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { Config, QualityTier } from '../core/Config.js';
 import { makeMaterial } from '../materials/TextureFactory.js';
 import { Kit, loft, roundRect, chamferBox, cyl } from './GunGeo.js';
-import { VIEWMODEL_AO, VIEWMODEL_MAGNIFY } from './Gunsmith.js';
+import { VIEWMODEL_MAGNIFY } from './Gunsmith.js';
 
 /**
  * OWNER: weapons agent.
@@ -18,33 +18,55 @@ import { VIEWMODEL_AO, VIEWMODEL_MAGNIFY } from './Gunsmith.js';
  *     +Y  the palm normal — the direction the fingers curl toward
  *     +Z  distal, along the fingers; the forearm leaves from the wrist at -Z
  *
- * THE PLACEMENT RULE, which the previous pass did not have. A hand does not sit
- * *at* an anchor, it *closes around* one. The curled fingers and the palm face
- * enclose a channel; the axis of that channel is what has to land on the grip.
- * So the build is:
+ * THE PLACEMENT RULE. A hand does not sit *at* an anchor, it *closes around*
+ * one. The curled fingers and the palm face enclose a channel; the axis of that
+ * channel is what has to land on the thing being held. So the build is:
  *
- *   1. measure the radius of the thing being held, off the weapon's own merged
- *      buffer (`graspRadius`) — not off a constant copied out of Gunsmith;
+ *   1. measure the thing being held, off the weapon's own merged buffer
+ *      (`graspRadius`, `underside`, `supportStation`) — never off a constant
+ *      copied out of Gunsmith, which is not exported and moves without notice;
  *   2. place the channel in hand space, one radius off the palm face and just
  *      proximal of the knuckles (`graspCentre`), and close each finger onto it
  *      until its *surface* touches (`solveCurl`);
- *   3. build a frame from the channel *axis* (which is the grip axis or the
- *      handguard axis, both known) and one free roll angle about it (`seat`);
+ *   3. build a frame from the channel *axis* and one free roll angle about it
+ *      (`seat`);
  *   4. translate the hand so the channel centre lands on the anchor.
  *
- * Measured after: on all three weapons the closest glove vertex to the grip
- * axis is 23.6 mm against an 18.5 mm grip (tangent through a 5 mm glove) and to
- * the handguard axis 32.4 mm against a 31.8 mm shell, with the hand covering 21
- * of 24 sectors around the grip. Nearest-surface distance from fingers, thumb
- * and palm to the weapon body is 0.0-1.5 mm — contact, not intersection.
+ * WHAT THE CHANNEL IS DIFFERS BETWEEN THE TWO HANDS, and that is the substance
+ * of this pass rather than a detail of it. The firing hand closes on the pistol
+ * grip, which fits inside a hand. The support hand does NOT close on the
+ * handguard, because a 56 x 57 mm rail does not fit inside a hand: it closes on
+ * a channel of its own girth, hung on the handguard's measured underside. See
+ * `HAND_R` for the measurement, and `SUPPORT_ROLL` for why no amount of rolling
+ * the old wrap could have saved it.
  *
- * The failure this replaces was measurable and was measured: with the old
- * `frame([-0.08, -0.30 - rake*0.30, -0.94], ...)` the firing hand's fingers
- * pointed *down the barrel* instead of across the grip, the nearest glove
- * vertex sat 1.9 mm from the grip axis (i.e. buried inside the polymer), and
- * the support hand penetrated the 24.5 mm handguard to a radius of 12.3 mm
- * while covering only 16 of 24 sectors around it. Nothing was gripping
- * anything; two gloves were intersecting a rifle.
+ * CURRENT MEASUREMENTS. The sight picture is `tools/sightline-probe.mjs` at full
+ * ADS through the real animator — the only number anyone may quote for it — and
+ * it now reads, on both the rifle and the SMG:
+ *
+ *   BLOCKED 0%, bands centre->rim 0/0/0/0, no clock position obstructed,
+ *   no blockers listed at all, fan 0/37 rays, axis clear.
+ *   (Was: rifle 25.2% blocked, bands 0/6/31/33, 82% at 6 o'clock, all of it
+ *   `leftHand/fingers`; SMG 14.0%; DMR 21.5%.)
+ *
+ * Note the disc it passes on is BIGGER than the disc it used to fail on — the
+ * front element went from 18.5 mm to 21.3 mm and the picture from 13.7% to 19.2%
+ * of frame height while this was being fixed. That was the ordering risk, and it
+ * is why the hand was taken out of the bore line entirely instead of tuned to
+ * miss the old radius.
+ *
+ * The rest is geometry, measured in node with a three-mesh-bvh signed distance
+ * from every glove vertex to the merged body, all three weapons:
+ *
+ *   highest support vertex forward
+ *     of the optic                   11-13 mm BELOW the bore line (was 58 above)
+ *   support hand to body             0.0-0.2 mm nearest, worst -1.7 mm
+ *   firing hand to body              0.0-0.1 mm nearest, worst -4.0 mm
+ *
+ * Negative numbers are glove modelled inside the shell. Everything left is
+ * inside the glove's own 5 mm wall, i.e. leather squashed against polymer, which
+ * is what contact looks like when neither surface can deform. The figures it
+ * replaces were -9.8 mm and 576-649 vertices on the firing hand alone.
  *
  * Anatomy note on the curl: the three phalanges do not flex equally.
  * Proximal : middle : distal runs about 1 : 1.2 : 1.4 of the MCP angle, which
@@ -59,43 +81,73 @@ import { VIEWMODEL_AO, VIEWMODEL_MAGNIFY } from './Gunsmith.js';
 const GLOVE = 0, SLEEVE = 1, PAD = 2;
 
 /**
- * The hands sit closer to the camera than any part of the weapon and they take
- * up more of the hip-fire frame than the receiver does, so they get the same
- * two viewmodel corrections the gunsmith applies to the gun — and for the same
- * measured reason. See `VIEWMODEL_AO` in Gunsmith.js: the recipes bake an
- * ambient-occlusion channel off a micro height field, `ambientOcclusion`
- * multiplies indirect diffuse, and on a surface this close that reads as a
- * printed camouflage pattern rather than as dirt in the creases.
+ * THE GLOVE'S CAMOUFLAGE IS THE AO MAP, and it is measured, not deduced.
  *
- * `repeat` is scaled less aggressively here than on the gun. A glove and a
- * canvas sleeve genuinely do have a coarser weave than a machined receiver has
- * grain, and the arms Kit already projects at a tighter tile (0.22 m against
- * the body's 0.35 m), so part of the correction is paid for by the projection.
+ * Dumping all three arm bakes and taking 8-bit statistics over the whole tile:
  *
- * The sleeve carries a tint on top of that. `canvas` bakes cotton duck at its
- * own natural albedo, which is right for a cargo strap forty metres away and
- * wrong for a forearm two hand-spans from a sunlit lens: at viewmodel range it
- * was the brightest object in the frame, brighter than the sky behind the
- * weapon, and read as a bare wooden dowel rather than as a sleeve. The tint is
- * a dark olive multiplier, not a new bake — the weave, the slubs and the
- * abrasion all survive it.
+ *              albedo mean / sd      AO mean / sd      AO range
+ *   glove          47 / 6.5          139 / 86.8         31-255
+ *   sleeve         88 / 6.8          168 / 101.2        31-255
+ *   pad            52 / 2.3          152 / 68.2         31-255
+ *
+ * The albedo of every one of them is flat — a standard deviation of 2 to 7 counts
+ * carries no pattern at all. The AO channel has a standard deviation of 68 to 101
+ * counts and hits both rails, and viewing it as an image settles it: it is hard
+ * black-and-white noise at the texel, a checkerboard on the glove and a
+ * thresholded grid on the sleeve. That is not shading, it is a print, and it is
+ * the same defect `VIEWMODEL_AO` in Gunsmith.js documents for the receiver —
+ * `ambientOcclusion` multiplies indirect diffuse, indirect diffuse is nearly all
+ * a matte dark surface shows under a sky, so multiplying it by a binary mask
+ * prints camouflage in the literal sense.
+ *
+ * It is worse here than on the gun for a reason worth writing down: `canvas` bakes
+ * with the highest `aoStrength` in the recipe library (1.1) and derives it from a
+ * thread lattice, so the field it produces is already binary before anything
+ * magnifies it. Turning the intensity down is therefore not a compromise between
+ * looks and correctness — the channel contains no usable occlusion to lose. What
+ * genuinely occludes on a hand is the gaps between the fingers and the shadow
+ * under the cuff, and both of those are geometry, which is already there.
+ *
+ * So each surface keeps only as much AO as its relief can physically cast:
+ * essentially none for a 1.5 mm moulded pebble grain, a little for a woven cloth
+ * whose threads really do shade each other, more for a moulded knuckle plate with
+ * a millimetre of relief and a hard edge.
+ *
+ * THE PAD IS NOT THE PATCH, and it is worth saying so because it looks like it
+ * is. The knuckle armour, cuff and gauntlet read as pale blocks in a capture, and
+ * the obvious diagnosis — a 0.74 tint on a black glove — is wrong: through the
+ * sRGB decode its 52-count bake times 0.74 lands at 0.025 linear against the
+ * glove's 0.026, i.e. the same value to within 5%. What makes them read bright is
+ * that the polymer bake is the glossiest of the three (roughness 0.62 against the
+ * glove's 0.84), so they carry the speculars — which is correct for a moulded
+ * plate on a suede glove and is exactly the separation-by-gloss a tactical glove
+ * has. So the tint is left alone and only the AO comes down. Turning the pad dark
+ * to "fix" the blocks would have swapped a bright patch for a dark one.
+ *
+ * The sleeve genuinely IS too bright, and that is measurable rather than a
+ * matter of taste: 88 counts of albedo decode to 0.099 linear, and even under the
+ * 0.42 tint it stood at 0.042 against the glove's 0.026 — 1.6 times the value of
+ * the thing it is sewn to, on the surface nearest the camera. At 0.30 it sits at
+ * 1.13 times, which is the right relationship for cotton duck next to leather.
+ * The tint is a multiplier, not a new bake: the weave, the slubs and the abrasion
+ * all survive it.
  */
 export function armMaterials() {
-  const AO = { aoMapIntensity: VIEWMODEL_AO };
   const M = VIEWMODEL_MAGNIFY * 0.7;
   const glove = makeMaterial('rubber', {
-    seed: 71, size: 512, detailStrength: 0.55, repeat: M, material: AO,
+    seed: 71, size: 512, detailStrength: 0.38, repeat: M,
+    material: { aoMapIntensity: 0.05 },
   });
   const sleeve = makeMaterial('canvas', {
     seed: 33, size: 512, repeat: 2 * M,
-    material: Object.assign({ color: new THREE.Color(0.42, 0.43, 0.35) }, AO),
+    material: { color: new THREE.Color(0.30, 0.31, 0.25), aoMapIntensity: 0.10 },
   });
-  // The knuckle and cuff hardware is the same bake as the weapon's polymer, and
-  // next to a black rubber glove it needs to sit a shade below it or the two
-  // read as one moulding.
+  // Knuckle plate, cuff band and gauntlet: the same polymer bake as the weapon's
+  // furniture, at the glove's own value and the bake's own roughness, so the two
+  // separate by gloss rather than by tone.
   const pad = makeMaterial('polymer', {
     seed: 88, size: 256, repeat: M,
-    material: Object.assign({ color: new THREE.Color(0.74, 0.74, 0.76) }, AO),
+    material: { color: new THREE.Color(0.74, 0.74, 0.76), aoMapIntensity: 0.16 },
   });
   return [glove, sleeve, pad];
 }
@@ -125,15 +177,21 @@ const RY = (a) => new THREE.Matrix4().makeRotationY(a);
 /* --------------------------------------------------- measuring the weapon */
 
 /**
- * Median radial extent of the weapon body about an axis, over an axial band.
+ * Radial extent of the weapon body about an axis, over an axial band, at a
+ * chosen percentile.
  *
  * This is how the hands find out how thick the thing they are holding is. The
  * alternative — copying `hg.radius` or the grip's profile constants out of
  * Gunsmith — makes the arms silently wrong the moment the gunsmith retunes a
- * part, and those constants are not exported anyway. A median (rather than a
- * max) is used because the band inevitably catches a rail tooth, a sling loop
- * or the edge of the magwell, and one outlier must not push the whole hand off
- * the weapon.
+ * part, and those constants are not exported anyway.
+ *
+ * `pct` is not a taste knob and the default is not the right answer everywhere.
+ * A percentile below the maximum exists because the band inevitably catches a
+ * rail tooth, a sling loop or the edge of the magwell, and one outlier must not
+ * push the whole hand off the weapon. But a LOW percentile is the radius of the
+ * part's narrow places, and fingers solved against that close inside its wide
+ * ones — see the 0.95 at the pistol grip and the 576 vertices of glove that were
+ * inside the lower receiver at the median.
  */
 function graspRadius(geo, origin, axis, t0, t1, rMax, fallback, pct = 0.6) {
   const pos = geo?.attributes?.position;
@@ -362,6 +420,15 @@ function solveCurl(radius, len, girth, palmY, zM, y0 = 0.002) {
  * with a knuckle bulge at every joint and a rounded pad at the tip. The bulges
  * are what let a finger read as a finger at 20 px wide — a smooth taper at this
  * size is a sausage.
+ *
+ * The section is narrower than it is deep, and that is the fix for the hand
+ * reading as a mitten. Real fingers do touch each other, but they touch along a
+ * crease, and a crease is what the eye actually uses to count them. Measured on
+ * the old numbers: MCP spacing 16.8 mm against section widths of 19.5, 19.3, 18.1
+ * and 16.5 mm, so every neighbouring pair overlapped by 2.6 mm — the four lofts
+ * fused into one slab with no crease anywhere on it. Taking 10% off the width and
+ * putting it back into the depth keeps the girth a finger's girth in silhouette
+ * and leaves about a millimetre of air between neighbours for the shading to find.
  */
 function finger(kit, base, len, girth, curl, spread, D, pads) {
   const c = D >= 1 ? 3 : 1;
@@ -372,7 +439,7 @@ function finger(kit, base, len, girth, curl, spread, D, pads) {
     const g0 = girth * (1 - i * 0.13);
     const g1 = girth * (1 - (i + 1) * 0.13);
     const k = g1 / g0;
-    const prof = roundRect(g0, g0 * 0.90, g0 * 0.36, c);
+    const prof = roundRect(g0 * 0.90, g0 * 0.98, g0 * 0.34, c);
     const rings = [
       { z: 0, scale: 1.08, scaleY: 1.04 },         // joint bulge
       { z: L * 0.22, scale: 0.98, scaleY: 0.99 },
@@ -388,8 +455,8 @@ function finger(kit, base, len, girth, curl, spread, D, pads) {
 
     if (pads && D >= 2 && i < 2) {
       // Knuckle armour sits on the back of the hand: -Y, opposite the curl.
-      kit.add(chamferBox(g0 * 0.98, g0 * 0.34, L * (i === 0 ? 0.62 : 0.46), g0 * 0.12), PAD, {
-        m: m.clone().multiply(T(0, -g0 * 0.50, L * 0.34)),
+      kit.add(chamferBox(g0 * 0.80, g0 * 0.30, L * (i === 0 ? 0.62 : 0.46), g0 * 0.11), PAD, {
+        m: m.clone().multiply(T(0, -g0 * 0.52, L * 0.34)),
       });
     }
     m = m.multiply(T(0, 0, L));
@@ -448,6 +515,25 @@ function buildHand(mats, opts, D) {
     { z: 0.004, scale: 0.70 }, { z: 0.024, scale: 1.00 }, { z: 0.048, scale: 0.76 },
   ]), GLOVE, { m: heel.clone().multiply(T(-palmW * 0.30, -0.001, 0.006)) });
 
+  // Seams. A tactical glove is cut and sewn, and at this range the stitching is
+  // most of what says "garment" rather than "moulding": two side seams where the
+  // palm panel meets the back panel, and one across the knuckle line where the
+  // stretch panel is let in. They are 2 mm piping in the glove's own material, so
+  // they read as a shading break rather than as a stripe — which is the whole
+  // point, since a stripe is what the AO map was already doing wrong.
+  if (D >= 2) {
+    kit.label = 'seam';
+    const sL = zM - zH + 0.014;
+    for (const sx of [-1, 1]) {
+      kit.add(chamferBox(0.0024, 0.0026, sL, 0.0007), GLOVE, {
+        m: T(sx * palmW * 0.465, 0, (zH + zM) * 0.5 + 0.002),
+      });
+    }
+    kit.add(chamferBox(palmW * 0.84, 0.0024, 0.0026, 0.0007), GLOVE, {
+      m: T(0, -palmT * 0.46, zM - 0.012),
+    });
+  }
+
   // Four fingers: index nearest the thumb (+X), little finger at -X. Each one
   // closes onto the held cylinder on its own, at its own length.
   kit.label = 'fingers';
@@ -461,11 +547,14 @@ function buildHand(mats, opts, D) {
   // axis instead of 38, and a 82 mm finger swung from 6 mm further out reaches
   // 13 mm further across the gun before it has curled at all.
   const fy = opts.fingerY ?? 0.002;
+  // Spacing widened from 0.195 to 0.215 of the palm for the same reason the
+  // section narrowed: at 16.8 mm the MCPs were closer together than the fingers
+  // were wide.
   for (let i = 0; i < 4; i++) {
-    const x = palmW * (0.29 - i * 0.195);
+    const x = palmW * (0.32 - i * 0.215);
     let base = T(x, fy - Math.abs(i - 1.2) * 0.0012, zM - 0.004);
     let f = solveCurl(R, lens[i], girths[i], top, zM, fy);
-    let spread = (i - 1.5) * 0.050;
+    let spread = (i - 1.5) * 0.075;
     if (i === 0 && opts.trigger !== undefined) {
       // The trigger finger leaves the front strap: it extends, rolls out of the
       // wrap plane, and reaches forward instead of closing. It is the one finger
@@ -645,7 +734,13 @@ export function buildArms(weapon, mats) {
   const gripDown = new THREE.Vector3(0, -1, 0)
     .applyEuler(new THREE.Euler(A.rightRake || 0, 0, 0)).normalize();
   const gripUp = gripDown.clone().negate();
-  const rGrip = graspRadius(body, A.rightHand, gripDown, -0.012, 0.030, 0.045, 0.0175, +(process.env.GP || 0.6)) + GLOVE_T;
+  // 0.95, not the median. A pistol grip is not a cylinder — it is a raked,
+  // tapered moulding with a palm swell and a beavertail — so a median radius is
+  // the radius of its NARROW places and the fingers close 5-10 mm inside its wide
+  // ones. Measured with the median: 576 glove vertices up to 9.8 mm inside the
+  // lower receiver. At the 95th percentile the same fingers sit 0.0-4.0 mm off
+  // it, i.e. within the glove's own 5 mm wall — squashed leather, not steel.
+  const rGrip = graspRadius(body, A.rightHand, gripDown, -0.012, 0.030, 0.045, 0.0175, 0.95) + GLOVE_T;
   const gripSolve = graspCentre(rGrip, PALM_TOP, PALM_ZM);
 
   const right = new THREE.Group();
@@ -658,8 +753,13 @@ export function buildArms(weapon, mats) {
   // is at the ribs, and a forearm aimed straight at the shoulder passes through
   // the lens when the weapon comes up to the eye.
   const rh = buildHand(mats, {
-    radius: rGrip, thumbCurl: +(process.env.TC||0.80), thumbYaw: +(process.env.TY||0.85), thumbLift: +(process.env.TL||0.30),
-    trigger: +(process.env.TR||0.86), triggerSpread: +(process.env.TS||0.02), triggerRoll: +(process.env.TRO||0.26), palmBend: 0.50,
+    // The thumb rolls further over the top and further round the grip than it
+    // did, and the trigger finger extends rather than curling: both were
+    // modelled through the receiver — 138 thumb and 246 trigger-finger vertices
+    // up to 9.8 mm inside it — because they are the two digits NOT solved
+    // against the grip, so nothing was stopping them.
+    radius: rGrip, thumbCurl: 1.00, thumbYaw: 0.60, thumbLift: 0.55,
+    trigger: 0.60, triggerSpread: 0.02, triggerRoll: 0.26, palmBend: 0.50,
     forearm: intoHand(new THREE.Vector3(0.30, -0.92, 0.25), rPose, false),
     forearmLen: 0.30,
   }, D);
@@ -671,13 +771,10 @@ export function buildArms(weapon, mats) {
   root.add(right);
 
   /* --- support hand ---------------------------------------------------- */
-  // The channel axis is the bore, and it is placed by the one thing that has to
-  // be true: the palm's contact face lies on the handguard's UNDERSIDE. So the
-  // underside is measured and the axis put exactly one grasp radius above it,
-  // rather than the anchor being lifted by a fudged fraction of the shell's
-  // height. Sideways the axis leans a little right of centre, which pushes the
-  // climbing fingers clear of the shell's lower-right corner without lifting the
-  // palm off the flat.
+  // The channel axis is the bore, ON the measured underside — see `HAND_R`. The
+  // old code lifted the published anchor by 34% of a measured shell height to get
+  // it onto the handguard's own axis, so the hand could encircle the handguard;
+  // that is the thing that was standing in the sight.
   const station = supportStation(body, A.leftHand, 0.012);
   const rHand = HAND_R + GLOVE_T;
   const hgAxis = new THREE.Vector3(0, station.under, station.z);
@@ -686,13 +783,15 @@ export function buildArms(weapon, mats) {
   const left = new THREE.Group();
   left.name = 'leftArm';
   left.frustumCulled = false;
-  // See the note above `SUPPORT_ARC`. The buffer is a left hand already, so this
-  // one is NOT mirrored; the axis points down the bore so the thumb (which sits
-  // at the buffer's +X) runs forward and the index finger is the forwardmost of
-  // the four. The roll then only has to lay the palm flat on the underside:
-  // `seat` puts the contact patch 90 degrees clockwise of the finger direction
-  // on an unmirrored hand, so a roll near zero means fingers across the bore and
-  // palm straight down.
+  // See the note above `SUPPORT_ROLL`. The buffer is a left hand already, so this
+  // one is NOT mirrored — it used to be, which made the support hand a right hand
+  // on a left arm and forced the wrap over the top of the handguard. The axis
+  // points DOWN the bore rather than back out of the stock, which is what keeps
+  // the thumb (at the buffer's +X) running forward and the index finger the
+  // forwardmost of the four now that the mirror is gone. The roll is then just
+  // the tilt of the fist: `seat` puts the contact patch 90 degrees anticlockwise
+  // of the finger direction on an unmirrored hand, so a small positive roll means
+  // fingers across the bore and the palm a few degrees off straight down.
   const lPose = seat(new THREE.Vector3(0, 0, -1), new THREE.Vector3(1, 0, 0), SUPPORT_ROLL, hgSolve);
   const lh = buildHand(mats, {
     radius: rHand, fingerY: 0.0072,

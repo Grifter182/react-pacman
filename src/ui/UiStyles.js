@@ -726,8 +726,17 @@ export const UI_CSS = /* css */`
    means the gestures need a real element of their own to land on. */
 .tc-surface { position: absolute; inset: 0; pointer-events: auto; touch-action: none; }
 
+/* Positioned by transform from a REAL resting place, never by bare left/top.
+   With \`left\`/\`top\` unset a fixed element falls back to its static position,
+   which for the first child of a full-screen fixed layer is the top-left corner
+   — so any path that showed the ring without assigning offsets parked it in the
+   corner, pulled further off screen by the negative margin. A player reported
+   exactly that. Now the default IS a plausible thumb rest, and the script only
+   displaces it. */
 .tc-stick {
-  position: fixed; width: 132px; height: 132px; margin: -66px 0 0 -66px;
+  position: fixed; left: 0; top: 0; width: 132px; height: 132px;
+  margin: -66px 0 0 -66px;
+  transform: translate(22vw, 68vh);
   opacity: 0; transition: opacity .12s; pointer-events: none;
 }
 .tc-stick.on { opacity: 1; }
@@ -784,6 +793,43 @@ export const UI_CSS = /* css */`
    would ghost through it. Removing the layer also releases a latched stick,
    because the pointerup still arrives on window. */
 body:has(.bl-menu.on) .bl-touch { display: none; }
+
+/* The browser must not treat a thumb drag as a scroll or a page gesture. The
+   layer already sets \`touch-action: none\`, but a scrollable document can still
+   claim the gesture on some mobile engines, so it is refused at the root too. */
+body.is-touch, body.is-touch html { overscroll-behavior: none; }
+body.is-touch { touch-action: none; -webkit-user-select: none; user-select: none; }
+
+/* MOVE ZONE AFFORDANCE. The stick is invisible until a thumb lands on it, which
+   is correct for a floating stick and useless for discovery: nothing said the
+   left half of the screen was a movement surface, and a player asked how to walk
+   forward. This is a low-contrast hint that fades once the stick has been used,
+   so it teaches the control and then gets out of the way. */
+.tc-hint {
+  position: fixed; left: max(20px, env(safe-area-inset-left)); bottom: 96px;
+  width: 118px; height: 118px; border-radius: 50%; pointer-events: none;
+  border: 1px dashed rgba(198,220,242,.20);
+  display: flex; align-items: flex-end; justify-content: center;
+  font: 700 9px/1 inherit; letter-spacing: .22em; color: rgba(198,220,242,.42);
+  padding-bottom: 10px;
+  transition: opacity .5s var(--ease);
+}
+.tc-hint::before {
+  content: ''; position: absolute; left: 50%; top: 24px; width: 0; height: 0;
+  transform: translateX(-50%);
+  border-left: 5px solid transparent; border-right: 5px solid transparent;
+  border-bottom: 7px solid rgba(198,220,242,.34);
+}
+.bl-touch.used .tc-hint { opacity: 0; }
+
+/* Input readout for diagnosing a device that cannot be reproduced locally. */
+.tc-dbg {
+  position: fixed; left: 50%; top: max(8px, env(safe-area-inset-top));
+  transform: translateX(-50%);
+  font: 600 10px/1.45 ui-monospace, monospace; white-space: pre;
+  color: #cfe6ff; background: rgba(4,7,11,.82); border: 1px solid rgba(126,196,255,.4);
+  border-radius: 6px; padding: 5px 8px; pointer-events: none; z-index: 60;
+}
 
 /* On a phone the HUD has to give up room: the keybind legend is meaningless
    without a keyboard, and the minimap competes with the left thumb. */
