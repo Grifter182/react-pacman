@@ -707,6 +707,78 @@ export const UI_CSS = /* css */`
 @media (prefers-reduced-motion: reduce) {
   .bl-root * { transition-duration: .01ms !important; animation-duration: .01ms !important; }
 }
+
+
+/* ------------------------------------------------------------------ touch */
+/* Built only on coarse-pointer devices. Everything is sized off dynamic
+   viewport units and safe-area insets so a notch, a home indicator or the
+   browser's collapsing address bar cannot push a control off screen. */
+.bl-touch { position: fixed; inset: 0; z-index: 30; pointer-events: none; touch-action: none; }
+.bl-touch > * { pointer-events: auto; }
+
+.tc-stick {
+  position: fixed; width: 132px; height: 132px; margin: -66px 0 0 -66px;
+  opacity: 0; transition: opacity .12s; pointer-events: none;
+}
+.tc-stick.on { opacity: 1; }
+.tc-stick .ring {
+  position: absolute; inset: 0; border-radius: 50%;
+  border: 1px solid rgba(255,255,255,.22); background: rgba(6,9,14,.28);
+}
+.tc-stick .knob {
+  position: absolute; left: 50%; top: 50%; width: 54px; height: 54px;
+  margin: 0; border-radius: 50%; transform: translate(-50%, -50%);
+  background: rgba(232,238,245,.30); border: 1px solid rgba(255,255,255,.45);
+}
+
+.tc-btn {
+  -webkit-tap-highlight-color: transparent; user-select: none;
+  font: 700 11px/1 inherit; letter-spacing: .18em; color: var(--fg);
+  background: rgba(10,14,20,.46); border: 1px solid rgba(255,255,255,.20);
+  border-radius: 10px; backdrop-filter: blur(3px);
+  display: flex; align-items: center; justify-content: center;
+}
+.tc-btn.down { background: rgba(126,196,255,.30); border-color: rgba(126,196,255,.8); }
+
+.tc-right {
+  position: fixed; display: flex; flex-direction: column; gap: 14px; align-items: flex-end;
+  right: max(18px, env(safe-area-inset-right)); bottom: max(22px, env(safe-area-inset-bottom));
+}
+/* The fire button is deliberately the largest target on the screen and sits
+   under the natural resting arc of the right thumb. */
+.tc-fire { width: 92px; height: 92px; border-radius: 50%; }
+.tc-fire::after {
+  content: ''; width: 26px; height: 26px; border-radius: 50%;
+  background: rgba(232,238,245,.55); box-shadow: 0 0 0 6px rgba(232,238,245,.12);
+}
+.tc-ads { width: 68px; height: 68px; border-radius: 50%; }
+
+.tc-left-btns {
+  position: fixed; display: flex; flex-direction: column; gap: 10px;
+  left: max(18px, env(safe-area-inset-left)); bottom: max(22px, env(safe-area-inset-bottom));
+}
+.tc-sm { width: 74px; height: 40px; }
+
+/* On a phone the HUD has to give up room: the keybind legend is meaningless
+   without a keyboard, and the minimap competes with the left thumb. */
+body.is-touch .bl-keyhint, body.is-touch .bl-perf { display: none !important; }
+/* The ammo readout lives in the bottom-right corner, which is exactly where
+   the fire and ADS buttons go. Lift it clear of them rather than letting the
+   two overlap — a number you cannot read under your own thumb is worse than
+   no number. */
+body.is-touch .bl-ammo { bottom: 128px !important; right: 118px !important; }
+body.is-touch .bl-vitals { bottom: 96px !important; }
+@media (max-width: 820px) {
+  body.is-touch .bl-map { transform: scale(.72); transform-origin: top left; }
+  .bl-title h1 { font-size: clamp(30px, 9vw, 52px); }
+  .bl-cols { grid-template-columns: 1fr; gap: calc(var(--u) * 3); }
+  .bl-credit { flex-wrap: wrap; }
+}
+/* Landscape phones are short: the front end must scroll rather than clip. */
+@media (max-height: 460px) {
+  .bl-mwrap { padding: calc(var(--u) * 2) 0; }
+  .bl-title { margin-bottom: calc(var(--u) * 2.5); }
+}
 `;
 
 /** Inject once; safe to call from several places. */

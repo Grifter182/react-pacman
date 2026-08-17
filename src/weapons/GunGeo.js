@@ -217,6 +217,48 @@ export function tube(rOuter, rInner, z0, z1, segments = 28) {
 }
 
 /**
+ * Hollow tube whose bore is a CONE rather than a cylinder — the shape a sight
+ * has to be if the player is to see the whole of its aperture.
+ *
+ * A straight bore is not see-through, and the reason is pure perspective. The
+ * eye is a point, so the pencil of rays that reaches it through a tube is a
+ * cone that *widens* going downrange. A cylindrical bore of radius r and length
+ * L, with the eye d behind the rear rim, therefore stops the cone at the FRONT
+ * rim: the largest half-angle that survives is r/(d+L), not r/d. On the red dot
+ * that is 15.2 mm of aperture reduced to an effective 10.9 mm — 48% of the area
+ * of the hole the player can see is tube wall, seen end-on at a grazing angle,
+ * which renders as an opaque grey annulus filling most of the sight.
+ *
+ * `boredTube` takes the eye position and the clear half-angle the sight is
+ * designed around and lays the bore ON that cone, so every ray that clears the
+ * rear rim also clears the front one. Real optics do exactly this — it is why
+ * an objective bell is wider than an ocular — and it costs nothing: the wall
+ * simply thins toward the front, where it is furthest from the eye anyway.
+ *
+ * @param outer  [[r, z], ...] outer profile, REAR to FRONT (z decreasing)
+ * @param bore   (z) => radius   the clear-cone radius at that z
+ * @param slack  extra bore radius over the cone, in metres
+ */
+export function boredTube(outer, bore, segments = 32, slack = 0.0006) {
+  const prof = outer.slice();
+  // Walk the outer profile back to front, then return along the cone. Sampling
+  // the bore at every outer station keeps the inner wall a true cone rather than
+  // a stack of cylinders, so nothing steps into the sight line *between*
+  // stations — which is the failure mode a single rear-rim check misses.
+  // Repeated z values (a square shoulder in the outer wall) would emit a
+  // zero-area ring, so they collapse to one.
+  let prevZ = NaN;
+  for (let i = outer.length - 1; i >= 0; i--) {
+    const z = outer[i][1];
+    if (z === prevZ) continue;
+    prevZ = z;
+    prof.push([bore(z) + slack, z]);
+  }
+  prof.push([outer[0][0], outer[0][1]]);
+  return lathe(prof, segments);
+}
+
+/**
  * Solid cylinder or truncated cone running along local +Z from z = 0 to
  * z = len. Used for the dozens of small turned bosses — turrets, plungers,
  * thumbscrews, pins — where a full profile is overkill and getting the winding

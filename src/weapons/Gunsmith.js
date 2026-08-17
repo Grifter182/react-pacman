@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { Config, QualityTier } from '../core/Config.js';
 import { makeMaterial, getMaterialCatalog } from '../materials/TextureFactory.js';
 import {
-  Kit, chamferBox, chamferWedge, loft, lathe, tube, cyl, knurl, octagon,
+  Kit, chamferBox, chamferWedge, loft, lathe, tube, boredTube, cyl, knurl, octagon,
   roundRect, ngon, picatinny, mlokSlots, flutes, panelLine, recessPanel,
 } from './GunGeo.js';
 
@@ -270,19 +270,33 @@ export function weaponMaterials() {
     material: { aoMapIntensity: VIEWMODEL_AO * 2.0 },
   });
 
-  // Optic glass: an AR-coated lens reads as a dark surface with a green-magenta
-  // bloom, never as a grey pane. No transmission — just a low-opacity
-  // dielectric with a hard specular lobe off the environment map.
+  // Optic glass. THE SIGHT HAS TO BE SEE-THROUGH — that is the whole function
+  // of the part, and it outranks how the coating looks.
+  //
+  // This was previously authored as a look rather than as an aperture: two
+  // discs at 0.34 opacity over a near-black tint, so only ~44% of the world's
+  // light survived the stack, with a 2.4x environment specular and full
+  // clearcoat laid on top. The result was a lens you saw *instead of* the
+  // target — aiming showed the coating, not the scene behind it.
+  //
+  // A real AR-coated lens passes better than 90% of the light; the coating is
+  // visible as a faint tint and an off-axis bloom, never as a filter. At 0.10
+  // the two discs together still pass ~81%, which keeps the target readable
+  // while leaving enough surface for the specular to catch and read as glass.
   const glass = new THREE.MeshPhysicalMaterial({
-    color: 0x0a1512, roughness: 0.045, metalness: 0.0,
-    transparent: true, opacity: 0.34, depthWrite: false,
-    clearcoat: 1.0, clearcoatRoughness: 0.03,
-    envMapIntensity: 2.4, side: THREE.DoubleSide,
+    name: 'lensGlass',
+    color: 0x14201c, roughness: 0.045, metalness: 0.0,
+    transparent: true, opacity: 0.10, depthWrite: false,
+    clearcoat: 1.0, clearcoatRoughness: 0.05,
+    // The specular has to stay a highlight, not a veil: at 2.4 the reflection
+    // alone was brighter than the transmitted image on any lit surface.
+    envMapIntensity: 0.9, side: THREE.DoubleSide,
   });
 
   // Emissive reticle: unlit, additive, outside the tone mapper so the bloom
   // pass sees a genuinely over-range value and blooms it like a real emitter.
   const lens = new THREE.MeshBasicMaterial({
+    name: 'reticleEmitter',
     color: new THREE.Color(7.5, 0.42, 0.16),
     transparent: true, blending: THREE.AdditiveBlending,
     depthWrite: false, depthTest: false, toneMapped: false, opacity: 1,
@@ -315,11 +329,11 @@ function detailLevel() {
  */
 const SEG = {
   //         LOW  MED  HIGH
-  barrel:   [12,  24,  40],
-  hguard:   [10,  18,  28],
-  optic:    [16,  32,  56],
-  small:    [ 8,  14,  22],
-  tiny:     [ 6,  10,  16],
+  barrel:   [14,  28,  48],
+  hguard:   [12,  20,  32],
+  optic:    [20,  40,  64],
+  small:    [10,  18,  28],
+  tiny:     [ 6,  12,  20],
 };
 function seg(kind, D) { return SEG[kind][D]; }
 
@@ -400,16 +414,16 @@ function upperReceiver(kit, M, D) {
 
   // Forward assist: a plunger in a boss, just behind the deflector.
   kit.add(cyl(0.0072, 0.0060, 0.014, seg('tiny', D)), S_RECV,
-    { pos: [portX - 0.002, 0.016, portZ + portLen * 0.5 + 0.014], rot: [0, -Math.PI / 2, 0] });
+    { pos: [portX - 0.002, 0.016, portZ + portLen * 0.5 + 0.014], rot: [0, Math.PI / 2, 0] });
   kit.add(cyl(0.0050, 0.0050, 0.005, seg('tiny', D)), S_RECV,
-    { pos: [portX + 0.010, 0.016, portZ + portLen * 0.5 + 0.014], rot: [0, -Math.PI / 2, 0] });
+    { pos: [portX + 0.011, 0.016, portZ + portLen * 0.5 + 0.014], rot: [0, Math.PI / 2, 0] });
 
   if (D >= 1) {
     // Takedown pins and the moulding seam along both flanks.
     kit.mirrored((k) => {
       k.add(panelLine(len - 0.02, { width: 0.0014, depth: 0.0010 }), S_RECV, { pos: [w * 0.5 - 0.0004, -h * 0.30, zc] });
-      k.add(cyl(0.0055, 0.0042, 0.005, seg('tiny', D)), S_RECV, { pos: [w * 0.5 - 0.001, -0.012, back - 0.020], rot: [0, -Math.PI / 2, 0] });
-      k.add(cyl(0.0055, 0.0042, 0.005, seg('tiny', D)), S_RECV, { pos: [w * 0.5 - 0.001, -0.012, front + 0.022], rot: [0, -Math.PI / 2, 0] });
+      k.add(cyl(0.0055, 0.0042, 0.005, seg('tiny', D)), S_RECV, { pos: [w * 0.5 - 0.001, -0.012, back - 0.020], rot: [0, Math.PI / 2, 0] });
+      k.add(cyl(0.0055, 0.0042, 0.005, seg('tiny', D)), S_RECV, { pos: [w * 0.5 - 0.001, -0.012, front + 0.022], rot: [0, Math.PI / 2, 0] });
     });
   }
   return { front, back, portZ, portLen, portH, deckY, raceY };
@@ -447,9 +461,9 @@ function lowerReceiver(kit, M, D) {
     { pos: [0, topY - 0.021, zc + 0.052] });
 
   // Magazine release (right) and its fence; bolt-catch boss (left).
-  kit.add(cyl(0.0060, 0.0048, 0.0068, seg('tiny', D)), S_RECV, { pos: [w * 0.5 - 0.001, topY - 0.014, zc + 0.006], rot: [0, -Math.PI / 2, 0] });
+  kit.add(cyl(0.0060, 0.0048, 0.0068, seg('tiny', D)), S_RECV, { pos: [w * 0.5 - 0.001, topY - 0.014, zc + 0.006], rot: [0, Math.PI / 2, 0] });
   kit.add(chamferBox(0.004, 0.014, 0.014, 0.0008), S_RECV, { pos: [w * 0.5, topY - 0.014, zc + 0.006] });
-  kit.add(cyl(0.0072, 0.0072, 0.0040, seg('tiny', D)), S_RECV, { pos: [-w * 0.5 + 0.001, topY - 0.017, zc + 0.052], rot: [0, Math.PI / 2, 0] });
+  kit.add(cyl(0.0072, 0.0072, 0.0040, seg('tiny', D)), S_RECV, { pos: [-w * 0.5 + 0.001, topY - 0.017, zc + 0.052], rot: [0, -Math.PI / 2, 0] });
 
   // Sling loop at the rear of the lower.
   kit.add(new THREE.TorusGeometry(0.0062, 0.0016, 8, 18), S_RECV,
@@ -485,9 +499,25 @@ function handguard(kit, M, D, frontZ) {
   // and ribs are placed on the face or they float / sink around the section.
   const face = r * Math.cos(Math.PI / N);
 
+  // End cap at the muzzle end — the shell's front is otherwise a bare loft cap,
+  // and the ring of shadow inside a real handguard mouth is what tells the eye
+  // the tube is hollow rather than a solid dowel.
+  kit.add(tube(r * 0.905, r * 0.905 - 0.0040, z1 + 0.0005, z1 + 0.0060, N), S_RAIL, { pos: [0, 0.010, 0] });
+  if (D >= 1) {
+    // Castellated barrel nut under the rear collar.
+    kit.addParts(knurl(D >= 2 ? 18 : 10, r * 1.045, 0.0095, { width: 0.0030, depth: 0.0022 }),
+      S_RAIL, { pos: [0, 0.010, z0 - 0.0145] });
+  }
+
   // The top rail runs continuous with the receiver's — a monolithic upper.
-  kit.addParts(picatinny(hg.len - 0.016, { detail: D >= 1 ? 1 : 0 }), S_RAIL,
-    { pos: [0, 0.010 + face - 0.0012, (z0 + z1) * 0.5] });
+  const railBase = 0.010 + face - 0.0012;
+  const railLen = hg.len - 0.016;
+  kit.addParts(picatinny(railLen, { detail: D >= 1 ? 1 : 0 }), S_RAIL,
+    { pos: [0, railBase, (z0 + z1) * 0.5] });
+  // Top of the teeth and the forward end of the row: the optic's sight line has
+  // to clear both, and this is the tallest thing downrange of the sight.
+  const railTopY = railBase + 0.0032 + 0.0044;
+  const railFrontZ = (z0 + z1) * 0.5 - railLen * 0.5;
 
   if (D >= 1) {
     // M-LOK rows at 3, 6 and 9 o'clock. These slots are what break up the long
@@ -506,10 +536,10 @@ function handguard(kit, M, D, frontZ) {
       });
     }
     // QD sling socket, front left.
-    kit.add(cyl(0.0055, 0.0030, 0.0045, seg('tiny', D)), S_RAIL, { pos: [-face + 0.001, 0.010, z1 + 0.030], rot: [0, Math.PI / 2, 0] });
+    kit.add(cyl(0.0055, 0.0030, 0.0045, seg('tiny', D)), S_RAIL, { pos: [-face + 0.001, 0.010, z1 + 0.030], rot: [0, -Math.PI / 2, 0] });
     // Anti-rotation index tab and the barrel-nut clamp screws at the rear.
     kit.mirrored((k) => k.add(cyl(0.0026, 0.0022, 0.004, seg('tiny', D)), S_RAIL,
-      { pos: [face * 0.72, 0.010 - face * 0.66, z0 - 0.012], rot: [0, -Math.PI / 2, 0] }));
+      { pos: [face * 0.72, 0.010 - face * 0.66, z0 - 0.012], rot: [0, Math.PI / 2, 0] }));
   }
 
   // Heat-shield ribs on the underside, visible whenever the gun is canted.
@@ -519,19 +549,27 @@ function handguard(kit, M, D, frontZ) {
         { pos: [(i - 1.5) * 0.006, 0.010 - face + 0.0006, (z0 + z1) * 0.5] });
     }
   }
-  return { z0, z1, radius: r, face };
+  return { z0, z1, radius: r, face, railTopY, railFrontZ };
 }
 
 /* ---------------------------------------------------------------- barrel */
 
 /** Barrel, gas system and muzzle device. */
-function barrelAssembly(kit, M, D, hg) {
+function barrelAssembly(kit, M, D, hg, opticFitted) {
   kit.label = 'barrel';
   const b = M.barrel;
   const zB = 0.010;                    // breech face
   const zM = zB - b.len;               // muzzle crown
   const sgB = SEG.barrel[D];
   const R = b.radius;
+  /**
+   * Everything forward of the receiver that stands up into the sight line, as
+   * `{ y, z }` samples of its highest point. `opticAssembly` solves the mount
+   * height against these — see `SIGHT_CLEAR`. Without them the optic is placed
+   * from a constant and the gun's own gas block and muzzle device end up inside
+   * the sight picture, which is the bug this list exists to close.
+   */
+  const skyline = [];
 
   // Profile listed rear -> front: chamber shoulder, gas journal, pencil
   // section, thread relief, crown.
@@ -581,30 +619,49 @@ function barrelAssembly(kit, M, D, hg) {
     if (D >= 1) {
       // Two set screws in the side of the block.
       kit.mirrored((k) => k.add(cyl(0.0022, 0.0018, 0.0022, seg('tiny', D)), S_BARREL,
-        { pos: [gw * 0.5, 0.010 + gh * 0.16, gz], rot: [0, -Math.PI / 2, 0] }));
+        { pos: [gw * 0.5 - 0.0004, 0.010 + gh * 0.16, gz], rot: [0, Math.PI / 2, 0] }));
     }
 
     // Front sight: a base on the block, two protective ears and a round post
     // between them, with the classic detent drum at its foot.
+    //
+    // THE POST AND EARS ONLY EXIST WHEN NOTHING IS MOUNTED ABOVE THEM. They
+    // stand about 4R off the bore, which puts them directly across the optic's
+    // line of sight — aiming produced a sight picture full of the rifle's own
+    // front sight instead of the target, which is why looking through the
+    // scope showed nothing useful. Every optic-equipped rifle solves this the
+    // same way: the irons fold flat and the optic owns the sight line. The
+    // base stays, because a bare gas block with no sight base on top reads as
+    // an unfinished barrel.
     const baseY = 0.010 + gh * 0.60;
     const postH = R * 2.6;
     kit.add(chamferBox(gw * 0.80, 0.0040, 0.020, 0.0010), S_BARREL, { pos: [0, baseY, gz] });
-    kit.mirrored((k) => k.add(loft(octagon(0.0034, postH, 0.0008), [
-      { z: gz + 0.008, scale: 0.85, scaleY: 0.72 },
-      { z: gz + 0.006, scale: 1.00, scaleY: 0.94 },
-      { z: gz - 0.006, scale: 1.00, scaleY: 1.00 },
-      { z: gz - 0.008, scale: 0.85, scaleY: 0.88 },
-    ]), S_BARREL, { pos: [gw * 0.28, baseY + postH * 0.5, 0] }));
-    kit.add(cyl(0.0016, 0.0013, postH * 0.92, seg('tiny', D)), S_BARREL,
-      { pos: [0, baseY, gz], rot: [-Math.PI / 2, 0, 0] });
-    kit.add(cyl(0.0034, 0.0034, 0.0035, seg('tiny', D)), S_BARREL,
-      { pos: [0, baseY + 0.0005, gz], rot: [-Math.PI / 2, 0, 0] });
+    skyline.push({ y: baseY + 0.0020 + (opticFitted ? 0.0061 : postH), z: gz });
+
+    if (!opticFitted) {
+      kit.mirrored((k) => k.add(loft(octagon(0.0034, postH, 0.0008), [
+        { z: gz + 0.008, scale: 0.85, scaleY: 0.72 },
+        { z: gz + 0.006, scale: 1.00, scaleY: 0.94 },
+        { z: gz - 0.006, scale: 1.00, scaleY: 1.00 },
+        { z: gz - 0.008, scale: 0.85, scaleY: 0.88 },
+      ]), S_BARREL, { pos: [gw * 0.28, baseY + postH * 0.5, 0] }));
+      kit.add(cyl(0.0016, 0.0013, postH * 0.92, seg('tiny', D)), S_BARREL,
+        { pos: [0, baseY, gz], rot: [-Math.PI / 2, 0, 0] });
+      kit.add(cyl(0.0034, 0.0034, 0.0035, seg('tiny', D)), S_BARREL,
+        { pos: [0, baseY + 0.0005, gz], rot: [-Math.PI / 2, 0, 0] });
+    } else {
+      // Folded: the sight lies along the base, so the silhouette keeps a step
+      // at the gas block without anything standing up into the sight line.
+      kit.add(chamferBox(gw * 0.44, 0.0052, 0.026, 0.0010), S_BARREL,
+        { pos: [0, baseY + 0.0035, gz - 0.004] });
+    }
   }
 
   // Muzzle device.
-  let tipZ;
+  let tipZ, muzzleTop;
   if (M.muzzle === 'flashhider') {
     tipZ = zM - 0.040;
+    muzzleTop = 0.010 + R * 1.16 + 0.0030;
     kit.add(lathe([
       [0, zM + 0.001], [R * 1.35, zM + 0.001], [R * 1.35, zM - 0.006],
       [R * 1.20, zM - 0.008], [R * 1.20, tipZ], [R * 0.62, tipZ],
@@ -621,6 +678,7 @@ function barrelAssembly(kit, M, D, hg) {
     }
   } else if (M.muzzle === 'compensator') {
     tipZ = zM - 0.028;
+    muzzleTop = 0.010 + R * 1.45;
     kit.add(lathe([
       [0, zM + 0.001], [R * 1.45, zM + 0.001], [R * 1.45, tipZ + 0.002], [R * 1.10, tipZ],
       [R * 0.55, tipZ], [R * 0.55, tipZ + 0.012], [0, tipZ + 0.012],
@@ -631,6 +689,7 @@ function barrelAssembly(kit, M, D, hg) {
     }
   } else {
     tipZ = zM - 0.052;
+    muzzleTop = 0.010 + R * 1.62;
     kit.add(lathe([
       [0, zM + 0.001], [R * 1.60, zM + 0.001], [R * 1.60, tipZ + 0.004], [R * 1.25, tipZ],
       [R * 0.55, tipZ], [R * 0.55, tipZ + 0.018], [0, tipZ + 0.018],
@@ -640,7 +699,10 @@ function barrelAssembly(kit, M, D, hg) {
         { pos: [R * 1.55, 0.010, zM - 0.010 - i * 0.012], rot: [0.22, 0, 0] }));
     }
   }
-  return { zB, zM, tipZ };
+  // The muzzle device is the furthest thing downrange, so it needs the least
+  // height to intrude on the sight line — sample it at both ends of its body.
+  skyline.push({ y: muzzleTop, z: zM }, { y: muzzleTop, z: tipZ });
+  return { zB, zM, tipZ, skyline };
 }
 
 /* ------------------------------------------------------------------ grip */
@@ -649,7 +711,7 @@ function barrelAssembly(kit, M, D, hg) {
 function pistolGrip(kit, M, D, anchor) {
   kit.label = 'grip';
   const rake = 0.36;
-  const g = loft(roundRect(0.030, 0.038, 0.008, D >= 1 ? 3 : 2), [
+  const g = loft(roundRect(0.030, 0.038, 0.008, D >= 2 ? 5 : D >= 1 ? 3 : 2), [
     { z: 0.000, scale: 1.00, scaleY: 1.00 },
     { z: 0.012, scale: 1.03, scaleY: 0.98 },
     { z: 0.040, scale: 0.94, scaleY: 0.92 },
@@ -728,6 +790,11 @@ function stockAssembly(kit, M, D, backZ) {
     // as a length of pipe glued on.
     kit.add(cyl(0.0182, 0.0182, 0.0055, seg('small', D)), S_RECV, { pos: [0, -0.004, backZ + 0.0005] });
     kit.add(chamferBox(0.036, 0.040, 0.0030, 0.0008), S_RECV, { pos: [0, -0.004, backZ - 0.0010] });
+    // Ambidextrous QD sling sockets through the end plate — the attachment
+    // point a modern carbine actually uses, and two more highlights on the one
+    // flat plate at the back of the frame.
+    kit.mirrored((k) => k.add(cyl(0.0044, 0.0036, 0.0060, seg('small', D)), S_RECV,
+      { pos: [0.0150, 0.0060, backZ - 0.0025], rot: [0, Math.PI / 2, 0] }));
     if (D >= 2) kit.addParts(knurl(12, 0.0176, 0.0050), S_RECV, { pos: [0, -0.004, backZ + 0.0005] });
   }
 
@@ -749,7 +816,9 @@ function stockAssembly(kit, M, D, backZ) {
   }
 
   // Carbine: slim body clamped on the tube, cheek weld on top, rubber pad.
-  kit.add(loft(octagon(0.042, 0.048, 0.0022), [
+  // Rounded section, not an octagon: at 45 mm across, held 300 mm from the eye,
+  // an eight-sided stock reads as exactly what it is.
+  kit.add(loft(roundRect(0.042, 0.048, 0.0075, D >= 2 ? 4 : D >= 1 ? 3 : 1), [
     { z: z(0.030), scale: 0.72, scaleY: 0.80 },
     { z: z(0.046), scale: 0.90, scaleY: 0.92 },
     { z: z(0.110), scale: 1.00, scaleY: 1.00 },
@@ -782,7 +851,10 @@ function stockAssembly(kit, M, D, backZ) {
 function magazineMesh(M, mats, D) {
   const kit = new Kit();
   const m = M.mag;
-  const N = D >= 1 ? 7 : 4;
+  // A magazine hangs below the bore in every hip frame and it is the biggest
+  // uninterrupted curve on the weapon, so it gets rings and corner segments
+  // rather than the 12-point section that read as a folded slab.
+  const N = D >= 2 ? 11 : D >= 1 ? 8 : 4;
   const curveAt = (t) => Math.sin(t * 1.25) * m.curve;
 
   const rings = [];
@@ -792,7 +864,7 @@ function magazineMesh(M, mats, D) {
     // most recognisable single element of a rifle's silhouette.
     rings.push({ z: t * m.len, dy: curveAt(t), scale: 1 - t * 0.03, scaleY: 1 - t * 0.02 });
   }
-  const body = loft(roundRect(m.width, m.depth, 0.004, D >= 1 ? 2 : 1), rings);
+  const body = loft(roundRect(m.width, m.depth, 0.0055, D >= 2 ? 4 : D >= 1 ? 3 : 1), rings);
   body.rotateX(Math.PI / 2);          // +Z sweep -> -Y, profile +Y -> +Z
   kit.add(body, 0);
 
@@ -810,6 +882,17 @@ function magazineMesh(M, mats, D) {
     { pos: [0, -m.len - 0.010, curveAt(1) + m.depth * 0.5] });
   kit.mirrored((k) => k.add(chamferBox(0.0030, 0.012, m.depth * 0.8, 0.0006), 1,
     { pos: [m.width * 0.5 - 0.001, 0.004, 0] }));
+  if (D >= 1) {
+    // Witness holes down the spine and the floorplate catch button. Both are
+    // tiny and both are the kind of thing whose ABSENCE reads as "prop".
+    for (let i = 0; i < 4; i++) {
+      const t = 0.30 + i * 0.17;
+      kit.add(cyl(0.0022, 0.0019, 0.0016, D >= 2 ? 10 : 6), 0,
+        { pos: [0, -t * m.len, curveAt(t) + m.depth * 0.5 - 0.0004], rot: [0, 0, 0] });
+    }
+    kit.add(chamferBox(0.0075, 0.0045, 0.0035, 0.0008), 1,
+      { pos: [0, -m.len - 0.0025, curveAt(1) - m.depth * 0.5 - 0.0012] });
+  }
 
   // Body and ribs are moulded polymer; floorplate and feed lips are steel.
   const mesh = new THREE.Mesh(kit.build(), [mats[S_POLY], mats[S_RECV]]);
@@ -862,95 +945,293 @@ function eyeReliefFor(r, kind) {
   const tanY = Math.tan(THREE.MathUtils.degToRad(fov) * 0.5);
   return r / ((OPTIC_FRAME_FRAC[kind] ?? OPTIC_FRAME_FRAC.reddot) * tanY);
 }
-function opticAssembly(kit, M, D, kind, railY, zc) {
+/**
+ * THE SIGHT PICTURE — the clear half-angle, in radians, of the cone the player
+ * has to be able to see the world through.
+ *
+ * WHY THIS CONSTANT EXISTS, AND WHAT IT REPLACED
+ *
+ * "Aiming down the sight does not work" survived three passes of alignment
+ * fixes because it was never an alignment bug. Measured with
+ * `src/weapons/aperture-probe.mjs` — 49 rays fanned out from the eye through
+ * the aperture at full ADS, on the shipped geometry:
+ *
+ *   rifle  22/49 rays blocked   optic 40 hits, upper 2, handguard 16, barrel 1
+ *   smg    12/49 rays blocked   optic 16 hits, handguard 3
+ *   dmr    49/49 rays blocked   optic 226 hits, handguard 13
+ *
+ * Three separate defects, all of them geometry:
+ *
+ *  1. **The bores were cylinders.** The eye is a point, so the pencil of rays
+ *     that reaches it through a tube widens downrange. A straight bore of
+ *     radius r and length L with the eye d behind it clips the cone at the
+ *     FRONT rim — half-angle r/(d+L), not r/d. On the red dot that turned a
+ *     15.2 mm aperture into an effective 10.9 mm one and filled 48% of the
+ *     visible hole with tube wall seen end-on. `boredTube` now lays every bore
+ *     ON the cone instead, which is exactly why a real objective bell is wider
+ *     than its ocular.
+ *  2. **The scope's rings and its ocular bell were solid `cyl()` plugs**
+ *     centred on the optical axis — three capped cylinders straight across the
+ *     bore. That is the entire 226-hit figure, and it is why the DMR could not
+ *     be aimed at all.
+ *  3. **The mounts were far too short.** A 21 mm axis-over-rail on a 30 mm tube
+ *     leaves 2 mm of mount, which is not a mount; more to the point it puts the
+ *     rifle's own handguard rail, gas block and muzzle device inside the sight
+ *     cone, because that cone drops 32 mm over the 530 mm to the front of the
+ *     rail. Mount height is now SOLVED against the gun's own skyline rather
+ *     than picked, which is why `handguard()` and `barrelAssembly()` report
+ *     where their tallest points are.
+ *
+ * 0.060 rad is 74% of the red dot's own subtended radius, so the sight reads as
+ * a rim around a clear field rather than as a peephole, and the tube walls no
+ * longer vignette at the eye relief actually in use — the raycast fan is clear
+ * to 96% of the lens radius at every quality tier.
+ *
+ * Raising it further is not free, and the cost falls in a place that is easy to
+ * miss: the cone DROPS at this angle as it runs downrange, so every extra
+ * milliradian pushes the optic another half-centimetre up its riser to keep the
+ * muzzle out of the picture. 0.060 lands the red dot on a 34 mm mount, which is
+ * a normal riser; 0.085 would need 51 mm, which is a stilt.
+ */
+const SIGHT_CLEAR = 0.060;
+
+/** Bore radius carried over the cone, so a facet chord never eats into it. */
+const BORE_SLACK = 0.0007;
+
+/** Vertical gap the cone keeps over the gun's own skyline. */
+const CONE_CLEAR = 0.0020;
+
+/** Shortest riser that still reads as a mount: rail deck to housing underside. */
+const MOUNT_MIN = 0.0055;
+
+/**
+ * Where the optical axis has to sit for the sight to be a sight.
+ *
+ * `drop` is the housing's underside relative to the axis, so the first term is
+ * simply "the optic clears the rail with a mount under it". The rest is the
+ * real constraint: for every obstacle at `(y, z)` on the weapon's own skyline,
+ * the bottom of the sight cone at that z must pass over it. That is linear in
+ * axis height, so the answer is one max — no iteration, and it re-solves itself
+ * for free when a handguard or a muzzle device changes.
+ */
+function solveOpticAxis(railY, zEye, drop, skyline) {
+  let y = railY + MOUNT_MIN + drop;
+  for (const o of skyline) y = Math.max(y, o.y + CONE_CLEAR + SIGHT_CLEAR * (zEye - o.z));
+  return y;
+}
+
+function opticAssembly(kit, M, D, kind, railY, zc, skyline = []) {
   kit.label = 'optic';
-  // The optic bell is a 40 mm circle held 100 mm from the eye — it subtends
-  // more of the frame than any other single part and it is the one shape the
-  // player stares through. Twenty segments made it a visible polygon; 36 puts
-  // the facet under 10 degrees, below where the silhouette reads as straight
-  // edges. Turrets and rings step up with it.
+  // The optic bell is the largest single shape in the ADS frame and it is the
+  // one the player stares through, so it carries the highest segment count on
+  // the weapon: 64 puts the facet under 6 degrees, well below where a rim viewed
+  // almost down its own axis starts reading as a polygon.
   const seg = SEG.optic[D];
   const sgS = SEG.small[D];
+  const sgT = SEG.tiny[D];
 
   if (kind === 'scope') {
-    const axisY = railY + 0.030;
     const zR = zc + 0.075, zF = zc - 0.115;
-    for (const z of [zc + 0.020, zc - 0.045]) {           // mount rings
-      kit.add(cyl(0.0205, 0.0205, 0.014, sgS), S_RAIL, { pos: [0, axisY, z - 0.007] });
-      kit.add(chamferBox(0.022, 0.026, 0.018, 0.0012), S_RAIL, { pos: [0, axisY - 0.022, z] });
+    const rearZ = zR - 0.028, frontZ = zF + 0.006;
+    const eyeRelief = eyeReliefFor(0.0215, 'scope');
+    const zEye = rearZ + eyeRelief;
+    const cone = (z) => SIGHT_CLEAR * (zEye - z);
+    /* The bore is the cone everywhere EXCEPT inside the ocular, where it opens
+     * back out toward the eye. Nothing downstream of the last element can widen
+     * the field, so the flare buys no extra sight picture — what it buys is the
+     * look. A cylindrical bore behind a 43 mm ocular presents 20 mm of wall
+     * seen almost exactly end-on, which shades to black and reads as a plugged
+     * scope; a bell catches the same light at 25 degrees and reads as the
+     * inside of an eyepiece, which is what it is. */
+    const bore = (z) => Math.max(cone(z), 0.0193 - (zR - z) * 0.45);
+
+    // Stations along the tube. The ocular's outside diameter is held at the
+    // authored 21.5 mm because that is what `eyeReliefFor` sizes the whole ADS
+    // frame against — it is the nearest and therefore largest-subtending ring
+    // on the optic, so the silhouette is unchanged by everything below.
+    const zOc1 = zR - 0.026, zT0 = zR - 0.036;
+    const zS0 = zc + 0.006, zS1 = zc - 0.026, zT1 = zS1 - 0.006;
+    const zB0 = zF + 0.050, zB1 = zF + 0.026;
+    const rOc = 0.0215;
+    const rTubeR = cone(zS0) + 0.0024;
+    const rSad = cone(zS1) + 0.0058;
+    const rTubeF = cone(zB0) + 0.0024;
+    const rBell = cone(zF) + 0.0032;
+
+    const ringR = rTubeF + 0.0063;
+    const axisY = solveOpticAxis(railY, zEye, ringR, skyline);
+
+    kit.add(boredTube([
+      [rOc, zR], [rOc, zOc1], [rTubeR, zT0], [rTubeR, zS0],
+      [rSad, zS0 - 0.004], [rSad, zS1 + 0.004], [rTubeF, zT1],
+      [rTubeF, zB0], [rBell, zB1], [rBell, zF],
+    ], bore, seg, BORE_SLACK), S_RAIL, { pos: [0, axisY, 0] });
+
+    /* Mount rings. These used to be `cyl()` — solid, capped cylinders of
+     * radius 20.5 mm sitting on the optical axis, i.e. three discs straight
+     * across the bore. They are annular now, which is what a scope ring is. */
+    for (const [z0, z1, rIn] of [[zS0, zS0 + 0.014, rTubeR], [zT1 - 0.023, zT1 - 0.009, rTubeF]]) {
+      const inner = rIn + 0.0003;
+      kit.add(tube(inner + 0.0060, inner, z0, z1, sgS), S_RAIL, { pos: [0, axisY, 0] });
+      // Ring cap with its four screws, and the cantilever foot down to the rail.
+      kit.add(chamferBox(0.020, 0.0060, (z1 - z0) * 0.86, 0.0010), S_RAIL,
+        { pos: [0, axisY + inner + 0.0038, (z0 + z1) * 0.5] });
+      if (D >= 1) {
+        kit.mirrored((k) => {
+          k.add(cyl(0.0018, 0.0016, 0.0030, sgT), S_RAIL, { pos: [0.0072, axisY + inner + 0.0060, (z0 + z1) * 0.5 - 0.0034], rot: [-Math.PI / 2, 0, 0] });
+          k.add(cyl(0.0018, 0.0016, 0.0030, sgT), S_RAIL, { pos: [0.0072, axisY + inner + 0.0060, (z0 + z1) * 0.5 + 0.0034], rot: [-Math.PI / 2, 0, 0] });
+        });
+      }
+      const footTop = axisY - inner - 0.0030;
+      const footH = Math.max(0.004, footTop - railY);
+      kit.add(chamferBox(0.021, footH, (z1 - z0) + 0.006, 0.0014), S_RAIL,
+        { pos: [0, railY + footH * 0.5, (z0 + z1) * 0.5] });
+      kit.add(chamferBox(0.033, 0.0090, (z1 - z0) + 0.010, 0.0012), S_RAIL,
+        { pos: [0, railY + 0.0045, (z0 + z1) * 0.5] });
+      if (D >= 1) {
+        kit.add(chamferBox(0.0090, footH * 0.66, 0.0110, 0.0010), S_RAIL,
+          { pos: [0.0135, railY + footH * 0.5, (z0 + z1) * 0.5] });     // QD throw lever
+      }
     }
-    // Closed annular section: ocular bell, 30 mm body, objective bell, then
-    // back down the bore so the shooter can actually see through it.
-    kit.add(lathe([
-      [0.0215, zR], [0.0215, zR - 0.026], [0.0160, zR - 0.034],
-      [0.0160, zc + 0.030], [0.0175, zc + 0.026], [0.0175, zc - 0.050],
-      [0.0155, zc - 0.054], [0.0155, zF + 0.048], [0.0250, zF + 0.030],
-      [0.0250, zF],
-      [0.0136, zF], [0.0136, zR], [0.0215, zR],
-    ], seg), S_RAIL, { pos: [0, axisY, 0] });
-    kit.add(cyl(0.0125, 0.0110, 0.016, sgS), S_RAIL, { pos: [0, axisY + 0.014, zc - 0.010], rot: [-Math.PI / 2, 0, 0] });
-    kit.add(cyl(0.0110, 0.0098, 0.014, sgS), S_RAIL, { pos: [0.014, axisY, zc - 0.010], rot: [0, -Math.PI / 2, 0] });
-    kit.add(cyl(0.0195, 0.0195, 0.020, sgS), S_RAIL, { pos: [0, axisY, zR - 0.050] });
-    if (D >= 1) kit.addParts(knurl(D >= 2 ? 20 : 14, 0.0198, 0.018), S_RAIL, { pos: [0, axisY, zR - 0.041] });
+
+    // Turret saddle: elevation on top, windage right, parallax left, each a
+    // knurled cap on a shoulder rather than a bare peg.
+    kit.add(cyl(0.0128, 0.0112, 0.017, sgS), S_RAIL, { pos: [0, axisY + rSad - 0.001, zc - 0.010], rot: [-Math.PI / 2, 0, 0] });
+    kit.add(cyl(0.0112, 0.0100, 0.015, sgS), S_RAIL, { pos: [rSad - 0.001, axisY, zc - 0.010], rot: [0, Math.PI / 2, 0] });
+    kit.add(cyl(0.0108, 0.0096, 0.013, sgS), S_RAIL, { pos: [-rSad + 0.001, axisY, zc - 0.010], rot: [0, -Math.PI / 2, 0] });
+    if (D >= 1) {
+      kit.addParts(knurl(D >= 2 ? 20 : 12, 0.0114, 0.014), S_RAIL, { pos: [0, axisY + rSad + 0.002, zc - 0.010], rot: [-Math.PI / 2, 0, 0] });
+      kit.addParts(knurl(D >= 2 ? 18 : 10, 0.0100, 0.012), S_RAIL, { pos: [rSad + 0.008, axisY, zc - 0.010], rot: [0, Math.PI / 2, 0] });
+    }
+
+    // Magnification collar with a throw lever, and the dioptre ring behind it.
+    kit.add(tube(rTubeR + 0.0044, rTubeR + 0.0002, zR - 0.056, zR - 0.040, sgS), S_RAIL, { pos: [0, axisY, 0] });
+    kit.add(tube(rOc + 0.0022, rOc - 0.0004, zR - 0.007, zR - 0.001, sgS), S_RAIL, { pos: [0, axisY, 0] });
+    if (D >= 1) {
+      kit.addParts(knurl(D >= 2 ? 26 : 14, rTubeR + 0.0046, 0.014), S_RAIL, { pos: [0, axisY, zR - 0.048] });
+      kit.add(chamferBox(0.0075, 0.020, 0.0090, 0.0010), S_RAIL,
+        { pos: [0, axisY + rTubeR + 0.0130, zR - 0.048], rot: [0, 0, 0.30] });   // throw lever
+    }
     return {
-      axisY, rearZ: zR - 0.028, frontZ: zF + 0.004, glassR: 0.0132,
-      eyeRelief: eyeReliefFor(0.0215, 'scope'),
+      axisY, rearZ, frontZ,
+      glassR: SIGHT_CLEAR * eyeRelief,
+      frontGlassR: SIGHT_CLEAR * (zEye - frontZ),
+      housingR: rOc, eyeRelief,
     };
   }
 
   if (kind === 'reflex') {
-    const axisY = railY + 0.017;
-    // Open-emitter reflex: shroud arms, a canted lens, an emitter housing.
-    kit.mirrored((k) => k.add(chamferBox(0.0040, 0.030, 0.044, 0.0010), S_RAIL, { pos: [0.0165, axisY + 0.002, zc - 0.002] }));
-    kit.add(chamferBox(0.037, 0.005, 0.044, 0.0010), S_RAIL, { pos: [0, axisY + 0.016, zc - 0.002] });
-    kit.add(chamferBox(0.037, 0.016, 0.020, 0.0012), S_RAIL, { pos: [0, axisY - 0.017, zc + 0.008] });
-    kit.add(chamferBox(0.028, 0.010, 0.014, 0.0010), S_RAIL, { pos: [0, axisY - 0.011, zc - 0.026] });
-    kit.add(chamferBox(0.030, 0.008, 0.032, 0.0010), S_RAIL, { pos: [0, axisY - 0.026, zc] });  // rail clamp
+    const rearZ = zc + 0.020, frontZ = zc - 0.022;
+    const eyeRelief = eyeReliefFor(0.0175, 'reflex');
+    const zEye = rearZ + eyeRelief;
+    const bore = (z) => SIGHT_CLEAR * (zEye - z);
+
+    // An open-emitter reflex has no tube, so its "bore" is the rectangle framed
+    // by the shroud. Size it on the cone at the FRONT of the shroud, which is
+    // where the cone is widest and where the old arms were 4 mm too close in.
+    const zS0 = zc + 0.020, zS1 = zc - 0.026;
+    const w = bore(zS1) + 0.0014;
+    const drop = w + 0.0125;
+    const axisY = solveOpticAxis(railY, zEye, drop, skyline);
+    const zSc = (zS0 + zS1) * 0.5, zSl = zS0 - zS1;
+
+    kit.mirrored((k) => {
+      k.add(chamferBox(0.0042, w * 1.9, zSl, 0.0010), S_RAIL, { pos: [w + 0.0021, axisY + 0.001, zSc] });
+      if (D >= 1) k.add(cyl(0.0020, 0.0017, 0.0026, sgT), S_RAIL, { pos: [w + 0.0042, axisY - w * 0.55, zSc + 0.012], rot: [0, Math.PI / 2, 0] });
+    });
+    kit.add(chamferBox(w * 2 + 0.0104, 0.0052, zSl, 0.0010), S_RAIL, { pos: [0, axisY + w + 0.0026, zSc] });
+    kit.add(chamferBox(w * 2 + 0.0070, 0.0110, 0.021, 0.0012), S_RAIL, { pos: [0, axisY - w - 0.0055, zc + 0.008] });   // emitter housing
+    kit.add(chamferBox(w * 2 + 0.0040, 0.0070, 0.012, 0.0010), S_RAIL, { pos: [0, axisY - w - 0.0035, zc - 0.026] });   // front hood lip
+    if (D >= 1) {
+      kit.add(cyl(0.0058, 0.0050, 0.0075, sgT), S_RAIL, { pos: [w + 0.0030, axisY - w - 0.0055, zc + 0.014], rot: [0, Math.PI / 2, 0] });  // battery cap
+      kit.mirrored((k) => k.add(chamferBox(0.0028, 0.0060, 0.0028, 0.0006), S_RAIL, { pos: [0.0075, axisY - w - 0.0120, zc + 0.012] }));    // adjust buttons
+    }
+
+    // Riser: a clamp foot on the rail and a column up to the emitter housing.
+    const bodyBot = axisY - w - 0.0110;
+    const riseH = Math.max(0.004, bodyBot - railY);
+    kit.add(chamferBox(0.019, riseH, 0.030, 0.0014), S_RAIL, { pos: [0, railY + riseH * 0.5, zc + 0.004] });
+    kit.add(chamferBox(0.031, 0.0085, 0.034, 0.0012), S_RAIL, { pos: [0, railY + 0.0042, zc + 0.004] });
+    if (D >= 1) kit.add(chamferBox(0.0085, riseH * 0.62, 0.0105, 0.0010), S_RAIL, { pos: [0.0128, railY + riseH * 0.5, zc + 0.010] });
+
     return {
-      axisY, rearZ: zc + 0.020, frontZ: zc - 0.022, glassR: 0.0125,
-      eyeRelief: eyeReliefFor(0.0175, 'reflex'), flat: true,
+      axisY, rearZ, frontZ,
+      glassR: SIGHT_CLEAR * eyeRelief,
+      housingR: w + 0.0042, eyeRelief, flat: true,
     };
   }
 
-  // 30 mm tube red dot with an integral mount, sun hood and turret caps.
-  const axisY = railY + 0.021;
-  const zR = zc + 0.038, zF = zc - 0.040;
-  // Tube AND sun hood as one closed surface of revolution.
-  //
-  // The hood used to be a separate `tube()` butted onto the front of this one.
-  // Every version of that has a coincidence in it: end the hood where the tube
-  // ends and the two annular caps are coplanar; sleeve it over instead and the
-  // two cylinder walls run parallel a fraction of a millimetre apart. Either
-  // way the surfaces z-fight, and because this is the largest curved thing in
-  // the ADS frame and it is viewed almost down its own axis, the fight lands on
-  // the bell rim as a stippled, eaten-away edge — which is what it was doing.
-  //
-  // A single profile cannot fight itself. The section now runs: outer wall
-  // forward, flare out to the hood, along the hood, back down its front lip,
-  // rearward along the hood's inside face, step in to the objective, and home
-  // down the bore. Same silhouette, one part, no coincident faces anywhere.
-  kit.add(lathe([
-    [0.0190, zR], [0.0190, zR - 0.006], [0.0168, zR - 0.010],
-    [0.0168, zc + 0.014], [0.0182, zc + 0.010], [0.0182, zc - 0.012],
-    [0.0168, zc - 0.016], [0.0168, zF + 0.014], [0.0192, zF + 0.008],
-    [0.0198, zF],                 // flare into the hood
-    [0.0198, zF - 0.013],         // hood outer wall
-    [0.0178, zF - 0.013],         // hood front lip
-    [0.0178, zF],                 // hood inside face, back to the objective
-    [0.0152, zF],                 // step in to the bore
-    [0.0152, zR], [0.0190, zR],
-  ], seg), S_RAIL, { pos: [0, axisY, 0] });
-  kit.add(chamferBox(0.020, 0.024, 0.048, 0.0014), S_RAIL, { pos: [0, axisY - 0.021, zc] });
-  kit.add(chamferBox(0.030, 0.008, 0.030, 0.0012), S_RAIL, { pos: [0, axisY - 0.032, zc] });
-  kit.add(cyl(0.0080, 0.0064, 0.011, sgS), S_RAIL, { pos: [0.013, axisY - 0.026, zc], rot: [0, -Math.PI / 2, 0] });
-  kit.add(cyl(0.0085, 0.0072, 0.012, sgS), S_RAIL, { pos: [0, axisY + 0.015, zc + 0.002], rot: [-Math.PI / 2, 0, 0] });
-  kit.add(cyl(0.0075, 0.0064, 0.010, sgS), S_RAIL, { pos: [0.015, axisY, zc + 0.002], rot: [0, -Math.PI / 2, 0] });
+  // ----------------------------------------------------------- 30 mm red dot
+  const zR = zc + 0.038, zF = zc - 0.040, zH = zF - 0.014;
+  const rearZ = zR - 0.004, frontZ = zF + 0.004;
+  const eyeRelief = eyeReliefFor(0.0198, 'reddot');
+  const zEye = rearZ + eyeRelief;
+  const cone = (z) => SIGHT_CLEAR * (zEye - z);
+  // Ocular bell: see the note on the scope's. Six millimetres of flare is
+  // enough on a 30 mm tube, because the clear cone already fills 74% of it.
+  const bore = (z) => Math.max(cone(z), 0.0165 - (zR - z) * 0.35);
+
+  /* Tube, turret saddle and sun hood as ONE closed surface of revolution.
+   *
+   * Two rules hold this shape together. The first is the old one and it still
+   * applies: a single profile cannot z-fight itself, and every version that
+   * butted a separate hood onto the front either made two annular caps coplanar
+   * or ran two walls a fraction of a millimetre apart — which, on the largest
+   * curved thing in the ADS frame viewed almost down its own axis, showed up as
+   * a stippled, eaten-away bell rim.
+   *
+   * The second is new: the OUTSIDE is derived from the inside, not the other way
+   * round. Each station's wall thickness is added to the clear cone at that z,
+   * so the housing widens toward the objective exactly as fast as the sight
+   * picture does. The ocular rim is the one exception — it is pinned at the
+   * authored 19 mm because `eyeReliefFor` sizes the whole ADS frame against it,
+   * and it is the nearest ring on the optic, so it is what sets the apparent
+   * size. The bell is now wider in metres and still smaller on screen. */
+  const rOc = 0.0190;
+  const rBody0 = cone(zc + 0.014) + 0.0024;
+  const rSad = cone(zc) + 0.0034;
+  const rBody1 = cone(zc - 0.016) + 0.0024;
+  const rObj = cone(zF) + 0.0030;
+  const rHood = cone(zH) + 0.0030;
+  const axisY = solveOpticAxis(railY, zEye, rSad, skyline);
+
+  kit.add(boredTube([
+    [rOc, zR], [rOc, zR - 0.006], [rBody0, zR - 0.011],
+    [rBody0, zc + 0.014], [rSad, zc + 0.010], [rSad, zc - 0.012],
+    [rBody1, zc - 0.016], [rBody1, zF + 0.016], [rObj, zF + 0.008],
+    [rHood, zF], [rHood, zH],
+  ], bore, seg, BORE_SLACK), S_RAIL, { pos: [0, axisY, 0] });
+
+  // Riser mount. The tube now sits high enough that the mount is a real part
+  // rather than a 2 mm shim — a column, a clamp foot on the rail, a cross bolt
+  // and a QD throw lever, all of which the old flush mount had no room for.
+  const mountTop = axisY - rSad + 0.0014;
+  const mountH = Math.max(0.004, mountTop - railY);
+  kit.add(chamferBox(0.0205, mountH, 0.046, 0.0016), S_RAIL, { pos: [0, railY + mountH * 0.5, zc] });
+  kit.add(chamferBox(0.032, 0.0090, 0.036, 0.0012), S_RAIL, { pos: [0, railY + 0.0045, zc] });
   if (D >= 1) {
-    kit.addParts(knurl(D >= 2 ? 18 : 12, 0.0086, 0.010), S_RAIL, { pos: [0, axisY + 0.020, zc + 0.002], rot: [-Math.PI / 2, 0, 0] });
+    kit.add(chamferBox(0.0090, mountH * 0.66, 0.0115, 0.0010), S_RAIL, { pos: [0.0135, railY + mountH * 0.52, zc + 0.013] });
+    kit.add(cyl(0.0052, 0.0052, 0.0115, sgT), S_RAIL, { pos: [0.0100, railY + 0.0060, zc - 0.012], rot: [0, Math.PI / 2, 0] });
+    kit.mirrored((k) => k.add(panelLine(0.040, { width: 0.0012, depth: 0.0010 }), S_RAIL, { pos: [0.0104, railY + mountH * 0.70, zc] }));
+  }
+
+  // Turret caps and the battery compartment, each standing on the saddle rather
+  // than sunk into it — the old ones were placed at a fixed 15 mm and ended up
+  // inside the tube once the tube grew.
+  kit.add(cyl(0.0086, 0.0072, 0.0125, sgS), S_RAIL, { pos: [0, axisY + rSad - 0.0012, zc + 0.002], rot: [-Math.PI / 2, 0, 0] });
+  kit.add(cyl(0.0078, 0.0066, 0.0110, sgS), S_RAIL, { pos: [rSad - 0.0012, axisY, zc + 0.002], rot: [0, Math.PI / 2, 0] });
+  kit.add(cyl(0.0092, 0.0080, 0.0095, sgS), S_RAIL, { pos: [-rSad + 0.0012, axisY - 0.0010, zc + 0.002], rot: [0, -Math.PI / 2, 0] });
+  if (D >= 1) {
+    kit.addParts(knurl(D >= 2 ? 18 : 12, 0.0074, 0.0105), S_RAIL, { pos: [0, axisY + rSad + 0.0040, zc + 0.002], rot: [-Math.PI / 2, 0, 0] });
+    kit.addParts(knurl(D >= 2 ? 16 : 10, 0.0082, 0.0080), S_RAIL, { pos: [-rSad - 0.0055, axisY - 0.0010, zc + 0.002], rot: [0, -Math.PI / 2, 0] });
+    // Brightness rocker on the left of the saddle.
+    kit.add(chamferBox(0.0030, 0.0140, 0.0165, 0.0006), S_RAIL, { pos: [-rSad + 0.0006, axisY + 0.0060, zc - 0.020] });
   }
   return {
-    axisY, rearZ: zR - 0.004, frontZ: zF + 0.004, glassR: 0.0148,
-    eyeRelief: eyeReliefFor(0.0198, 'reddot'),
+    axisY, rearZ, frontZ,
+    glassR: SIGHT_CLEAR * eyeRelief,
+    frontGlassR: SIGHT_CLEAR * (zEye - frontZ),
+    housingR: rOc, eyeRelief,
   };
 }
 
@@ -970,7 +1251,8 @@ export function buildWeapon(def, mats) {
   const up = upperReceiver(kit, M, D);
   const low = lowerReceiver(kit, M, D);
   const hg = handguard(kit, M, D, up.front + 0.004);
-  const bar = barrelAssembly(kit, M, D, hg);
+  // An optic on the rail owns the sight line, so the irons fold flat.
+  const bar = barrelAssembly(kit, M, D, hg, !!def.optic);
   const gripAnchor = new THREE.Vector3(0, low.topY - 0.010, low.zc + 0.070);
   const grip = pistolGrip(kit, M, D, gripAnchor);
   stockAssembly(kit, M, D, up.back);
@@ -988,7 +1270,17 @@ export function buildWeapon(def, mats) {
   }
 
   const railY = up.deckY + 0.005 + 0.0032 + 0.0044;
-  const optic = opticAssembly(kit, M, D, def.optic, railY, 0.018);
+  // Everything downrange that could stand up into the sight cone. The optic
+  // solves its own mount height against this instead of taking a constant —
+  // see `solveOpticAxis`. `hg.railTopY` is the dominant term on every weapon:
+  // a handguard rail is only a few millimetres below the receiver's, and it
+  // runs a quarter of a metre closer to the muzzle, where the cone has dropped.
+  const skyline = [
+    { y: hg.railTopY, z: hg.railFrontZ },
+    { y: hg.railTopY, z: hg.z1 },
+    ...bar.skyline,
+  ];
+  const optic = opticAssembly(kit, M, D, def.optic, railY, 0.018, skyline);
 
   const bodyGeo = kit.build();
   const body = new THREE.Mesh(bodyGeo, mats);
@@ -1061,9 +1353,32 @@ export function buildWeapon(def, mats) {
   cover.position.set(M.receiverW * 0.5 - 0.0012, 0.006 - up.portH * 0.5, up.portZ);
   track('cover', cover, 'rotation');
 
-  const trig = new THREE.Mesh(chamferBox(0.006, 0.020, 0.006, 0.0008), mats[S_RECV]);
+  // A curved trigger bow. The flat plate this replaces sat in the one place on
+  // the weapon the eye is trained to look at and had no shape at all.
+  const trigKit = new Kit();
+  {
+    // Origin is the trigger pin, because that is what the Animator rotates
+    // about; the blade hangs below it and bows forward toward the finger.
+    const steps = D >= 1 ? 7 : 3;
+    const bow = [];
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps;
+      bow.push({ z: 0.0035 + t * 0.019, dy: -Math.sin(t * 1.9) * 0.0034, scale: 1 - t * 0.14 });
+    }
+    const blade = loft(octagon(0.0062, 0.0044, 0.0009), bow);
+    blade.rotateX(Math.PI / 2);          // sweep +Z downward, bow toward -Z
+    trigKit.add(blade, 0);
+    trigKit.add(chamferBox(0.0060, 0.0080, 0.0062, 0.0010), 0, { pos: [0, -0.0010, 0] });   // shoe
+    if (D >= 1) {
+      for (let i = 0; i < 4; i++) {      // serrations on the face
+        trigKit.add(chamferBox(0.0058, 0.0013, 0.0013, 0.0003), 0,
+          { pos: [0, -0.0130 - i * 0.0032, -0.0030 - i * 0.0004] });
+      }
+    }
+  }
+  const trig = new THREE.Mesh(trigKit.build(), mats[S_RECV]);
   trig.name = 'trigger';
-  trig.position.set(0, low.topY - 0.022, low.zc + 0.050);
+  trig.position.set(0, low.topY - 0.014, low.zc + 0.050);
   trig.rotation.x = 0.25;
   track('trigger', trig, 'rotation');
 
@@ -1088,20 +1403,33 @@ export function buildWeapon(def, mats) {
 
   /* --- optics ------------------------------------------------------------ */
   const sightGroup = new THREE.Group();
+  sightGroup.name = 'sight';
   sightGroup.position.set(0, optic.axisY, optic.rearZ);
   root.add(sightGroup);
 
   // The lens edge is the same circle as the bell it sits in; if the disc is
   // coarser than the housing the glass reads as a polygon inside a tube.
+  //
+  // The two discs are NOT the same size any more, and that is the point. The
+  // bore is a cone now, so the objective is a bigger circle than the ocular —
+  // a shared radius meant either an objective that stopped the sight cone down
+  // (a black ring inside the bell) or an ocular disc overhanging its own rim.
   const glassGeo = new THREE.CircleGeometry(optic.glassR, seg('optic', D) + 4);
   const rearGlass = new THREE.Mesh(glassGeo, mats[S_GLASS]);
+  // Named, because "is anything but glass in the aperture?" is a question the
+  // sight-line probe answers by NAME (tools/sightline-probe.mjs). An unnamed
+  // mesh on the optical axis makes the answer a guess from its distance.
+  rearGlass.name = 'lensRear';
   rearGlass.rotation.x = optic.flat ? -0.16 : 0;    // reflex lenses are canted
   rearGlass.renderOrder = 4;
   rearGlass.frustumCulled = false;
   sightGroup.add(rearGlass);
 
+  let frontGeo = null;
   if (!optic.flat) {
-    const frontGlass = new THREE.Mesh(glassGeo, mats[S_GLASS]);
+    frontGeo = new THREE.CircleGeometry(optic.frontGlassR ?? optic.glassR, seg('optic', D) + 4);
+    const frontGlass = new THREE.Mesh(frontGeo, mats[S_GLASS]);
+    frontGlass.name = 'lensFront';
     frontGlass.position.z = optic.frontZ - optic.rearZ;
     frontGlass.renderOrder = 3;
     frontGlass.frustumCulled = false;
@@ -1158,6 +1486,16 @@ export function buildWeapon(def, mats) {
     root, body, parts, muzzle, ejectPort, reticle,
     sight: {
       group: sightGroup, glassR: optic.glassR, eyeRelief: optic.eyeRelief, flat: !!optic.flat,
+      /**
+       * Housing radius, and the reference the EYEBOX is measured in — see
+       * `collimate`. It has to be separate from `glassR` now that the clear
+       * aperture is solved from the sight cone rather than authored: the
+       * scope's lens went from 13.2 mm to 10.9 mm when its bore became a real
+       * cone, and an eyebox pegged to the lens would have silently tightened by
+       * the same 17% and put the reticle back inside the window where the last
+       * pass proved it was being switched off mid-transition.
+       */
+      eyeboxR: optic.housingR,
       scoped: def.optic === 'scope',
       // Angular radius of the reticle quad, in radians (see RETICLE_ANGLE).
       reticleAngle: RETICLE_ANGLE[def.optic] ?? RETICLE_ANGLE.reddot,
@@ -1168,6 +1506,7 @@ export function buildWeapon(def, mats) {
       bodyGeo.dispose();
       for (const k of Object.keys(parts)) parts[k]?.geometry?.dispose?.();
       glassGeo.dispose();
+      frontGeo?.dispose();
       reticle.geometry.dispose();
       reticle.userData.disposeTexture?.dispose();
       reticle.material.dispose();
@@ -1433,9 +1772,12 @@ export function collimate(build, cam, adsBlend = 0, scope = null) {
   // spring still short of settled — so every ADS frame ever captured was taken
   // inside the band the old curve had already faded to nothing, or nearly.
   // A dot that is correct at blend 1.0 and invisible at 0.85 is a dot nobody
-  // ever sees. 1.4-3.8 keeps it solidly lit from about 0.8 blend on, and still
-  // has it correctly absent at the hip, where the axis misses by 18 apertures.
-  const fade = 1 - THREE.MathUtils.smoothstep(off, R * 1.4, R * 3.8);
+  // ever sees. The window is stated in HOUSING radii (`eyeboxR`) rather than
+  // lens radii, so it is the same absolute 21-56 mm band it was measured at
+  // even though the clear aperture is now solved rather than authored; at the
+  // hip the axis still misses by 15-plus housings and the dot is correctly gone.
+  const H = build.sight.eyeboxR || R;
+  const fade = 1 - THREE.MathUtils.smoothstep(off, H * 1.05, H * 2.85);
   const scale = t * (build.sight.reticleAngle || 5.8e-4);
 
   ret.position.copy(P);

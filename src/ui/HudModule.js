@@ -8,6 +8,7 @@ import { VitalsPanel, AmmoPanel, MatchBar, Callouts, ObjectiveStrip, RespawnOver
 import { Scoreboard } from './Scoreboard.js';
 import { Menus } from './Menus.js';
 import { LoadingScreen } from './LoadingScreen.js';
+import { TouchControls } from './TouchControls.js';
 import { Config } from '../core/Config.js';
 
 /**
@@ -138,6 +139,15 @@ export class HudModule {
     const level = engine.get('level');
     const collision = engine.get('collision');
     this.map.build(collision?.collider || level?.collider, level?.bounds);
+
+    // Touch controls build themselves only on a coarse-pointer, no-hover
+    // device (or with ?touch=1), so desktop is untouched. They feed the same
+    // InputMap the mouse and gamepad use rather than a parallel path.
+    this.touch = new TouchControls(this.root, engine);
+    if (this.touch.enabled) {
+      engine.get('player')?.input?.attachTouch?.(this.touch);
+      document.body.classList.add('is-touch');
+    }
 
     this._bind(engine);
     this.crosshair.resize(engine.width, engine.height);

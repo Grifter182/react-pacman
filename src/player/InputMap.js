@@ -212,6 +212,10 @@ export class InputMap {
     const ky = (this.down('forward') ? 1 : 0) - (this.down('back') ? 1 : 0);
 
     let mx = kx, my = ky;
+    // Touch stick outranks the keyboard but yields to a real gamepad, and only
+    // while the thumb is actually deflecting it.
+    const t = this.touch?.axes?.();
+    if (t && (Math.abs(t.x) + Math.abs(t.y) > 0)) { mx = t.x; my = -t.y; }
     if (this.pad) {
       const ax = deadzone(this._padAxes[0], this.settings.padDeadzone);
       const ay = deadzone(this._padAxes[1], this.settings.padDeadzone);
@@ -223,6 +227,20 @@ export class InputMap {
     if (len > 1) { mx /= len; my /= len; }
     this.moveX = mx; this.moveY = my;
   }
+
+  /**
+   * Feed a relative look delta in raw pointer units. Touch drag and any future
+   * device go through here rather than through their own sensitivity path, so
+   * they inherit sensitivity, the ADS scale and the optic zoom scale from
+   * `drainLook` exactly as the mouse does.
+   */
+  addLook(dx, dy) {
+    this.lookDx += dx || 0;
+    this.lookDy += dy || 0;
+  }
+
+  /** A touch stick, if one is attached. Set by the HUD on touch devices. */
+  attachTouch(source) { this.touch = source; }
 
   endFrame() {
     this._edge.clear();
