@@ -40,13 +40,24 @@ import { VIEWMODEL_MAGNIFY } from './Gunsmith.js';
  * `HAND_R` for the measurement, and `SUPPORT_ROLL` for why no amount of rolling
  * the old wrap could have saved it.
  *
- * CURRENT MEASUREMENTS, geometry only, on all three weapons at full ADS
- * (`tools/sightline-probe.mjs` for the sight picture; the same disc sampled in
- * metres at the front element, plus a three-mesh-bvh signed distance from every
- * glove vertex to the merged body, for the rest):
+ * CURRENT MEASUREMENTS. The sight picture is `tools/sightline-probe.mjs` at full
+ * ADS through the real animator — the only number anyone may quote for it — and
+ * it now reads, on both the rifle and the SMG:
  *
- *   sight picture blocked            0.0%   (was 25.2% rifle / 14.0 / 21.5)
- *   worst clock position             0%     (was 82% at 6 o'clock)
+ *   BLOCKED 0%, bands centre->rim 0/0/0/0, no clock position obstructed,
+ *   no blockers listed at all, fan 0/37 rays, axis clear.
+ *   (Was: rifle 25.2% blocked, bands 0/6/31/33, 82% at 6 o'clock, all of it
+ *   `leftHand/fingers`; SMG 14.0%; DMR 21.5%.)
+ *
+ * Note the disc it passes on is BIGGER than the disc it used to fail on — the
+ * front element went from 18.5 mm to 21.3 mm and the picture from 13.7% to 19.2%
+ * of frame height while this was being fixed. That was the ordering risk, and it
+ * is why the hand was taken out of the bore line entirely instead of tuned to
+ * miss the old radius.
+ *
+ * The rest is geometry, measured in node with a three-mesh-bvh signed distance
+ * from every glove vertex to the merged body, all three weapons:
+ *
  *   highest support vertex forward
  *     of the optic                   11-13 mm BELOW the bore line (was 58 above)
  *   support hand to body             0.0-0.2 mm nearest, worst -1.7 mm
@@ -166,15 +177,21 @@ const RY = (a) => new THREE.Matrix4().makeRotationY(a);
 /* --------------------------------------------------- measuring the weapon */
 
 /**
- * Median radial extent of the weapon body about an axis, over an axial band.
+ * Radial extent of the weapon body about an axis, over an axial band, at a
+ * chosen percentile.
  *
  * This is how the hands find out how thick the thing they are holding is. The
  * alternative — copying `hg.radius` or the grip's profile constants out of
  * Gunsmith — makes the arms silently wrong the moment the gunsmith retunes a
- * part, and those constants are not exported anyway. A median (rather than a
- * max) is used because the band inevitably catches a rail tooth, a sling loop
- * or the edge of the magwell, and one outlier must not push the whole hand off
- * the weapon.
+ * part, and those constants are not exported anyway.
+ *
+ * `pct` is not a taste knob and the default is not the right answer everywhere.
+ * A percentile below the maximum exists because the band inevitably catches a
+ * rail tooth, a sling loop or the edge of the magwell, and one outlier must not
+ * push the whole hand off the weapon. But a LOW percentile is the radius of the
+ * part's narrow places, and fingers solved against that close inside its wide
+ * ones — see the 0.95 at the pistol grip and the 576 vertices of glove that were
+ * inside the lower receiver at the median.
  */
 function graspRadius(geo, origin, axis, t0, t1, rMax, fallback, pct = 0.6) {
   const pos = geo?.attributes?.position;
@@ -509,7 +526,7 @@ function buildHand(mats, opts, D) {
     const sL = zM - zH + 0.014;
     for (const sx of [-1, 1]) {
       kit.add(chamferBox(0.0024, 0.0026, sL, 0.0007), GLOVE, {
-        m: T(sx * palmW * 0.485, 0, (zH + zM) * 0.5 + 0.002),
+        m: T(sx * palmW * 0.465, 0, (zH + zM) * 0.5 + 0.002),
       });
     }
     kit.add(chamferBox(palmW * 0.84, 0.0024, 0.0026, 0.0007), GLOVE, {
@@ -754,13 +771,10 @@ export function buildArms(weapon, mats) {
   root.add(right);
 
   /* --- support hand ---------------------------------------------------- */
-  // The channel axis is the bore, and it is placed by the one thing that has to
-  // be true: the palm's contact face lies on the handguard's UNDERSIDE. So the
-  // underside is measured and the axis put exactly one grasp radius above it,
-  // rather than the anchor being lifted by a fudged fraction of the shell's
-  // height. Sideways the axis leans a little right of centre, which pushes the
-  // climbing fingers clear of the shell's lower-right corner without lifting the
-  // palm off the flat.
+  // The channel axis is the bore, ON the measured underside — see `HAND_R`. The
+  // old code lifted the published anchor by 34% of a measured shell height to get
+  // it onto the handguard's own axis, so the hand could encircle the handguard;
+  // that is the thing that was standing in the sight.
   const station = supportStation(body, A.leftHand, 0.012);
   const rHand = HAND_R + GLOVE_T;
   const hgAxis = new THREE.Vector3(0, station.under, station.z);
@@ -769,13 +783,15 @@ export function buildArms(weapon, mats) {
   const left = new THREE.Group();
   left.name = 'leftArm';
   left.frustumCulled = false;
-  // See the note above `SUPPORT_ARC`. The buffer is a left hand already, so this
-  // one is NOT mirrored; the axis points down the bore so the thumb (which sits
-  // at the buffer's +X) runs forward and the index finger is the forwardmost of
-  // the four. The roll then only has to lay the palm flat on the underside:
-  // `seat` puts the contact patch 90 degrees clockwise of the finger direction
-  // on an unmirrored hand, so a roll near zero means fingers across the bore and
-  // palm straight down.
+  // See the note above `SUPPORT_ROLL`. The buffer is a left hand already, so this
+  // one is NOT mirrored — it used to be, which made the support hand a right hand
+  // on a left arm and forced the wrap over the top of the handguard. The axis
+  // points DOWN the bore rather than back out of the stock, which is what keeps
+  // the thumb (at the buffer's +X) running forward and the index finger the
+  // forwardmost of the four now that the mirror is gone. The roll is then just
+  // the tilt of the fist: `seat` puts the contact patch 90 degrees anticlockwise
+  // of the finger direction on an unmirrored hand, so a small positive roll means
+  // fingers across the bore and the palm a few degrees off straight down.
   const lPose = seat(new THREE.Vector3(0, 0, -1), new THREE.Vector3(1, 0, 0), SUPPORT_ROLL, hgSolve);
   const lh = buildHand(mats, {
     radius: rHand, fingerY: 0.0072,
