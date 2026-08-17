@@ -168,27 +168,44 @@ export const Config = {
    * the two, and the automatic behaviour if the files are ever missing.
    */
   assets: {
-    useAuthored: false,   // BISECT: temporarily off
+    /**
+     * OFF BY DEFAULT — the probe path stops the ground rendering.
+     *
+     * BISECTED, not guessed: with `useAuthored: false` the street renders
+     * correctly (shots/bisect); with it true the ground is a flat untextured
+     * slab (shots/assets2..6). Everything else was held constant, including
+     * `levelTextures: false`, so the fault is in the environment probe alone.
+     *
+     * What the evidence rules OUT:
+     *  - The level texture swap. The regression survives with it disabled.
+     *  - Shadowing by the market awnings under the probe's higher sun
+     *    (54.7deg against the analytic 14.5deg). An OPEN area with nothing
+     *    overhead is equally affected, and shadowed ground would still show
+     *    surface detail; this shows none.
+     *  - Ambient over-brightness. Matching the probe's cosine-weighted
+     *    irradiance to the analytic model's dimmed the frame without
+     *    restoring the ground.
+     *  - Metalness/roughness on the swapped materials: rock063's packed metal
+     *    channel measures mean 1.5/255, nowhere near a mirror.
+     *
+     * What is still unexplained: sampling the HDR buffer dead-centre while
+     * looking straight down returns the same value with the ground shown and
+     * hidden, which says those meshes contribute nothing to the frame even
+     * though they exist, are visible, and carry valid geometry.
+     *
+     * Next thing to check: what changes for a ground mesh when
+     * `scene.background` becomes an EquirectangularReflectionMapping texture
+     * rather than a CubeTexture, and whether the ground's shader program is
+     * being rebuilt (and failing silently) on that switch.
+     */
+    useAuthored: false,
     environment: 'daysky',
     environmentIntensity: 1.0,
     /**
-     * KNOWN BROKEN — off until fixed.
-     *
-     * Swapping level surfaces to the authored sets makes the street stop
-     * rendering. Established so far: the meshes exist, are visible, carry
-     * 3.4k triangles with valid UVs and normals, and the textures load; the
-     * collision proxy is present (a ray down hits it at 1.65 m); and sampling
-     * the HDR buffer dead-centre while looking straight down gives EXACTLY
-     * the same value with the ground shown and hidden, so those meshes are
-     * contributing nothing to the frame. Neither the shared-texture dispose
-     * nor the surface-shader metalness theory explained it.
-     *
-     * The remaining suspect is the Batcher path: buckets default to
-     * `weather: true`, which emits an `aWeather` attribute and applies the
-     * Weathering injection to whatever material the bucket holds, and that
-     * machinery was written against the procedural surface shader.
-     *
-     * The environment probe is independent of this and stays on.
+     * Swap level surfaces to the authored sets. Gated separately from the
+     * probe so the two can be tested independently — which is how the probe
+     * was identified as the sole cause of the ground regression. Untested in
+     * isolation, because the probe fault masked it.
      */
     levelTextures: false,
     /** Metres of world per texture tile, per surface class. */
