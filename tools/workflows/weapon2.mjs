@@ -43,18 +43,17 @@ FACTS ALREADY ESTABLISHED — do not re-derive, do not "fix" again:
 - THE OPTIC ITSELF IS CLEAR. The axial ray hits nothing but the reticle and
   lens glass on every weapon. Do not go looking for a capped tube, a solid lens
   disc or a bridging mount — that theory is dead, it was measured.
-- THE RETICLE IS ON THE AXIS. Measured: 1.0 px off the optic axis on the rifle,
-  3.7 px on the SMG. An earlier review claimed a 23.5 px offset; that claim is
-  FALSE at this build. Do not "fix" the reticle mount on the rifle — you will
-  break a 1-pixel alignment. The SMG's 3.7 px is worth closing, gently.
-- THE THING BLOCKING THE SIGHT IS THE SUPPORT HAND. Measured, and it is the
-  same on every weapon: 19.7% of the rifle's sight picture and 15.0% of the
-  SMG's is 'leftHand/fingers', concentrated at 5, 6, 7 and 8 o'clock — the
-  lower-left of the sight picture — entirely in the outer two radial bands
-  (centre bands 0% and 0%, outer bands 20% and 31%). The hit distances are
-  0.45-0.51 m on the rifle while the front lens is at 0.31 m, so the fingers are
-  IN FRONT OF the optic, standing up through the line of sight. This is the
-  player's "you can't actually aim at anything" and it belongs to Arms.js.
+- THE RETICLE IS ON THE AXIS. Measured: 0.8 px off the optic axis on the rifle.
+  An earlier review claimed a 23.5 px offset; that claim is FALSE at this build.
+  Do not "fix" the reticle mount — you will break a sub-pixel alignment. Check
+  sightline.json for the other weapons before touching any of them.
+- THE THING BLOCKING THE SIGHT IS THE SUPPORT HAND. Measured on the rifle:
+  25.2% of the sight picture is 'leftHand/fingers', concentrated at 5, 6, 7 and
+  8 o'clock — the lower-left — with radial bands centre-to-rim of 0%, 6%, 31%,
+  33%. It is the rim, not the middle. Hit distances are 0.45-0.51 m while the
+  front lens sits at 0.31 m, so the fingers are IN FRONT OF the optic, standing
+  up through the line of sight. This is the player's "you can't actually aim at
+  anything" and it belongs to Arms.js.
 - The front sight post and ears already fold away when an optic is fitted
   (Gunsmith.js barrelAssembly, opticFitted flag).
 - The optic glass passes ~81% of light (two discs at 0.10 opacity).
@@ -73,6 +72,17 @@ HARD RULES
   probe that waits on simulation, give it seconds, not milliseconds, and report
   the frame count it actually got — a 700ms wait spans less than one step and
   makes correct code look dead.
+- YOUR PROBE MEASURES A TREE TWO OTHER AGENTS ARE EDITING. Anything you boot
+  starts a dev server against the shared working copy, so a number that makes no
+  sense may be someone else's half-saved file rather than your bug. Re-run once
+  before believing a surprise, say in your report which numbers you measured
+  under those conditions, and treat the Verify phase — which runs after all
+  three of you have finished — as the authoritative reading. Do not chase a
+  discrepancy in a file you do not own.
+- Only ONE other agent is also running the sight probe. If a boot takes several
+  minutes longer than you expect, that is CPU contention on a 4-core box, not a
+  hang. Wait it out rather than killing and retrying, which only doubles the
+  load — orphaned capture processes have wedged this box before.
 
 Report compactly: what you changed, what you PROVED versus assumed, the build
 status, and anything another agent's files must change to match.
@@ -88,11 +98,12 @@ NOTE WHAT IS *NOT* YOURS: the sight picture is blocked by the support hand's
 fingers, not by your geometry, and the reticle is already on the axis. Both are
 measured. Do not chase either one.
 
-1. THE SIGHT PICTURE IS TOO SMALL TO AIM THROUGH. Measured: the rifle's is
-   47.6 px in radius — 10.6% of the frame height — and the SMG's is 61.7 px,
-   13.7%. That is a 95-pixel hole to identify a target in, at 1600x900, and it
-   is the second half of "you can't actually aim at anything": even with the
-   fingers gone, there is very little picture there. It is governed by
+1. THE SIGHT PICTURE IS TOO SMALL TO AIM THROUGH. Read the exact figures per
+   weapon out of sightline.json (\`discRadiusPx\`, \`discDiameterPct\`); on the
+   rifle it is a 0.01848 m rim measured off the front lens mesh, and around a
+   sixth of the frame height. That is a small hole to identify a target in at
+   1600x900, and it is the second half of "you can't actually aim at anything":
+   even with the fingers gone, there is not much picture there. It is governed by
    SIGHT_CLEAR (0.060 rad, line ~996) times the eye relief, so it is a design
    constant you own, not an accident. A shipped console optic gives noticeably
    more. Widen the usable picture — via SIGHT_CLEAR, the eye relief, the optic's
@@ -102,13 +113,15 @@ measured. Do not chase either one.
    Acceptance: discDiameterPct at or above 18 on every weapon, with the axial
    ray still clear.
 
-2. THE SMG HAS NO FRONT LENS. The probe reports 'no lensFront mesh found' for
-   the SMG, and its axial ray hits lensRear but never a front element — so that
-   optic is a tube with glass at one end. Give it a front element like the
-   rifle's, and publish \`frontGlassR\` on the sight object for every weapon that
-   has one. Right now only some weapons export it, which is a measurement trap:
-   anything reading \`sight.frontGlassR\` silently falls back to the rear radius
-   and measures the wrong plane.
+2. NOT EVERY OPTIC HAS A FRONT LENS. On the previous run the probe reported 'no
+   lensFront mesh found' for the SMG, whose axial ray hit lensRear but never a
+   front element — that optic is a tube with glass at one end only. Check
+   \`rimPlane\` per weapon in sightline.json, give every optic a front element
+   like the rifle's, and publish \`frontGlassR\` on the sight object wherever one
+   exists. Right now only some weapons export it (the rifle's is null), which is
+   a measurement trap: anything reading \`sight.frontGlassR\` silently falls back
+   to the rear radius and measures the wrong plane. That exact bug cost three
+   rounds of wrong conclusions about this weapon.
 
 3. THE RAIL IS THE WRONG COLOUR. Gunsmith.js line ~234 sets the rail material
    to \`new THREE.Color(0.62, 0.63, 0.66)\` at roughness 1.22 — a light neutral
@@ -151,11 +164,11 @@ YOU OWN THE MOST IMPORTANT DEFECT IN THE GAME. Read item 1 before anything else.
    complaint — "you can't actually aim at anything, nothing renders through the
    scope" — and it is measured, not guessed:
 
-     rifle: 19.7% of the sight picture is 'leftHand/fingers'
-     SMG:   15.0%
+     rifle: 25.2% of the sight picture is 'leftHand/fingers'
      concentrated at 5, 6, 7 and 8 o'clock (the lower-left of the picture)
-     radial bands centre->rim: 0%, 0%, 20%, 31%  — it is the rim, not the middle
-     hit distances 0.45-0.51 m on the rifle, while the front lens is at 0.31 m
+     radial bands centre->rim: 0%, 6%, 31%, 33%  — it is the rim, not the middle
+     hit distances 0.45-0.51 m, while the front lens sits at 0.31 m
+     (read shots/sightline/sightline.json for the SMG and DMR figures)
 
    So the fingers are FORWARD of the optic and standing UP into the line of
    sight, eating the lower-left third of the rim. The optic itself is clear —
@@ -317,10 +330,10 @@ every vertex on screen.
 Judge, specifically:
 1. THE SIGHT PICTURE. At ADS, can you see and identify a target through the
    optic? Pass/fail, and it outranks everything else. Two things were wrong
-   going in, both measured: the support hand's fingers ate 19.7% of it at 5-8
-   o'clock, and the whole picture was only 10.6% of the frame height. Judge both
-   — a clear but tiny aperture is still not something you can fight through.
-2. The reticle: is it where a shot would land? It measured 1 px off the optic
+   going in, both measured: the support hand's fingers ate 25.2% of it at 5-8
+   o'clock, and the whole picture was about a sixth of the frame height. Judge
+   both — a clear but tiny aperture is still not something you can fight through.
+2. The reticle: is it where a shot would land? It measured 0.8 px off the optic
    axis before this pass, so if it now looks off, that is a REGRESSION and you
    should say so loudly.
 3. Materials: does the receiver read as manufactured, phosphated steel — is
