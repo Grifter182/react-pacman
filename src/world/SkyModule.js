@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { Config } from '../core/Config.js';
 import { ATMO, atmosphereGLSL, sunDirectionArray, sunTransmittance, skyRadiance } from './Atmosphere.js';
+import { loadEnvironment, sunDirectionFromMeta } from '../materials/AssetLibrary.js';
 
 /**
  * OWNER: sky / atmosphere agent.
@@ -48,6 +49,32 @@ export class SkyModule {
   }
 
   async init(engine) {
+    // AUTHORED PROBE FIRST, IF THERE IS ONE.
+    //
+    // A measured HDRI beats the analytic sky for both background and IBL, but
+    // it cannot simply be dropped in: the shadow-casting sun has to point at
+    // the sun that is actually *in* the photograph, or the world is lit from
+    // one direction while the sky says another — which reads as fake
+    // instantly, and is the most common way this swap goes wrong.
+    //
+    // So the measured direction is adopted BEFORE the analytic bake runs. The
+    // analytic model still executes, because LightingModule derives its fog
+    // fit and ground-bounce irradiance from it, and those must agree with the
+    // sun everything else is using. The probe then replaces only the two
+    // things it is genuinely better at: the visible background and the PMREM.
+    this.probe = null;
+    if (Config.assets?.useAuthored !== false) {
+      try {
+        const { texture, meta } = await loadEnvironment(Config.assets?.environment ?? 'daysky');
+        this.probe = { texture, meta };
+        if (meta?.direction) this.sunDirection.copy(sunDirectionFromMeta(meta));
+      } catch (err) {
+        // A missing probe is not fatal — the analytic sky is a complete
+        // implementation, not a placeholder.
+        console.warn('[sky] authored probe unavailable, using analytic sky', err?.message || err);
+      }
+    }
+
     const T = sunTransmittance();
     const peak = Math.max(T[0], T[1], T[2], 1e-4);
     this.sunColor.setRGB(T[0] / peak, T[1] / peak, T[2] / peak, THREE.LinearSRGBColorSpace);
@@ -80,7 +107,18 @@ export class SkyModule {
     engine.scene.backgroundIntensity = 1.0;
 
     const pmrem = new THREE.PMREMGenerator(renderer);
-    const env = pmrem.fromCubemap(sky.texture);
+    let env;
+    if (this.probe) {
+      // The probe is the sky the player sees AND the light the world receives,
+      // exactly as the analytic bake was — same principle, better source.
+      env = pmrem.fromEquirectangular(this.probe.texture);
+      engine.scene.background = this.probe.texture;
+      engine.scene.backgroundIntensity = Config.assets?.environmentIntensity ?? 1.0;
+      this.usingProbe = true;
+    } else {
+      env = pmrem.fromCubemap(sky.texture);
+      this.usingProbe = false;
+    }
     this.envMap = env.texture;
     pmrem.dispose();
 
@@ -97,6 +135,35 @@ export class SkyModule {
     const up = this._hemisphereIrradianceUp();
     this.skyIrradianceUp = new THREE.Vector3(up[0], up[1], up[2]);
     engine.skyIrradianceUp = this.skyIrradianceUp;
+
+    // MATCH THE PROBE'S AMBIENT ENERGY TO THE ANALYTIC MODEL'S.
+    //
+    // An HDRI carries absolute radiometric values; the lighting rig is tuned
+    // in the renderer's own arbitrary units. Substituting one for the other
+    // unscaled multiplies the ambient term by whatever the ratio happens to
+    // be, and the failure is deceptive: surfaces facing straight up take the
+    // full hit and wash out to sky colour, while vertical faces — dominated by
+    // the directional sun — still look correct. The result reads as a broken
+    // material rather than a broken exposure, which is exactly how it was
+    // first misdiagnosed here.
+    //
+    // Both irradiances are cosine-weighted over the upper hemisphere, so their
+    // ratio is the scale that makes the photograph deliver the same ambient
+    // energy the rest of the rig already expects.
+    if (this.probe) {
+      const m = this.probe.meta?.irradianceUp;
+      if (Array.isArray(m) && m.length === 3) {
+        const probeE = (m[0] + m[1] + m[2]) / 3;
+        const modelE = (up[0] + up[1] + up[2]) / 3;
+        if (probeE > 1e-6 && modelE > 1e-6) {
+          const scale = (modelE / probeE) * (Config.assets?.environmentIntensity ?? 1.0);
+          engine.scene.environmentIntensity = scale;
+          engine.scene.backgroundIntensity = scale;
+          engine.viewmodelScene.environmentIntensity = scale;
+          this.probeScale = scale;
+        }
+      }
+    }
 
     for (const d of this._transient) d.dispose();
     this._transient.length = 0;

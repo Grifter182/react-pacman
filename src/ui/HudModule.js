@@ -228,6 +228,16 @@ export class HudModule {
     this.scoreboard.show(false);
     this.menus.showTitle();
     this.engine?.bus.emit('ui:pause', { paused: true });
+    // The title screen gets a slow crane shot over the map behind it. Only the
+    // title — the pause menu keeps the player's own view, because cutting away
+    // from where they were standing mid-match is disorienting.
+    this._setCinematic(true);
+  }
+
+  /** Drive the front-end camera. Safe if the rig is not built yet. */
+  _setCinematic(on) {
+    const rig = this.engine?.get('player')?.rig;
+    if (rig) rig.cinematic = !!on;
   }
 
   showPause() {
@@ -266,6 +276,7 @@ export class HudModule {
     this.menus.hide();
     this.hud.classList.remove('bl-off');
     this.engine?.bus.emit('ui:pause', { paused: false });
+    this._setCinematic(false);
   }
 
   /**

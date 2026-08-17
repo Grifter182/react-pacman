@@ -39,9 +39,15 @@ export class Menus {
 
     this.node = frag(`
       <div class="bl-menu">
+        <div class="bl-atmos">
+          <div class="motes"></div>
+          <div class="sweep"></div>
+          <div class="bar t"></div>
+          <div class="bar b"></div>
+        </div>
         <div class="bl-mwrap">
           <div class="bl-title">
-            <div class="eyebrow">TASK FORCE 141 · CLASSIFIED</div>
+            <div class="eyebrow"><i class="live"></i><span class="txt">TASK FORCE 141 · CLASSIFIED</span><span class="clk">--:--:--</span></div>
             <h1>OPERATION <em>BLACKOUT</em></h1>
             <div class="sub">SUQ AL-HADID · 06:40 LOCAL · TEAM DEATHMATCH</div>
             <div class="rule"></div>
@@ -50,6 +56,12 @@ export class Menus {
             <div class="bl-nav"></div>
             <div class="bl-pane bl-panel"></div>
           </div>
+          <div class="bl-credit">
+            <span class="by">CREATED BY</span>
+            <strong>DARRYN ROOZA</strong>
+            <i></i>
+            <span class="studio">CLOCK IT GAMES</span>
+          </div>
         </div>
       </div>`);
     parent.appendChild(this.node);
@@ -57,7 +69,8 @@ export class Menus {
     this.$title = this.node.querySelector('.bl-title');
     this.$h1 = this.node.querySelector('.bl-title h1');
     this.$sub = this.node.querySelector('.bl-title .sub');
-    this.$eyebrow = this.node.querySelector('.eyebrow');
+    this.$eyebrow = this.node.querySelector('.eyebrow .txt');
+    this.$clock = this.node.querySelector('.eyebrow .clk');
     this.$nav = this.node.querySelector('.bl-nav');
     this.$pane = this.node.querySelector('.bl-pane');
 
@@ -167,8 +180,26 @@ export class Menus {
     this._open();
   }
 
-  hide() { this.screen = null; this.node.classList.remove('on'); }
-  _open() { this.node.classList.add('on'); }
+  hide() {
+    this.screen = null;
+    this.node.classList.remove('on');
+    if (this._clockTimer) { clearInterval(this._clockTimer); this._clockTimer = null; }
+  }
+
+  _open() {
+    this.node.classList.add('on');
+    // A running clock is the cheapest thing that makes a menu feel like a live
+    // feed rather than a still. It only ticks while the menu is up.
+    if (!this._clockTimer) {
+      const tick = () => {
+        const d = new Date();
+        const p = (n) => String(n).padStart(2, '0');
+        this.$clock.textContent = `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}Z`;
+      };
+      tick();
+      this._clockTimer = setInterval(tick, 1000);
+    }
+  }
   get open() { return this.screen !== null; }
 
   /* ---------------------------------------------------------------- panes */

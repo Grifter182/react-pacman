@@ -1,0 +1,18 @@
+{
+  "direction": [
+    -0.18339,
+    0.93493,
+    -0.30375
+  ],
+  "elevationDeg": 69.22,
+  "peakLuminance": 1.6,
+  "meanLuminance": 0.2276,
+  "irradianceUp": [
+    1.5252,
+    1.8588,
+    2.1357
+  ],
+  "sunPixels": 53,
+  "width": 1024,
+  "height": 512
+}

@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { makeMaterial } from '../materials/TextureFactory.js';
+import { loadTextureSet } from '../materials/AssetLibrary.js';
 import { Config, QualityTier } from '../core/Config.js';
 
 import { ProxySet, rng, fbm2, FACE_ALL, FACE_NY } from './kit/Geo.js';
@@ -136,6 +137,7 @@ export class LevelModule {
     this.detail = { [QualityTier.LOW]: 0, [QualityTier.MEDIUM]: 1, [QualityTier.HIGH]: 2, [QualityTier.ULTRA]: 3 }[tier] ?? 1;
 
     this._buildMaterials();
+    await this._applyAuthoredMaterials();
 
     this.batch = new Batcher(44);
     this.proxy = new ProxySet();
@@ -184,6 +186,96 @@ export class LevelModule {
    * variants deliberately reuse the *same* preset+seed so they share one baked
    * texture set and differ only by material colour — that is free variety.
    */
+  /**
+   * Upgrade selected surfaces from procedural bakes to authored photographic
+   * texture sets.
+   *
+   * REPLACES the material rather than mutating it, and that is load-bearing.
+   * The procedural materials carry an onBeforeCompile injection (SF_SURFACE /
+   * SF_DETAIL / SF_MACRO / SF_WORLD) that computes the surface response from
+   * the recipe's own packed uniforms. Assigning `roughnessMap`/`metalnessMap`
+   * onto one of those does nothing — the injected code never reads them —
+   * while the `roughness`/`metalness` SCALARS that must be 1.0 for a packed
+   * map to survive are taken at face value. The ground became a mirror
+   * reflecting the sky probe, which reads as a hole in the world.
+   *
+   * An authored photographic set does not want that injection anyway: the
+   * detail, macro-variation and triplanar passes exist to rescue a small
+   * procedural bake from looking repetitive, and a measured 1K set with real
+   * grain has none of those problems.
+   *
+   * Replacing is safe here specifically because this runs before the Batcher
+   * is constructed and before any geometry is built, so the catalogue is the
+   * only thing holding these references. It would NOT be safe later.
+   *
+   * Failure is non-fatal: without the files the procedural bake stands, which
+   * is a complete implementation in its own right.
+   */
+  async _applyAuthoredMaterials() {
+    if (Config.assets?.useAuthored === false) return;
+    if (Config.assets?.levelTextures !== true) return;   // see Config.assets.levelTextures
+    const M = this.materials;
+
+    // `sandFar` must be swapped alongside `sand`: they are the inner and outer
+    // rings of the same ground, and leaving one procedural puts a visible
+    // material seam across the map at 54 m.
+    const swaps = [
+      { set: 'rock063', targets: ['sand', 'sandFar', 'gravel'], normalScale: 1.0 },
+      { set: 'metal053c', targets: ['metal', 'corrugated', 'ironwork'], normalScale: 0.85 },
+    ];
+
+    try {
+      const aniso = this.engine?.maxAnisotropy ?? 8;
+      await Promise.all(swaps.map(async ({ set, targets, normalScale }) => {
+        const src = await loadTextureSet(set, { anisotropy: aniso });
+        for (const key of targets) {
+          const old = M[key];
+          if (!old) continue;
+
+          // Inherit the repeat the procedural map was using: those were chosen
+          // against each surface's real size in metres, so reusing them keeps
+          // texel density as authored rather than re-deriving it.
+          const rep = old.map?.repeat?.clone() ?? new THREE.Vector2(1, 1);
+          const map = src.map.clone();
+          const normalMap = src.normalMap.clone();
+          const ormMap = src.ormMap.clone();
+          for (const t of [map, normalMap, ormMap]) {
+            t.repeat.copy(rep);
+            t.needsUpdate = true;
+          }
+
+          const next = new THREE.MeshStandardMaterial({
+            name: `${key}:${set}`,
+            map,
+            normalMap,
+            aoMap: ormMap,
+            roughnessMap: ormMap,
+            metalnessMap: ormMap,
+            // Scalars multiply the maps, so both must be 1 for the packed
+            // channels to reach the shader unmodified.
+            roughness: 1.0,
+            metalness: 1.0,
+            normalScale: new THREE.Vector2(normalScale, normalScale),
+            envMapIntensity: old.envMapIntensity ?? 1.0,
+            side: old.side,
+            dithering: true,
+          });
+          // Keep whatever tint the recipe chose; it is what separates the
+          // variants of one surface from each other.
+          if (old.color) next.color.copy(old.color);
+          next.userData.authored = set;
+
+          // The outgoing textures are NOT disposed: the catalogue shares one
+          // baked set between tinted variants, so freeing them here pulls the
+          // texture out from under variants that were not swapped.
+          M[key] = next;
+        }
+      }));
+    } catch (err) {
+      console.warn('[level] authored textures unavailable, keeping procedural', err?.message || err);
+    }
+  }
+
   _buildMaterials() {
     const M = this.materials;
     const S = 512;

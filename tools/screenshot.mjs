@@ -46,6 +46,12 @@ const SHOT_SETS = {
     { name: '09-skyline', pos: [-30, 1.0, 30], yaw: 2.5, pitch: 0.12 },
     { name: '10-enemy-engage', pos: [0, 1.0, 12], yaw: Math.PI, pitch: -0.02, ads: true, fire: true },
   ],
+  // Front end only. Pair with `--extra "frontend=1"`, which forces the menus
+  // on under automation; they are suppressed by default so they cannot sit
+  // over every gameplay shot.
+  title: [
+    { name: '01-title', pos: [0, 1.0, 20], yaw: Math.PI, pitch: 0.0 },
+  ],
 };
 
 async function startServer() {
@@ -96,7 +102,11 @@ async function main() {
   // would mean every visual review judged an image with the top-tier effects
   // switched off. Reviews must see what the game is actually trying to render.
   const quality = arg('quality', 'high');
-  const target = `${server.url}${server.url.includes('?') ? '&' : '?'}quality=${quality}`;
+  // `--extra "frontend=1"` appends query params, which is the only way to
+  // reach screens the harness normally suppresses (the front end is hidden
+  // under automation so it cannot sit over every gameplay shot).
+  const extra = arg('extra', '');
+  const target = `${server.url}?quality=${quality}${extra ? `&${extra}` : ''}`;
   await page.goto(target, { waitUntil: 'load', timeout: 60000 });
 
   // Wait for the engine to present its first frame.
