@@ -286,14 +286,43 @@ export class CameraRig {
    * (1 = critical). Semi-implicit Euler is stable here for any frame time the
    * engine will hand us because the engine clamps dt to 250 ms.
    */
+  /**
+   * Integrate one axis of the camera spring.
+   *
+   * SUBSTEPPED, and that is not optional. Explicit Euler on a spring is only
+   * stable while dt < 2/omega, and it rings long before it diverges. At the
+   * omega values here (13.5 grounded, 16 airborne) the hard limit is ~125-148
+   * ms, but the camera already oscillates visibly around a *stationary* player
+   * by ~15 fps, and below ~10 fps it slams between the leash limits — a 0.7 m
+   * swing on every axis with the capsule provably motionless. Because only the
+   * camera moves, the symptom reads as the whole world shaking rather than as
+   * a camera bug, which is what makes it hard to place.
+   *
+   * A fixed 240 Hz substep puts omega*h at ~0.06 regardless of frame rate, so
+   * the result is identical whether the frame took 4 ms or 200 ms, and the
+   * existing tuning — which was chosen at 60 fps — is preserved exactly. The
+   * cost is trivial: four iterations per axis at 60 fps.
+   */
   _springAxis(axis, target, f, zeta, dt) {
+    const MAX_STEP = 1 / 240;
     const omega = f;
-    const x = this._pos[axis] - target;
-    const v = this._vel[axis];
-    const a = -omega * omega * x - 2 * zeta * omega * v;
-    const nv = v + a * dt;
-    this._vel[axis] = nv;
-    this._pos[axis] += nv * dt;
+    // The engine already clamps a frame to 250 ms; clamping again here keeps a
+    // pathological hitch from turning into a long loop.
+    let remaining = Math.min(dt, 0.25);
+    let pos = this._pos[axis];
+    let v = this._vel[axis];
+
+    while (remaining > 1e-6) {
+      const h = remaining > MAX_STEP ? MAX_STEP : remaining;
+      remaining -= h;
+      const x = pos - target;
+      v += (-omega * omega * x - 2 * zeta * omega * v) * h;
+      pos += v * h;
+    }
+
+    this._pos[axis] = pos;
+    this._vel[axis] = v;
+
     // Hard leash: the camera may lag, but it may never leave the head.
     const d = this._pos[axis] - target;
     if (d > 0.35) { this._pos[axis] = target + 0.35; this._vel[axis] = 0; }
