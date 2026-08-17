@@ -108,12 +108,26 @@ export class Mixer {
     this.tin.frequency.value = 4620;
     this.tinGain = ctx.createGain();
     this.tinGain.gain.value = 0;
-    const tinShimmer = ctx.createOscillator();     // slow beat so it is not a test tone
+    // Slow beat so the ring is not a flat test tone.
+    //
+    // THE DEPTH MUST TRACK THE TONE'S OWN LEVEL. An oscillator connected to an
+    // AudioParam is SUMMED with that param's intrinsic value, it does not
+    // scale it — so a fixed 0.35 depth meant this 4.6 kHz sine swung between
+    // -0.35 and +0.35 gain forever, at full volume, no matter what `tinGain`
+    // itself was set to. The result was a loud high-pitched tone audible from
+    // the first frame, with no explosion needed to trigger it and no volume
+    // setting able to silence it, because the fader only ever touched the
+    // intrinsic value it was being added to.
+    //
+    // `_applyEar` now drives this depth from the same level as the tone, so
+    // it behaves as a tremolo ON the ring rather than as an independent
+    // source, and it goes to true silence with it.
+    const tinShimmer = ctx.createOscillator();
     tinShimmer.frequency.value = 0.7;
-    const tinDepth = ctx.createGain();
-    tinDepth.gain.value = 0.35;
-    tinShimmer.connect(tinDepth);
-    tinDepth.connect(this.tinGain.gain);
+    this.tinDepth = ctx.createGain();
+    this.tinDepth.gain.value = 0;
+    tinShimmer.connect(this.tinDepth);
+    this.tinDepth.connect(this.tinGain.gain);
     this.tin.connect(this.tinGain);
     this.tinGain.connect(this.limiter);
     this.tin.start(); tinShimmer.start();
@@ -189,16 +203,23 @@ export class Mixer {
     // The ring is generated in the ear, so it bypasses the ear filter and the
     // ear attenuation — but it still has to answer to the master fader.
     const tin = this._deaf * 0.085 * this.levels.master;
+    // Tremolo depth is a fraction of the tone's own level, never a constant:
+    // summed into the gain param, a constant depth is an independent source
+    // that no fader can reach. At `tin` 0 this is 0, so silence is silence.
+    const tinDepth = tin * 0.4;
     if (smoothing > 0) {
       this.earLP.frequency.setTargetAtTime(cutoff, t, smoothing);
       this.earGain.gain.setTargetAtTime(1 - d * 0.55, t, smoothing);
       this.tinGain.gain.setTargetAtTime(tin, t, smoothing * 1.5);
+      this.tinDepth.gain.setTargetAtTime(tinDepth, t, smoothing * 1.5);
     } else {
       this.earLP.frequency.cancelScheduledValues(t);
       this.earLP.frequency.setValueAtTime(cutoff, t);
       this.earGain.gain.setValueAtTime(1 - d * 0.55, t);
       this.tinGain.gain.cancelScheduledValues(t);
       this.tinGain.gain.setValueAtTime(tin, t);
+      this.tinDepth.gain.cancelScheduledValues(t);
+      this.tinDepth.gain.setValueAtTime(tinDepth, t);
     }
   }
 
