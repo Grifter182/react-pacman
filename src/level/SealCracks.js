@@ -5,6 +5,20 @@ import { Config } from '../core/Config.js';
 /**
  * Wall off the dead cracks between building shells.
  *
+ * STATUS: NOT WIRED UP, AND NOT WORKING. LevelModule does not call this. It
+ * runs and reports "149 dead cracks, 135.2 m2, 314 boxes, spared 13", but
+ * dropping the player into each of the five cracks tools/level-probe.mjs names
+ * leaves all five enterable — so it is selecting a set of narrow cells that does
+ * not contain the reported ones. Two theories have been tried and both were
+ * refuted by measurement rather than by argument: that the fix and the test read
+ * different maps (fixed, no effect on the outcome), and that the map perimeter
+ * merged into one oversized cluster and was spared by the area guard (disproved
+ * — the numbers were identical before and after narrowing that guard, so nothing
+ * was ever hitting it). The next step is a direct SET COMPARISON: dump the cell
+ * indices this selects and the ones level-probe reports as narrow, and
+ * difference them. Every theory so far has been an inference about that
+ * difference instead of a measurement of it.
+ *
  * THE COMPLAINT, MEASURED. A player reported "narrow corridors between buildings
  * that feel like a flaw". tools/level-probe.mjs found 147 m2 of walkable ground
  * at or under 1.5 m wide, in 79 clusters, the narrowest 0.52 m and the worst an

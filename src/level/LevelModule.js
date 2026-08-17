@@ -7,7 +7,6 @@ import { ProxySet, rng, fbm2, FACE_ALL, FACE_NY } from './kit/Geo.js';
 import { Batcher, InstancePool } from './kit/Batcher.js';
 import { applyWeathering, disposeWeathering } from './kit/Weathering.js';
 import { Foliage } from './kit/Foliage.js';
-import { sealDeadCracks } from './SealCracks.js';
 import {
   SCALE, wall, building, roof, stairs, railing, pillar, column, archway, awning,
   windowFill, wallFrame, facadeFittings,
@@ -2296,13 +2295,14 @@ export class LevelModule {
     const instMeshes = this.inst.flush(this.root, this.batch);
     const meshes = this.batch.flush(this.root);
 
-    // Wall off the seams between building shells before the collider is frozen.
-    // Driven from a NavMesh built with the same parameters AiModule will use, so
-    // the fix and the probe that measures it read one map rather than two —
-    // see the long note in SealCracks.js for why that is the whole point.
-    const seal = sealDeadCracks(this.proxy, this.bounds);
-    console.info(`[Level] sealed ${seal.sealed} dead cracks (${seal.sealedAreaM2} m2, `
-      + `${seal.boxes} boxes, ${seal.ms}ms); spared ${seal.sparedCount}`);
+    // NOT WIRED UP. `sealDeadCracks` (src/level/SealCracks.js) is written and
+    // it runs, reporting "149 dead cracks, 135.2 m2, 314 boxes" — but it does
+    // not do the job: dropping the player into each of the five cracks the
+    // probe names shows all five still enterable. It is selecting a set of
+    // narrow cells that does not contain the reported ones, and until that is
+    // understood it would add 314 collision boxes to the bullet and capsule
+    // BVH in exchange for nothing. The analysis is kept, the cost is not paid.
+    // See the header of SealCracks.js for the diagnosis so far.
 
     const collider = this.proxy.toMesh();
     engine.get('collision').build(collider);
