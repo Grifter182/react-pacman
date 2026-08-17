@@ -168,7 +168,7 @@ export const Config = {
    * the two, and the automatic behaviour if the files are ever missing.
    */
   assets: {
-    useAuthored: true,
+    useAuthored: false,   // BISECT: temporarily off
     environment: 'daysky',
     environmentIntensity: 1.0,
     /**
