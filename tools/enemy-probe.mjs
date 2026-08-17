@@ -56,7 +56,7 @@ const browser = await chromium.launch({
 });
 const page = await browser.newPage({ viewport: { width: 640, height: 360 } });
 page.on('pageerror', (e) => console.log('PAGEERROR', e.message));
-await page.goto(`http://127.0.0.1:${PORT}?quality=low&nofrontend=1`, { waitUntil: 'load' });
+await page.goto(`http://127.0.0.1:${PORT}?quality=low&nofrontend=1&bots=${process.env.BOTS || 7}`, { waitUntil: 'load' });
 await page.waitForFunction(() => document.body.dataset.ready === '1', null, { timeout: 300000 });
 await page.waitForTimeout(1500);
 
