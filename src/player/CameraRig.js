@@ -53,6 +53,22 @@ export class CameraRig {
     this._q = new THREE.Quaternion();
     this._e = new THREE.Euler(0, 0, 0, 'YXZ');
     this._tmp = new THREE.Vector3();
+
+    /**
+     * Front-end crane shot. Off during play; the HUD turns it on with the
+     * title screen so the menu has a living backdrop instead of a still.
+     */
+    this.cinematic = false;
+    this.cinematicPhase = 1.9;             // start looking down the main street
+    this.cinematicShot = {
+      centre: new THREE.Vector3(0, 1.6, 6),
+      radius: 26,
+      radiusSwing: 4.5,
+      height: 9.5,
+      heightSwing: 1.6,
+      lookLift: 2.2,
+      fov: 46,                             // longer lens than gameplay: compresses the souk
+    };
   }
 
   /** Landing: impact speed becomes downward spring velocity plus trauma. */
@@ -197,8 +213,35 @@ export class CameraRig {
     this.trauma.update(dt);
     const tr = this.trauma;
 
-    /* --- compose ---------------------------------------------------------- */
     const cam = engine.camera;
+
+    /* --- cinematic idle --------------------------------------------------- */
+    // While the front end is up there is no player to follow, so the camera
+    // becomes a slow crane shot over the map instead of standing still. A
+    // static menu backdrop reads as a screenshot; drifting parallax reads as a
+    // place. Driven entirely from elapsed time so it needs no state and cannot
+    // desync, and it returns the camera to the player the moment it is off.
+    if (this.cinematic) {
+      const t = engine.elapsed * 0.045 + this.cinematicPhase;
+      const c = this.cinematicShot;
+      const orbit = c.radius + Math.sin(t * 0.6) * c.radiusSwing;
+      cam.position.set(
+        c.centre.x + Math.sin(t) * orbit,
+        c.height + Math.sin(t * 0.83) * c.heightSwing,
+        c.centre.z + Math.cos(t) * orbit,
+      );
+      // Look slightly above the focus so the frame carries sky and roofline,
+      // which is where the silhouette detail is.
+      _look.set(c.centre.x, c.centre.y + c.lookLift, c.centre.z);
+      cam.lookAt(_look);
+      const vmc = engine.viewmodelCamera;
+      vmc.position.copy(cam.position);
+      vmc.quaternion.copy(cam.quaternion);
+      if (Math.abs(cam.fov - c.fov) > 0.01) { cam.fov = c.fov; cam.updateProjectionMatrix(); }
+      return;
+    }
+
+    /* --- compose ---------------------------------------------------------- */
     // Bob is in view space; rotate it into the world by yaw.
     const worldBobX = bobX * cos;
     const worldBobZ = -bobX * sin;
@@ -257,3 +300,6 @@ export class CameraRig {
     else if (d < -0.35) { this._pos[axis] = target - 0.35; this._vel[axis] = 0; }
   }
 }
+
+/** Scratch for the cinematic look-at target; allocated once. */
+const _look = new THREE.Vector3();

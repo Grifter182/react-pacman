@@ -480,10 +480,18 @@ export const UI_CSS = /* css */`
 .bl-menu {
   position: absolute; inset: 0; display: none;
   align-items: stretch; justify-content: center;
+  /* The live map is behind this. It used to be buried under a 90-96% opaque
+     wash, which threw away the only atmosphere the front end had — the game
+     itself. Now the scrim is a graded wedge: near-opaque down the left where
+     the type sits, opening up to the right so the souk and the sky read
+     through it. Blur plus desaturation keeps text legible without hiding the
+     world. */
   background:
-    radial-gradient(ellipse at 30% 0%, rgba(24,44,64,.55), transparent 62%),
-    linear-gradient(180deg, rgba(4,6,9,.90), rgba(4,6,9,.96));
-  backdrop-filter: blur(10px) saturate(.8);
+    linear-gradient(100deg, rgba(4,6,9,.94) 0%, rgba(4,6,9,.86) 34%,
+                            rgba(4,6,9,.55) 62%, rgba(4,6,9,.42) 100%),
+    radial-gradient(ellipse at 26% -10%, rgba(30,58,84,.55), transparent 64%),
+    radial-gradient(ellipse at 120% 110%, rgba(96,58,26,.30), transparent 58%);
+  backdrop-filter: blur(5px) saturate(.72) brightness(.78);
   pointer-events: auto;
   opacity: 0; transition: opacity var(--t-med) var(--ease);
 }
@@ -491,15 +499,83 @@ export const UI_CSS = /* css */`
 /* Panes are taller than a short viewport; the container scrolls rather than
    letting the bottom of the settings list fall off the screen. */
 .bl-menu { overflow-y: auto; overscroll-behavior: contain; }
-/* Faint scanline + grain: enough to sit the panel in a device, not a browser. */
+/* Faint scanline + grain: enough to sit the panel in a device, not a browser.
+   Vignette is layered in here too so the open right-hand side of the scrim
+   still falls off at the frame edge. */
 .bl-menu::after {
   content: ''; position: absolute; inset: 0; pointer-events: none; opacity: .35;
-  background: repeating-linear-gradient(180deg, rgba(255,255,255,.022) 0 1px, transparent 1px 3px);
+  background:
+    repeating-linear-gradient(180deg, rgba(255,255,255,.022) 0 1px, transparent 1px 3px);
+}
+.bl-menu::before {
+  content: ''; position: absolute; inset: 0; pointer-events: none; z-index: 2;
+  background: radial-gradient(ellipse at 50% 50%, transparent 44%, rgba(0,0,0,.62) 100%);
+}
+
+/* Atmosphere layer: dust drifting through the light, and a slow sensor sweep.
+   Both are pure CSS on two elements — no per-frame JS, so the front end costs
+   nothing while the map renders behind it. */
+.bl-atmos { position: absolute; inset: 0; pointer-events: none; overflow: hidden; z-index: 1; }
+.bl-atmos .motes {
+  position: absolute; inset: -20% -10%;
+  /* Four sizes of speck at four densities reads as depth; one layer reads as
+     noise. The largest are nearest, so they move most. */
+  background-image:
+    radial-gradient(1.6px 1.6px at 12% 22%, rgba(255,238,214,.55), transparent 60%),
+    radial-gradient(1.2px 1.2px at 68% 14%, rgba(255,238,214,.40), transparent 60%),
+    radial-gradient(2.2px 2.2px at 34% 76%, rgba(255,238,214,.30), transparent 60%),
+    radial-gradient(1px 1px at 84% 58%, rgba(255,238,214,.45), transparent 60%),
+    radial-gradient(1.4px 1.4px at 52% 40%, rgba(255,238,214,.28), transparent 60%);
+  background-size: 340px 300px, 520px 460px, 700px 620px, 260px 240px, 880px 700px;
+  animation: bl-drift 64s linear infinite;
+  opacity: .5;
+}
+@keyframes bl-drift {
+  from { transform: translate3d(0, 0, 0); }
+  to   { transform: translate3d(-340px, -300px, 0); }
+}
+.bl-atmos .sweep {
+  position: absolute; left: 0; right: 0; height: 42%;
+  background: linear-gradient(180deg, transparent, rgba(126,196,255,.045) 45%, transparent);
+  animation: bl-sweep 11s cubic-bezier(.4, 0, .5, 1) infinite;
+}
+@keyframes bl-sweep {
+  0%   { top: -45%; opacity: 0; }
+  12%  { opacity: 1; }
+  88%  { opacity: 1; }
+  100% { top: 105%; opacity: 0; }
+}
+/* Letterbox. Thin — enough to say "camera feed", not enough to eat the page. */
+.bl-atmos .bar { position: absolute; left: 0; right: 0; height: 26px; background: rgba(2,3,5,.85); }
+.bl-atmos .bar.t { top: 0; box-shadow: 0 1px 0 rgba(255,255,255,.05); }
+.bl-atmos .bar.b { bottom: 0; box-shadow: 0 -1px 0 rgba(255,255,255,.05); }
+
+@media (prefers-reduced-motion: reduce) {
+  .bl-atmos .motes, .bl-atmos .sweep { animation: none; }
 }
 .bl-mwrap { position: relative; z-index: 1; width: min(1180px, 92vw); margin: auto; padding: calc(var(--u) * 4) 0; }
 
 .bl-title { margin-bottom: calc(var(--u) * 5); }
-.bl-title .eyebrow { font-size: 10px; letter-spacing: .5em; color: var(--fg-mute); }
+.bl-title .eyebrow {
+  display: flex; align-items: center; gap: calc(var(--u) * 1.5);
+  font-size: 10px; letter-spacing: .5em; color: var(--fg-mute);
+}
+/* Recording tally. Slow, uneven blink — a metronome reads as a CSS animation,
+   which is exactly what it must not look like. */
+.bl-title .eyebrow .live {
+  width: 6px; height: 6px; border-radius: 50%; background: var(--enemy, #d8452f);
+  box-shadow: 0 0 8px rgba(216,69,47,.85); animation: bl-tally 3.4s ease-in-out infinite;
+}
+@keyframes bl-tally {
+  0%, 46% { opacity: 1; }
+  52%, 60% { opacity: .18; }
+  66%, 100% { opacity: 1; }
+}
+.bl-title .eyebrow .clk {
+  margin-left: auto; font-variant-numeric: tabular-nums; letter-spacing: .28em;
+  color: var(--fg-dim); opacity: .8;
+}
+@media (prefers-reduced-motion: reduce) { .bl-title .eyebrow .live { animation: none; } }
 .bl-title h1 {
   font-size: clamp(38px, 6.4vw, 76px); line-height: .94; font-weight: 700;
   letter-spacing: .12em; margin: calc(var(--u) * 1.5) 0 calc(var(--u) * 1.5);
@@ -507,6 +583,20 @@ export const UI_CSS = /* css */`
 .bl-title h1 em { font-style: normal; color: var(--friend); }
 .bl-title .sub { font-size: 11px; letter-spacing: .3em; color: var(--fg-dim); }
 .bl-title .rule { height: 1px; background: linear-gradient(90deg, var(--line-2), transparent); margin-top: calc(var(--u) * 2); }
+
+/* Creator credit, under the menu columns. Sits in the tertiary tier of the
+   type hierarchy — the name is the only part at full weight, everything around
+   it is dimmed, so it reads without competing with the title. */
+.bl-credit {
+  display: flex; align-items: center; gap: calc(var(--u) * 1.5);
+  margin-top: calc(var(--u) * 5); padding-top: calc(var(--u) * 2.5);
+  border-top: 1px solid var(--line-2);
+  font-size: 10px; letter-spacing: .34em; color: var(--fg-mute);
+}
+.bl-credit .by { opacity: .7; }
+.bl-credit strong { font-weight: 700; letter-spacing: .3em; color: var(--fg); }
+.bl-credit i { width: 14px; height: 1px; background: var(--line-2); opacity: .9; }
+.bl-credit .studio { color: var(--friend); letter-spacing: .3em; }
 
 .bl-cols { display: grid; grid-template-columns: 280px 1fr; gap: calc(var(--u) * 5); align-items: start; }
 
