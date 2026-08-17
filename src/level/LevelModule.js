@@ -7,6 +7,7 @@ import { ProxySet, rng, fbm2, FACE_ALL, FACE_NY } from './kit/Geo.js';
 import { Batcher, InstancePool } from './kit/Batcher.js';
 import { applyWeathering, disposeWeathering } from './kit/Weathering.js';
 import { Foliage } from './kit/Foliage.js';
+import { sealDeadCracks } from './SealCracks.js';
 import {
   SCALE, wall, building, roof, stairs, railing, pillar, column, archway, awning,
   windowFill, wallFrame, facadeFittings,
@@ -2294,6 +2295,14 @@ export class LevelModule {
     // open, so the instance pool is resolved first.
     const instMeshes = this.inst.flush(this.root, this.batch);
     const meshes = this.batch.flush(this.root);
+
+    // Wall off the seams between building shells before the collider is frozen.
+    // Driven from a NavMesh built with the same parameters AiModule will use, so
+    // the fix and the probe that measures it read one map rather than two —
+    // see the long note in SealCracks.js for why that is the whole point.
+    const seal = sealDeadCracks(this.proxy, this.bounds);
+    console.info(`[Level] sealed ${seal.sealed} dead cracks (${seal.sealedAreaM2} m2, `
+      + `${seal.boxes} boxes, ${seal.ms}ms); spared ${seal.sparedCount}`);
 
     const collider = this.proxy.toMesh();
     engine.get('collision').build(collider);
