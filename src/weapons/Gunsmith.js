@@ -270,14 +270,26 @@ export function weaponMaterials() {
     material: { aoMapIntensity: VIEWMODEL_AO * 2.0 },
   });
 
-  // Optic glass: an AR-coated lens reads as a dark surface with a green-magenta
-  // bloom, never as a grey pane. No transmission — just a low-opacity
-  // dielectric with a hard specular lobe off the environment map.
+  // Optic glass. THE SIGHT HAS TO BE SEE-THROUGH — that is the whole function
+  // of the part, and it outranks how the coating looks.
+  //
+  // This was previously authored as a look rather than as an aperture: two
+  // discs at 0.34 opacity over a near-black tint, so only ~44% of the world's
+  // light survived the stack, with a 2.4x environment specular and full
+  // clearcoat laid on top. The result was a lens you saw *instead of* the
+  // target — aiming showed the coating, not the scene behind it.
+  //
+  // A real AR-coated lens passes better than 90% of the light; the coating is
+  // visible as a faint tint and an off-axis bloom, never as a filter. At 0.10
+  // the two discs together still pass ~81%, which keeps the target readable
+  // while leaving enough surface for the specular to catch and read as glass.
   const glass = new THREE.MeshPhysicalMaterial({
-    color: 0x0a1512, roughness: 0.045, metalness: 0.0,
-    transparent: true, opacity: 0.34, depthWrite: false,
-    clearcoat: 1.0, clearcoatRoughness: 0.03,
-    envMapIntensity: 2.4, side: THREE.DoubleSide,
+    color: 0x14201c, roughness: 0.045, metalness: 0.0,
+    transparent: true, opacity: 0.10, depthWrite: false,
+    clearcoat: 1.0, clearcoatRoughness: 0.05,
+    // The specular has to stay a highlight, not a veil: at 2.4 the reflection
+    // alone was brighter than the transmitted image on any lit surface.
+    envMapIntensity: 0.9, side: THREE.DoubleSide,
   });
 
   // Emissive reticle: unlit, additive, outside the tone mapper so the bloom
@@ -525,7 +537,7 @@ function handguard(kit, M, D, frontZ) {
 /* ---------------------------------------------------------------- barrel */
 
 /** Barrel, gas system and muzzle device. */
-function barrelAssembly(kit, M, D, hg) {
+function barrelAssembly(kit, M, D, hg, opticFitted) {
   kit.label = 'barrel';
   const b = M.barrel;
   const zB = 0.010;                    // breech face
@@ -586,19 +598,36 @@ function barrelAssembly(kit, M, D, hg) {
 
     // Front sight: a base on the block, two protective ears and a round post
     // between them, with the classic detent drum at its foot.
+    //
+    // THE POST AND EARS ONLY EXIST WHEN NOTHING IS MOUNTED ABOVE THEM. They
+    // stand about 4R off the bore, which puts them directly across the optic's
+    // line of sight — aiming produced a sight picture full of the rifle's own
+    // front sight instead of the target, which is why looking through the
+    // scope showed nothing useful. Every optic-equipped rifle solves this the
+    // same way: the irons fold flat and the optic owns the sight line. The
+    // base stays, because a bare gas block with no sight base on top reads as
+    // an unfinished barrel.
     const baseY = 0.010 + gh * 0.60;
     const postH = R * 2.6;
     kit.add(chamferBox(gw * 0.80, 0.0040, 0.020, 0.0010), S_BARREL, { pos: [0, baseY, gz] });
-    kit.mirrored((k) => k.add(loft(octagon(0.0034, postH, 0.0008), [
-      { z: gz + 0.008, scale: 0.85, scaleY: 0.72 },
-      { z: gz + 0.006, scale: 1.00, scaleY: 0.94 },
-      { z: gz - 0.006, scale: 1.00, scaleY: 1.00 },
-      { z: gz - 0.008, scale: 0.85, scaleY: 0.88 },
-    ]), S_BARREL, { pos: [gw * 0.28, baseY + postH * 0.5, 0] }));
-    kit.add(cyl(0.0016, 0.0013, postH * 0.92, seg('tiny', D)), S_BARREL,
-      { pos: [0, baseY, gz], rot: [-Math.PI / 2, 0, 0] });
-    kit.add(cyl(0.0034, 0.0034, 0.0035, seg('tiny', D)), S_BARREL,
-      { pos: [0, baseY + 0.0005, gz], rot: [-Math.PI / 2, 0, 0] });
+
+    if (!opticFitted) {
+      kit.mirrored((k) => k.add(loft(octagon(0.0034, postH, 0.0008), [
+        { z: gz + 0.008, scale: 0.85, scaleY: 0.72 },
+        { z: gz + 0.006, scale: 1.00, scaleY: 0.94 },
+        { z: gz - 0.006, scale: 1.00, scaleY: 1.00 },
+        { z: gz - 0.008, scale: 0.85, scaleY: 0.88 },
+      ]), S_BARREL, { pos: [gw * 0.28, baseY + postH * 0.5, 0] }));
+      kit.add(cyl(0.0016, 0.0013, postH * 0.92, seg('tiny', D)), S_BARREL,
+        { pos: [0, baseY, gz], rot: [-Math.PI / 2, 0, 0] });
+      kit.add(cyl(0.0034, 0.0034, 0.0035, seg('tiny', D)), S_BARREL,
+        { pos: [0, baseY + 0.0005, gz], rot: [-Math.PI / 2, 0, 0] });
+    } else {
+      // Folded: the sight lies along the base, so the silhouette keeps a step
+      // at the gas block without anything standing up into the sight line.
+      kit.add(chamferBox(gw * 0.44, 0.0052, 0.026, 0.0010), S_BARREL,
+        { pos: [0, baseY + 0.0035, gz - 0.004] });
+    }
   }
 
   // Muzzle device.
@@ -970,7 +999,8 @@ export function buildWeapon(def, mats) {
   const up = upperReceiver(kit, M, D);
   const low = lowerReceiver(kit, M, D);
   const hg = handguard(kit, M, D, up.front + 0.004);
-  const bar = barrelAssembly(kit, M, D, hg);
+  // An optic on the rail owns the sight line, so the irons fold flat.
+  const bar = barrelAssembly(kit, M, D, hg, !!def.optic);
   const gripAnchor = new THREE.Vector3(0, low.topY - 0.010, low.zc + 0.070);
   const grip = pistolGrip(kit, M, D, gripAnchor);
   stockAssembly(kit, M, D, up.back);
