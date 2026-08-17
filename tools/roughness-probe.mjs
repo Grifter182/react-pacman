@@ -185,8 +185,8 @@ function measure(label, name, worldScale, N, seed, mul, gating = true) {
   const al = stats(lum), mt = stats(metal);
   console.log(`  albedo8 mean ${al.mean.toFixed(1)} sd ${al.sd.toFixed(2)}`
     + `   metalness mean ${mt.mean.toFixed(3)} max ${mt.max.toFixed(3)}`
-    + `   -> ${pass ? 'PASS' : 'FAIL'}`);
-  return pass;
+    + `   -> ${pass ? 'PASS' : 'FAIL'}${gating ? '' : ' (informational, not a viewmodel slot)'}`);
+  return pass || !gating;
 }
 
 const argv = process.argv.slice(2);
@@ -197,9 +197,9 @@ if (argv.length >= 2) {
     parseInt(seed ?? '1', 10), parseFloat(mul ?? '1'));
 } else {
   const want = argv[0];
-  for (const [label, [name, ws, size, seed, mul]] of Object.entries(SLOTS)) {
+  for (const [label, [name, ws, size, seed, mul, gating]] of Object.entries(SLOTS)) {
     if (want && want !== label && want !== name) continue;
-    ok = measure(label, name, ws, size, seed, mul) && ok;
+    ok = measure(label, name, ws, size, seed, mul, gating) && ok;
   }
 }
 process.exitCode = ok ? 0 : 1;
