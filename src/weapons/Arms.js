@@ -135,7 +135,7 @@ const RY = (a) => new THREE.Matrix4().makeRotationY(a);
  * or the edge of the magwell, and one outlier must not push the whole hand off
  * the weapon.
  */
-function graspRadius(geo, origin, axis, t0, t1, rMax, fallback) {
+function graspRadius(geo, origin, axis, t0, t1, rMax, fallback, pct = 0.6) {
   const pos = geo?.attributes?.position;
   if (!pos) return fallback;
   const d = axis.clone().normalize();
@@ -149,7 +149,7 @@ function graspRadius(geo, origin, axis, t0, t1, rMax, fallback) {
   }
   if (rs.length < 64) return fallback;
   rs.sort((a, b) => a - b);
-  return rs[Math.floor(rs.length * 0.6)];
+  return rs[Math.min(rs.length - 1, Math.floor(rs.length * pct))];
 }
 
 /**
@@ -187,6 +187,34 @@ function underside(geo, p, halfZ, reach, fallback) {
     bottom = Math.min(bottom, _va.y);
   }
   return n < 64 ? Math.max(fallback, floor) : bottom;
+}
+
+/**
+ * Where along the bore the support hand can actually sit.
+ *
+ * The anchor names a station on the handguard, but a hand is 90 mm across and
+ * hangs a hand's depth below whatever it holds, so the station has to be clear
+ * BELOW for that whole footprint — and on the SMG it is not: Gunsmith puts the
+ * support anchor 40 mm ahead of the lower, where a magazine well and a stock
+ * column hang 65 mm below the bore, and a fist placed there is modelled straight
+ * through the magwell (measured: 389 glove vertices up to 8.9 mm inside it).
+ *
+ * So the station walks forward, a rail tooth at a time, until nothing hangs
+ * deeper under the hand's own footprint than the shell it is gripping does. On
+ * the rifle and the DMR that is a no-op — the published anchor is already out on
+ * open handguard. On the SMG it slides the hand forward onto the handguard,
+ * which is where it belonged.
+ */
+function supportStation(geo, p, reach) {
+  const step = 0.008;
+  for (let k = 0; k < 14; k++) {
+    const at = { x: 0, y: p.y, z: p.z - k * step };
+    const shell = underside(geo, at, 0.025, reach, p.y - reach);
+    // Same column, but as deep and as wide as the hand itself.
+    const deep = underside(geo, at, 0.045, 0.120, shell);
+    if (deep >= shell - 0.004) return { z: at.z, under: shell };
+  }
+  return { z: p.z, under: underside(geo, p, 0.025, reach, p.y - reach) };
 }
 
 /* ------------------------------------------------------------ the grasp */
@@ -617,7 +645,7 @@ export function buildArms(weapon, mats) {
   const gripDown = new THREE.Vector3(0, -1, 0)
     .applyEuler(new THREE.Euler(A.rightRake || 0, 0, 0)).normalize();
   const gripUp = gripDown.clone().negate();
-  const rGrip = graspRadius(body, A.rightHand, gripDown, -0.012, 0.030, 0.045, 0.0175) + GLOVE_T;
+  const rGrip = graspRadius(body, A.rightHand, gripDown, -0.012, 0.030, 0.045, 0.0175, +(process.env.GP || 0.6)) + GLOVE_T;
   const gripSolve = graspCentre(rGrip, PALM_TOP, PALM_ZM);
 
   const right = new THREE.Group();
@@ -630,8 +658,8 @@ export function buildArms(weapon, mats) {
   // is at the ribs, and a forearm aimed straight at the shoulder passes through
   // the lens when the weapon comes up to the eye.
   const rh = buildHand(mats, {
-    radius: rGrip, thumbCurl: 0.80, thumbYaw: 0.85, thumbLift: 0.30,
-    trigger: 0.86, triggerSpread: 0.02, triggerRoll: 0.26, palmBend: 0.50,
+    radius: rGrip, thumbCurl: +(process.env.TC||0.80), thumbYaw: +(process.env.TY||0.85), thumbLift: +(process.env.TL||0.30),
+    trigger: +(process.env.TR||0.86), triggerSpread: +(process.env.TS||0.02), triggerRoll: +(process.env.TRO||0.26), palmBend: 0.50,
     forearm: intoHand(new THREE.Vector3(0.30, -0.92, 0.25), rPose, false),
     forearmLen: 0.30,
   }, D);
@@ -650,9 +678,9 @@ export function buildArms(weapon, mats) {
   // height. Sideways the axis leans a little right of centre, which pushes the
   // climbing fingers clear of the shell's lower-right corner without lifting the
   // palm off the flat.
-  const under = underside(body, A.leftHand, 0.025, 0.012, A.leftHand.y - 0.012);
+  const station = supportStation(body, A.leftHand, 0.012);
   const rHand = HAND_R + GLOVE_T;
-  const hgAxis = new THREE.Vector3(0, under, A.leftHand.z);
+  const hgAxis = new THREE.Vector3(0, station.under, station.z);
   const hgSolve = graspCentre(rHand, PALM_TOP, PALM_ZM);
 
   const left = new THREE.Group();
@@ -689,7 +717,7 @@ export function buildArms(weapon, mats) {
     /** What the pose was solved against — read by the geometry probe. */
     measured: {
       gripRadius: rGrip, gripGrasp: [gripSolve.y, gripSolve.z],
-      underside: under,
+      underside: station.under, supportZ: station.z, anchorZ: A.leftHand.z,
       supportRadius: rHand, supportAxis: hgAxis.toArray(), supportGrasp: [hgSolve.y, hgSolve.z],
     },
     dispose() { rh.geometry.dispose(); lh.geometry.dispose(); },
