@@ -1,5 +1,6 @@
 import { Engine } from './core/Engine.js';
 import { Config, autoDetectQuality } from './core/Config.js';
+import { ATMO } from './world/Atmosphere.js';
 import { flushMaterialBakes, materialsReady } from './materials/TextureFactory.js';
 
 import { RenderModule } from './render/RenderModule.js';
@@ -7,6 +8,8 @@ import { PostStack } from './render/PostStack.js';
 import { SkyModule } from './world/SkyModule.js';
 import { LightingModule } from './world/LightingModule.js';
 import { LevelModule } from './level/LevelModule.js';
+import { GltfLevelModule } from './level/GltfLevelModule.js';
+import { selectedMap } from './level/MapRegistry.js';
 import { CollisionModule } from './physics/CollisionModule.js';
 import { PlayerModule } from './player/PlayerModule.js';
 import { WeaponModule } from './weapons/WeaponModule.js';
@@ -21,6 +24,24 @@ import { MatchModule } from './game/MatchModule.js';
  * Dependencies flow strictly downward: a module may only look up modules
  * registered above it during init().
  */
+
+/**
+ * Night, expressed as the one number the whole atmosphere derives from.
+ *
+ * Atmosphere.js generates the sky, the aerial perspective, the sun's colour and
+ * the IBL from `ATMO`, precisely so the horizon cannot seam against the fog. So
+ * a night preset must not paint a dark sky and leave a noon sun lighting the
+ * ground: it drops the sun below the horizon and scales the solar constant, and
+ * every dependent term follows on its own.
+ *
+ * Must run BEFORE SkyModule.init, which samples these to bake its cubemap.
+ */
+function applyNightSky() {
+  ATMO.sunElevationDeg = -3.5;   // just under the horizon: dusk, not pitch black
+  ATMO.E0 = 0.55;                // moonlight is roughly a millionth of sunlight;
+                                 // this is the cinematic version, not the real one
+}
+
 async function boot() {
   const canvas = document.getElementById('view');
   const engine = new Engine(canvas);
@@ -36,7 +57,22 @@ async function boot() {
   engine.register('sky', new SkyModule());
   engine.register('lighting', new LightingModule());
   engine.register('collision', new CollisionModule());
-  engine.register('level', new LevelModule());
+  // Which map boots is a registry lookup, not a hard-coded class. Both
+  // implementations satisfy the same contract, so nothing below this line
+  // knows or cares which one it got. See MapRegistry.js.
+  const map = selectedMap();
+  engine.mapDef = map;
+  // `?night=0` forces daylight on a night map and `?night=1` the reverse, so a
+  // dark frame can be told from a missing one without editing the registry.
+  let night = map.lighting?.preset === 'night';
+  try {
+    const q = new URLSearchParams(location.search).get('night');
+    if (q === '0') night = false; else if (q === '1') night = true;
+  } catch { /* ignore */ }
+  if (night) applyNightSky();
+  engine.register('level', map.kind === 'gltf'
+    ? new GltfLevelModule(map)
+    : new LevelModule());
   engine.register('fx', new FxModule());
   engine.register('audio', new AudioModule());
   engine.register('player', new PlayerModule());

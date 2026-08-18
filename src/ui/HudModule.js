@@ -139,6 +139,9 @@ export class HudModule {
     const level = engine.get('level');
     const collision = engine.get('collision');
     this.map.build(collision?.collider || level?.collider, level?.bounds);
+    // The minimap's caption was hard-coded to the original map's name, which is
+    // wrong the moment a second map exists.
+    this.map.setName?.(engine.mapDef?.name);
 
     // Touch controls build themselves only on a coarse-pointer, no-hover
     // device (or with ?touch=1), so desktop is untouched. They feed the same

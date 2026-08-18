@@ -11,6 +11,7 @@ export default defineConfig({
       'three',
       'three/examples/jsm/loaders/HDRLoader.js',
       'three/examples/jsm/utils/BufferGeometryUtils.js',
+      'three/examples/jsm/loaders/GLTFLoader.js',
     ],
   },
   build: {

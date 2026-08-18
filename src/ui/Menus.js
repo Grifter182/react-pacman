@@ -1,4 +1,5 @@
 import { el, frag, clamp, weaponIcon } from './Dom.js';
+import { MAPS, selectedMap, chooseMap } from '../level/MapRegistry.js';
 import { Config, QualityTier } from '../core/Config.js';
 
 /**
@@ -75,6 +76,7 @@ export class Menus {
     this.$pane = this.node.querySelector('.bl-pane');
 
     this.panes = {
+      maps: this._paneMaps(),
       brief: this._buildBrief(),
       loadout: this._buildLoadout(),
       settings: this._buildSettings(),
@@ -107,6 +109,38 @@ export class Menus {
 
   /* -------------------------------------------------------------- screens */
 
+  /** Map cards, driven off the registry so adding a map needs no UI edit. */
+  _paneMaps() {
+    const n = el('div');
+    n.appendChild(el('h3', { text: 'AVAILABLE MAPS' }));
+    const wrap = el('div.bl-mapgrid');
+    const current = selectedMap().id;
+    for (const m of MAPS) {
+      const card = el("button.bl-mapcard", { type: "button" });
+      card.classList.toggle('on', m.id === current);
+      card.innerHTML =
+        `<div class="cls">${m.subtitle}</div>
+         <div class="nm">${m.name}</div>
+         <div class="br">${m.brief}</div>
+         ${m.creditShort ? `<div class="cr">${m.creditShort}</div>` : ''}
+         <div class="go">${m.id === current ? 'DEPLOYED HERE' : 'LOAD MAP'}</div>`;
+      card.addEventListener('click', () => {
+        if (m.id === current) return;
+        card.querySelector('.go').textContent = 'LOADING...';
+        chooseMap(m.id);
+      });
+      wrap.appendChild(card);
+    }
+    n.appendChild(wrap);
+    // The licence requires the full credit sentence to travel with the work, so
+    // it is printed here in full rather than only as the short badge.
+    for (const m of MAPS) {
+      if (!m.credit) continue;
+      n.appendChild(el('div.bl-mapcredit', { text: m.credit }));
+    }
+    return n;
+  }
+
   showTitle() {
     this.screen = 'title';
     this.$eyebrow.textContent = 'TASK FORCE 141 · CLASSIFIED';
@@ -114,6 +148,7 @@ export class Menus {
     this.$sub.textContent = 'SUQ AL-HADID · 06:40 LOCAL · TEAM DEATHMATCH';
     this._nav([
       { label: 'DEPLOY', key: 'ENTER', primary: true, action: () => this.hooks.onDeploy?.() },
+      { label: 'MAPS', action: () => this.showMaps('title') },
       { label: 'LOADOUT', action: () => this.showLoadout('title') },
       { label: 'SETTINGS', action: () => this.showSettings('title') },
       { label: 'BRIEFING', action: () => this._setPane('brief') },
@@ -129,6 +164,7 @@ export class Menus {
     this.$sub.textContent = 'THE OPERATION CONTINUES WITHOUT YOU';
     this._nav([
       { label: 'RESUME', key: 'ESC', primary: true, action: () => this.hooks.onResume?.() },
+      { label: 'MAPS', action: () => this.showMaps('pause') },
       { label: 'LOADOUT', action: () => this.showLoadout('pause') },
       { label: 'SETTINGS', action: () => this.showSettings('pause') },
       { label: 'RESTART MATCH', action: () => this.hooks.onRestart?.() },
@@ -147,6 +183,23 @@ export class Menus {
       { label: 'BACK', action: () => (back === 'pause' ? this.showPause() : this.showTitle()) },
     ]);
     this._setPane('loadout');
+    this._open();
+  }
+
+  /**
+   * Map select. Choosing a map RELOADS the page — see MapRegistry.js: the level
+   * module is registered before the engine initialises, so the choice has to be
+   * made at boot. The button says so rather than appearing to hang.
+   */
+  showMaps(back) {
+    this.screen = 'maps';
+    this.$eyebrow.textContent = 'DEPLOYMENT';
+    this.$h1.innerHTML = 'SELECT <em>MAP</em>';
+    this.$sub.textContent = 'CHANGING MAP RESTARTS THE MATCH';
+    this._nav([
+      { label: 'BACK', primary: true, action: () => (back === 'pause' ? this.showPause() : this.showTitle()) },
+    ]);
+    this._setPane('maps');
     this._open();
   }
 
@@ -172,6 +225,7 @@ export class Menus {
     this.$sub.textContent = `SUQ AL-HADID · ${summary.teamA} ${summary.scoreA} — ${summary.scoreB} ${summary.teamB}`;
     this._nav([
       { label: 'PLAY AGAIN', primary: true, action: () => this.hooks.onRestart?.() },
+      { label: 'MAPS', action: () => this.showMaps('title') },
       { label: 'LOADOUT', action: () => this.showLoadout('title') },
       { label: 'SETTINGS', action: () => this.showSettings('title') },
     ]);
