@@ -2295,6 +2295,15 @@ export class LevelModule {
     const instMeshes = this.inst.flush(this.root, this.batch);
     const meshes = this.batch.flush(this.root);
 
+    // NOT WIRED UP. `sealDeadCracks` (src/level/SealCracks.js) is written and
+    // it runs, reporting "149 dead cracks, 135.2 m2, 314 boxes" — but it does
+    // not do the job: dropping the player into each of the five cracks the
+    // probe names shows all five still enterable. It is selecting a set of
+    // narrow cells that does not contain the reported ones, and until that is
+    // understood it would add 314 collision boxes to the bullet and capsule
+    // BVH in exchange for nothing. The analysis is kept, the cost is not paid.
+    // See the header of SealCracks.js for the diagnosis so far.
+
     const collider = this.proxy.toMesh();
     engine.get('collision').build(collider);
     this.collider = collider;

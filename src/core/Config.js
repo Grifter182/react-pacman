@@ -158,6 +158,25 @@ export const Config = {
     scoreLimit: 75,
     timeLimitSec: 600,
     respawnDelaySec: 4.0,
+    /**
+     * THIS IS THE POPULATION OF THE WHOLE MATCH, BOTH TEAMS, NOT THE OPPOSITION.
+     *
+     * The level is documented as "a 6v6 three-lane market compound", which wants
+     * eleven bots beside the player. At seven, split across two teams, the
+     * player faces three or four opponents spread over three lanes and 5858 m2
+     * of walkable ground — roughly one enemy per lane, and a density several
+     * times thinner than the shooters this is modelled on.
+     *
+     * Measured consequence, standing still for a minute in four places
+     * (tools/enemy-probe.mjs): an enemy is in front of the player and not behind
+     * a wall for 1.7% of the time at their own spawn and 0% in the plaza, while
+     * the closest any opponent came all match was 22.7 m. They are alive, drawn
+     * and busy — 7 deaths a minute among themselves — just never near the player,
+     * which is exactly the "they are like ghosts" that was reported.
+     *
+     * Override with `?bots=N` to measure the effect of population as a single
+     * variable rather than arguing about it.
+     */
     botCount: 7,
   },
 
@@ -234,7 +253,13 @@ export const Config = {
  */
 export function autoDetectQuality(renderer) {
   try {
-    const forced = new URLSearchParams(location.search).get('quality');
+    const q = new URLSearchParams(location.search);
+    // Population override, so `?bots=12` can be measured against `?bots=7`
+    // with nothing else changed. It lives here because this is the one function
+    // guaranteed to run before any module reads Config.
+    const bots = parseInt(q.get('bots') ?? '', 10);
+    if (Number.isFinite(bots) && bots >= 0 && bots <= 24) Config.match.botCount = bots;
+    const forced = q.get('quality');
     if (forced && QualityPresets[forced]) return forced;
   } catch { /* no location in a worker/test context */ }
   try {
