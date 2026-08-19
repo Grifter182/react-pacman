@@ -664,6 +664,36 @@ export const UI_CSS = /* css */`
 .bl-stat .m i { display: block; height: 100%; background: var(--fg-dim); transition: width var(--t-med) var(--ease-out); }
 .bl-gun.on .bl-stat .m i { background: var(--friend); }
 
+/* --- map select ----------------------------------------------------------
+   Same card language as the weapon picker, one column wider apart because a map
+   card carries prose rather than stat bars. Two columns rather than three so the
+   brief stays readable, and one on a phone. */
+.bl-mapgrid { display: grid; grid-template-columns: repeat(2, 1fr); gap: calc(var(--u) * 2); }
+.bl-mapcard {
+  padding: calc(var(--u) * 2); text-align: left; cursor: pointer; border: 1px solid var(--line);
+  background: linear-gradient(180deg, rgba(255,255,255,.035), rgba(255,255,255,.012));
+  transition: border-color var(--t-fast) var(--ease), background var(--t-fast) var(--ease), transform var(--t-fast) var(--ease-out);
+  font-family: var(--font); color: var(--fg); display: flex; flex-direction: column; gap: 4px;
+}
+.bl-mapcard:hover { transform: translateY(-2px); border-color: var(--line-2); }
+.bl-mapcard.on { border-color: var(--friend); background: linear-gradient(180deg, rgba(99,200,255,.14), rgba(99,200,255,.03)); }
+.bl-mapcard .cls { font-size: 9px; letter-spacing: .26em; color: var(--fg-mute); }
+.bl-mapcard .nm { font-size: 21px; letter-spacing: .1em; }
+.bl-mapcard .br { font-size: 11px; line-height: 1.5; color: var(--fg-dim); letter-spacing: .02em; }
+.bl-mapcard .cr { font-size: 8px; letter-spacing: .18em; color: var(--fg-mute); margin-top: 2px; }
+.bl-mapcard .go {
+  margin-top: auto; padding-top: calc(var(--u) * 1.5);
+  font-size: 10px; letter-spacing: .24em; color: var(--fg-mute);
+}
+.bl-mapcard.on .go { color: var(--friend); }
+/* The CC-BY licence asks for its credit sentence to travel with the work, so it
+   is printed in full and not only as the badge on the card. */
+.bl-mapcredit {
+  margin-top: calc(var(--u) * 2); font-size: 9px; line-height: 1.6;
+  color: var(--fg-mute); letter-spacing: .04em; word-break: break-word;
+}
+@media (max-width: 820px) { .bl-mapgrid { grid-template-columns: 1fr; } }
+
 /* End-of-match summary. */
 .bl-sum { text-align: center; }
 .bl-sum .verdict { font-size: clamp(34px, 5vw, 58px); letter-spacing: .28em; text-indent: .28em; line-height: 1; }

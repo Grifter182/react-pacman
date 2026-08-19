@@ -113,6 +113,7 @@ export class Minimap {
     this.ctx = this.canvas.getContext('2d');
     this.rose = this.node.querySelector('.rose b');
     this.uavTag = this.node.querySelector('.uav');
+    this.nameTag = this.node.querySelector('.nm');
 
     this.plan = null;
     this.origin = { x: 0, z: 0, span: 1, scale: 1 };
@@ -255,6 +256,11 @@ export class Minimap {
     // Fixed-capacity ring — a firefight must not grow this array.
     if (this._blips.length > 24) this._blips.shift();
     this._blips.push({ x, z, t: dur, dur, kind });
+  }
+
+  /** The caption under the disc. Set from the registry, not hard-coded. */
+  setName(name) {
+    if (name && this.nameTag) this.nameTag.textContent = name;
   }
 
   setUav(on) {
