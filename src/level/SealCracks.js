@@ -5,50 +5,53 @@ import { Config } from '../core/Config.js';
 /**
  * Wall off the dead cracks between building shells.
  *
- * STATUS: NOT WIRED UP, AND NOT WORKING. LevelModule does not call this. It
- * runs and reports "149 dead cracks, 135.2 m2, 314 boxes, spared 13", but
- * dropping the player into each of the five cracks tools/level-probe.mjs names
- * leaves all five enterable — so it is selecting a set of narrow cells that does
- * not contain the reported ones. Two theories have been tried and both were
- * refuted by measurement rather than by argument: that the fix and the test read
- * different maps (fixed, no effect on the outcome), and that the map perimeter
- * merged into one oversized cluster and was spared by the area guard (disproved
- * — the numbers were identical before and after narrowing that guard, so nothing
- * was ever hitting it). The next step is a direct SET COMPARISON: dump the cell
- * indices this selects and the ones level-probe reports as narrow, and
- * difference them. Every theory so far has been an inference about that
- * difference instead of a measurement of it.
+ * ---------------------------------------------------------------------------
+ * WHY THE PREVIOUS REVISION SEALED 135 m2 AND CHANGED NOTHING
+ * ---------------------------------------------------------------------------
+ * It is the two-maps failure again, one layer further in than the header used
+ * to claim. The file said it had fixed that by building a NavMesh "with the
+ * same parameters AiModule will use" — but AiModule's cell size is
+ * `AI_TIERS[Config.quality].navCell`, which is 0.52 / 0.46 / 0.38 / 0.34 across
+ * the four tiers, and this file hard-coded 0.52. At the tier the probe runs
+ * (low) the two agreed; at any other tier they did not, and the CELL INDICES
+ * this returns were never comparable with the ones the probe reports in any
+ * case, because nothing ever compared them.
  *
- * THE COMPLAINT, MEASURED. A player reported "narrow corridors between buildings
- * that feel like a flaw". tools/level-probe.mjs found 147 m2 of walkable ground
- * at or under 1.5 m wide, in 79 clusters, the narrowest 0.52 m and the worst an
- * 8.3 m long half-metre slot at x 39.5. They are not the level's alleys — the
- * alley here is 7 m wide — they are the seams left where two building shells
- * stand near each other, and walking into one puts the player in a gap that goes
+ * So the instruction is now obeyed literally: `debug` carries the grid this
+ * ran on and the exact cell index sets it classified — `narrowCells`, the
+ * candidates, and `sealedCells`, the ones it filled. LevelModule stashes it on
+ * `level.crackReport`, and a probe can difference those against the cells the
+ * shipped navmesh calls narrow AFTER the fill. That is a measurement of the
+ * difference rather than an inference about it.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT IT NOW MEASURES, AND WHY THAT AND NOT THE AI AGENT'S GRID
+ * ---------------------------------------------------------------------------
+ * The complaint is that the PLAYER walks into slots that go nowhere, so the
+ * agent this reasons about is the player: `Config.player.radius` and a cell
+ * fine enough to resolve a gap the player's 0.68 m of shoulder can enter. The
+ * AI's voxelisation is a per-tier performance knob and is the wrong ruler for a
+ * question about the player's capsule.
+ *
+ * That does mean this grid and the probe's grid are not the same grid — but
+ * they no longer need to be, because what this emits is not a cell, it is a
+ * SOLID: a box in the collision proxy, in world space, which every later
+ * measurement (navmesh at any cell size, capsule sweep, bullet) reads through
+ * the same BVH. The failure mode being avoided was two grids DISAGREEING ABOUT
+ * WHERE; a finer grid that emits real geometry cannot disagree, it can only be
+ * more precise. The direction of any residual error is safe — the fine grid
+ * finds a superset of the coarse grid's slots — and the guards below are what
+ * stop a superset from becoming a mistake.
+ *
+ * ---------------------------------------------------------------------------
+ * THE COMPLAINT, MEASURED
+ * ---------------------------------------------------------------------------
+ * tools/level-probe.mjs found 146 m2 of walkable ground at or under 1.5 m wide,
+ * in 79 clusters, the narrowest 0.52 m and the worst an 8.3 m long half-metre
+ * slot at x 39.5, z -26.5..-18.2. They are not the level's alleys — the alley
+ * here is 7 m wide — they are the seams left where two building shells stand
+ * near each other, and walking into one puts the player in a gap that goes
  * nowhere.
- *
- * ---------------------------------------------------------------------------
- * WHY THIS READS THE NAVMESH INSTEAD OF RASTERISING ITS OWN GRID
- * ---------------------------------------------------------------------------
- * The first attempt at this built its own occupancy grid — 0.26 m cells, a chest
- * band, triangle bounding boxes — and decided from that. It ran, it reported
- * "sealed 135 dead cracks, 153.9 m2, 749 boxes", and it was wrong: the probe
- * still measured 140 m2 of narrow ground (down from 147), and all five of the
- * cracks it names were still enterable. It had sealed 153.9 m2 of somewhere
- * else.
- *
- * The cause was having two maps. That grid and the navmesh disagreed about where
- * narrow space is — different cell size, different notion of solid, and bounding
- * boxes that inflate every yaw-rotated prop — so the fix and the test were
- * measuring different worlds, each self-consistently. It is the same failure
- * that has produced every wrong answer in this project: a sight probe fanning
- * rays at the rear-glass radius while claiming to test the front element, an
- * aperture test cast from an eye position no player has.
- *
- * So there is now exactly one map. This builds a NavMesh with the same
- * parameters AiModule will use, and the crack analysis marches over its ground
- * nodes with the same rule level-probe.mjs uses to measure them. The fix cannot
- * drift from its test, because they read the same structure.
  *
  * ---------------------------------------------------------------------------
  * WHY IT IS NOT SIMPLY "CLOSE EVERY NARROW GAP"
@@ -70,10 +73,15 @@ import { Config } from '../core/Config.js';
  * both ends, the exact case the first attempt let through. Anything larger than
  * `maxArea` is spared regardless, so a genuine room can never be walled off
  * silently, and every spared cluster is reported with its reason.
+ *
+ * The acceptance test is two-sided and both sides matter: narrow area must fall
+ * well below 146 m2 AND the ground area must not move. A drop in ground area is
+ * this function walling the player out of the interiors, which is a worse bug
+ * than the one it fixes.
  */
 
 /** Ground cells at or under this width are candidates. */
-const NARROW_M = 1.25;
+const NARROW_M = 1.10;
 /** A narrow run longer than this is a passage, not an opening in a wall. */
 const MAX_OPENING_RUN = 1.6;
 /** Never seal a cul-de-sac bigger than this: it is a room, not a crack. */
@@ -85,19 +93,22 @@ export function sealDeadCracks(proxy, bounds, opts = {}) {
 
   // Same agent as AiModule builds for, so "walkable" means the same thing here
   // as it will at runtime and in the probe.
+  const cell = opts.cell ?? 0.34;
   const nav = new NavMesh({
-    cell: opts.cell ?? 0.52,
-    agentRadius: (Config.player.radius ?? 0.34) + 0.08,
-    agentHeight: 1.72,
+    cell,
+    // The player's own capsule, not the AI agent's inflated one: this is a
+    // question about where the player's shoulders fit.
+    agentRadius: (Config.player.radius ?? 0.34) + 0.04,
+    agentHeight: Config.player.height ?? 1.75,
     stepHeight: Config.player.stepHeight,
-    maxSlopeDeg: Config.player.maxSlopeDeg + 2,
+    maxSlopeDeg: Config.player.maxSlopeDeg,
   });
   const bb = bounds || new THREE.Box3().setFromBufferAttribute(mesh.geometry.getAttribute('position'));
   nav.build(mesh.geometry, bb);
   mesh.geometry.dispose();
   if (!nav.ready) return { sealed: 0, sealedAreaM2: 0, boxes: 0, spared: [], note: 'navmesh not ready' };
 
-  const { gw, gd, cell, minX, minZ, cellFirst, cellCount, nodeY, nodeFlags } = nav;
+  const { gw, gd, minX, minZ, cellFirst, cellCount, nodeY, nodeFlags } = nav;
   const cells = gw * gd;
 
   /* --- 1. the ground surface of each column ------------------------------ */
@@ -227,13 +238,30 @@ export function sealDeadCracks(proxy, bounds, opts = {}) {
     }
   }
 
+  // The set comparison the diagnosis asked for. These are cell indices on the
+  // grid described by `debug.grid`; `x = minX + (i % gw) * cell` recovers the
+  // world position of any of them, which is what makes them differenceable
+  // against a probe reading a grid of a different pitch.
+  const narrowCells = [];
+  const sealedCells2 = [];
+  for (let c = 0; c < cells; c++) {
+    if (narrow[c]) narrowCells.push(c);
+    if (fill[c]) sealedCells2.push(c);
+  }
+
   return {
     sealed: sealedClusters,
     sealedAreaM2: +(sealedCells * cell * cell).toFixed(1),
+    narrowAreaM2: +(narrowCells.length * cell * cell).toFixed(1),
     boxes,
     wideRegions: regions,
     sparedCount: spared.length,
     spared: spared.sort((a, b) => b.areaM2 - a.areaM2).slice(0, 10),
     ms: +(performance.now() - t0).toFixed(0),
+    debug: {
+      grid: { gw, gd, cell, minX, minZ },
+      narrowCells: Int32Array.from(narrowCells),
+      sealedCells: Int32Array.from(sealedCells2),
+    },
   };
 }

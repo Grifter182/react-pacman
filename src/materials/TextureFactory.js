@@ -265,6 +265,90 @@ function tiled(tex, repeat) {
   return t;
 }
 
+/* ------------------------------------------------------------------ paint */
+
+/**
+ * A MATERIAL COLOUR IS A MULTIPLY, AND A MULTIPLY IS NOT A PAINT.
+ *
+ * `material.color` scales the sampled albedo. That is fine for lifting or
+ * knocking back a light, near-neutral surface — which is what the ground decals
+ * and the two plaster tones were written to do — and it is useless for putting
+ * a colour ON something, because a product can only ever move toward the
+ * intersection of two spectra and downward in value. Measured on this tree:
+ * `M.shutter` asks for "faded teal joinery" as wood x 0x4d6f74 and the product
+ * is linear (0.012, 0.014, 0.007) — a 1.4%-reflectance near-black, no teal in
+ * it at all. `M.signage` (metal x 0x2f6f86) and `M.rug` (canvas x 0x8e3b34) are
+ * the same arithmetic. Every accent the level asked for was being multiplied
+ * into the dark.
+ *
+ * So for recipes that declare `paintable: true` — the ones that model a coating
+ * over a substrate — a caller's colour is routed into the BAKE as the coat
+ * colour and the multiply is dropped. The recipe lays the colour down as paint,
+ * limewash, dye or glaze, keeping its own chipping, fading and grime masks; the
+ * caller gets the colour it asked for without changing a line.
+ *
+ * Non-paintable recipes are untouched and keep the multiply. That distinction
+ * is deliberate, not an oversight: the ground decals are documented as shallow
+ * multiplies over asphalt/gravel/sand and re-baking them as painted ground
+ * would put four solid-colour rugs on the street.
+ *
+ * An explicit `opts.paint` always wins, and `opts.tintMode: 'multiply'` opts a
+ * call site back out.
+ *
+ * WHERE THE LINE IS. Auto-routing every tint would be wrong, and the reason is
+ * the diagnosis itself: a multiply is a legitimate VALUE adjustment and an
+ * illegitimate CHROMA one. Knocking a light near-neutral surface up or down —
+ * `M.plasterPale` at 0xd8d2c2, `M.ironwork` at 0x5a5550, the viewmodel sleeve
+ * at a grey-olive — is what a multiply is for and it works. Asking one to carry
+ * a teal, a signal blue or a madder red is what does not, and those are exactly
+ * the tints with saturation in them.
+ *
+ * So the switch is the TINT's saturation, not the caller's identity. Below the
+ * threshold nothing changes anywhere in the game, including on surfaces owned
+ * by other agents — the viewmodel arms tint at saturation 0.10 and keep the
+ * multiply they were tuned with. Above it, the call site was asking for a
+ * colour it could not have been getting.
+ *
+ * WHAT IT COSTS, because it is not free and should not arrive as a surprise.
+ * A tint is one extra material sharing one bake; a paint is a SEPARATE BAKE,
+ * because the colour is in the bytes. On this level that is seven new surface
+ * sets — shutter, signage, awning, awningRed, rug, sack, plasterWarm — at three
+ * 512-square textures each, so about 22 MB of texture memory and seven more
+ * bakes for the scheduler to trickle. Frame time is unaffected (the scheduler
+ * still slices to ~1 ms and the bakes are one-time), and the count is visible
+ * in the harness manifest's `textures` field if it needs watching. Callers that
+ * want the accent cheaper should ask for a smaller `size` on the cloth: an
+ * awning at 5-30 m has no use for 512 and the recipe's floor is 256.
+ */
+const PAINT_MIN_SAT = 0.22;
+
+function splitPaint(recipe, opts) {
+  const explicit = opts.paint;
+  const wantsMultiply = opts.tintMode === 'multiply';
+  if (!recipe.paintable || wantsMultiply) return { paint: explicit ?? null, material: opts.material };
+  if (explicit != null) return { paint: explicit, material: opts.material };
+
+  const col = opts.material?.color;
+  if (col == null) return { paint: null, material: opts.material };
+
+  // THREE.Color stores in the working (linear) space however it was built, and
+  // `getHex()` encodes back to sRGB — which is the space `paintOf` reads. That
+  // round-trip is exact for the `new THREE.Color(0x…)` form the call sites use
+  // and correct for the float form Arms.js uses.
+  const hex = col.isColor ? col.getHex() : (typeof col === 'number' ? col : null);
+  if (hex == null) return { paint: null, material: opts.material };
+
+  const r = ((hex >> 16) & 255) / 255, g = ((hex >> 8) & 255) / 255, b = (hex & 255) / 255;
+  const mx = Math.max(r, g, b);
+  const sat = mx > 1e-4 ? (mx - Math.min(r, g, b)) / mx : 0;
+  if (sat < PAINT_MIN_SAT) return { paint: null, material: opts.material };
+
+  // Strip the colour out of the material overrides so it is not applied twice.
+  const rest = Object.assign({}, opts.material);
+  delete rest.color;
+  return { paint: hex, material: rest };
+}
+
 /* --------------------------------------------------------------- material */
 
 /**
@@ -290,6 +374,14 @@ function tiled(tex, repeat) {
  *   envMapIntensity
  *   material    raw property overrides applied last
  *   recipe      recipe-specific parameters (e.g. asphalt_line's lineWidth)
+ *   paint       coat colour for a `paintable` recipe, as an sRGB hex or an
+ *               [r,g,b] triple in 0..1. Baked in as the paint / limewash / dye
+ *               / glaze, NOT multiplied over the albedo — a multiply cannot put
+ *               a colour on a dark surface, it can only darken it further. See
+ *               splitPaint above. `material.color` on a paintable recipe is
+ *               routed here automatically.
+ *   tintMode    'multiply' to opt a paintable recipe back out and keep the old
+ *               material-colour multiply.
  */
 export function makeMaterial(preset, opts = {}) {
   const key = `${preset}:${JSON.stringify(opts)}:${Config.quality}`;
@@ -309,7 +401,13 @@ export function makeMaterial(preset, opts = {}) {
   // before the bake, not after.
   const worldScale = opts.worldScale ?? recipe.worldScale ?? 2;
 
-  const set = getSurfaceSet(id, recipe, size, seed, worldScale, opts.recipe);
+  // Coat colour goes into the bake, not onto the material — see splitPaint.
+  const { paint, material: materialOverrides } = splitPaint(recipe, opts);
+  const recipeOpts = paint != null
+    ? Object.assign({}, opts.recipe, { paint })
+    : opts.recipe;
+
+  const set = getSurfaceSet(id, recipe, size, seed, worldScale, recipeOpts);
 
   const props = {
     map: tiled(set.map, repeat),
@@ -329,7 +427,7 @@ export function makeMaterial(preset, opts = {}) {
   props.metalnessMap = props.aoMap;
 
   const Klass = recipe.klass === 'physical' ? THREE.MeshPhysicalMaterial : THREE.MeshStandardMaterial;
-  const mat = new Klass(Object.assign(props, recipe.props || {}, opts.material || {}));
+  const mat = new Klass(Object.assign(props, recipe.props || {}, materialOverrides || {}));
 
   if (shaderOk) {
     const detail = opts.detail === false ? null : (opts.detail ?? recipe.detail);
@@ -392,7 +490,11 @@ export function getMaterialCatalog() {
       triplanar: !!r.triplanar,
       worldScale: r.worldScale ?? 2,
       minSize: r.minSize ?? 256,
-      transparent: r.klass === 'physical',
+      // `physical` is a shading model, not an opacity: car_paint is a
+      // MeshPhysicalMaterial for its clearcoat lobe and is entirely opaque.
+      // Report what the recipe actually sets.
+      transparent: !!(r.props && (r.props.transparent || r.props.opacity < 1)),
+      paintable: !!r.paintable,
       aliases: Object.keys(ALIASES).filter((a) => ALIASES[a] === id),
     });
   }

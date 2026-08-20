@@ -23,12 +23,24 @@ import * as THREE from 'three';
  *     than reposition laterally.
  *   - Losing sight of you does not reset the bot. It searches the last known
  *     position, then the places you could have gone from it.
+ *
+ * And the rule that stops them being ghosts, which is the newer problem:
+ *
+ *   - Out of contact a bot does not wander. It goes to the place the squad has
+ *     looked at least recently (SquadIntel coverage), or to a decaying report
+ *     of contact if there is one (SquadIntel marks). Neither channel is told
+ *     where the player is; the first is pure map coverage and the second is a
+ *     rumour with a half-life. Together they are why a fight starts at all.
+ *   - Only a bounded number of the squad have permission to shoot the player at
+ *     once (`a.mayFire`, set by AiModule). The rest keep manoeuvring. Finding
+ *     the player more often must not mean being shot by seven rifles at once.
  */
 
 export const Tactic = {
   IDLE: 'idle',
   PATROL: 'patrol',
   SUSPICIOUS: 'suspicious',
+  ADVANCE: 'advance',
   SEARCH: 'search',
   ENGAGE: 'engage',
   TAKE_COVER: 'takeCover',
@@ -55,6 +67,10 @@ export function createBrain() {
     entered: true,
     searchOrigin: new THREE.Vector3(),
     patrolTarget: null,
+    sweepGoal: null,     // coverage cell this bot owes a visit to
+    mark: null,          // SquadIntel contact this bot is walking to, if any
+    markTimer: 0,
+    blindUntil: 0,       // sweepers ignore unseen contacts until this time
     goal: new THREE.Vector3(),
     hasGoal: false,
     wantFire: false,
@@ -112,6 +128,10 @@ export class Brain {
       ctx.cover.release(a.cover, a.id);
       a.cover = null;
     }
+    // A bot that stops patrolling is no longer going where it said it would.
+    // Handing the claim back is what stops one interrupted sweep leg marking a
+    // corner of the map as covered for the rest of the match.
+    if (b.tactic === Tactic.PATROL && tactic !== Tactic.PATROL) ctx.intel?.release(a.id);
     b.tactic = tactic;
     b.since = 0;
     // Consumed by whichever state wants one-shot entry logic. `since` cannot
@@ -126,8 +146,31 @@ export class Brain {
 
   _relaxed(dt, a) {
     const b = a.brain;
+    const ctx = this.ctx;
     b.crouch = false;
     b.wantFire = false;
+
+    // A live contact anywhere the squad knows about outranks routine patrol.
+    // This is the whole reason the two sides meet: one bot seeing something,
+    // one bot going down, one loud shot, and the rest of the squad has a place
+    // to be. The mark decays (SquadIntel, ~6 s half-life) so this pull fades
+    // on its own if nothing further happens.
+    if (b.tactic !== Tactic.ADVANCE && a.role !== 'sweep') {
+      b.markTimer -= dt;
+      if (b.markTimer <= 0) {
+        b.markTimer = 1.1 + Math.random() * 0.8;
+        const m = ctx.intel?.best(a.position, ctx.time, { minHeat: 0.22, maxDist: 95, maxClaims: 4 });
+        if (m) {
+          ctx.intel.claim(m, ctx.time);
+          b.mark = m;
+          this._set(a, Tactic.ADVANCE);
+          ctx.requestPath(a, m.pos, 'advance');
+          b.timer = 0;
+        }
+      }
+    }
+
+    if (b.tactic === Tactic.ADVANCE) { this._advance(dt, a); return; }
 
     if (b.tactic !== Tactic.PATROL && b.tactic !== Tactic.IDLE) this._set(a, Tactic.PATROL);
 
@@ -142,27 +185,84 @@ export class Brain {
       return;
     }
 
-    // PATROL: walk the navmesh between distant points, pausing at some of them.
-    // Arrival is checked before a new leg is requested — the request clears
-    // `pathDone`, so testing it afterwards would never see the arrival.
-    b.desiredSpeed = 2.1;
+    // PATROL: cover ground. The old rule picked a waypoint uniformly at random
+    // about 26 m off, which is a random walk — measured, a bot's expected
+    // displacement over a 60 s window was under 40 m on a map 85 m deep, so the
+    // half of the level the player was standing in simply never got visited.
+    // Now the destination is the *stalest* place the squad can reach, and the
+    // long pauses are gone: patrol is a job, not a stroll.
+    b.desiredSpeed = 3.6;
     if (a.pathDone && a.path) {
       a.path = null;
-      if (Math.random() < 0.45) { this._set(a, Tactic.IDLE); b.timer = 1.5 + Math.random() * 4; return; }
+      if (Math.random() < 0.12) { this._set(a, Tactic.IDLE); b.timer = 0.7 + Math.random() * 1.8; return; }
     }
     if (!a.path || a.pathDone) {
-      const dest = this._patrolPoint(a);
-      if (dest) this.ctx.requestPath(a, dest, 'patrol');
-      else b.timer = 1;
+      // If the last sweep leg was interrupted (shot at, pulled into a search)
+      // and that ground is still unwatched, finish it. Re-deciding from scratch
+      // every time is how the frontier stopped moving: the squad kept picking
+      // the nearest stale cell to wherever the last interruption left it.
+      let dest = null;
+      if (b.sweepGoal && ctx.intel && (a.pathFails || 0) < 2
+          && ctx.intel.ageAt(b.sweepGoal, ctx.time) > 25
+          && a.position.distanceTo(b.sweepGoal) > 7) {
+        dest = b.sweepGoal;
+      } else {
+        b.sweepGoal = null;
+        dest = this._patrolPoint(a);
+        if (dest && ctx.intel) b.sweepGoal = dest.clone();
+      }
+      // A rejected leg must give the ground back, or the coverage map records
+      // where the squad *meant* to go instead of where it has been.
+      if (!dest || !ctx.requestPath(a, dest, 'patrol')) {
+        if (dest) ctx.intel?.unpledge(dest);
+        b.sweepGoal = null;
+        b.timer = 1;
+      }
     }
     this._lookAlongMotion(a);
   }
 
+  /**
+   * Walk to a reported contact and look at it. Nothing here knows where the
+   * player is: the destination is a decaying *place*, and on arrival the mark
+   * is cooled so an empty room stops attracting the rest of the squad. A player
+   * who broke line of sight and left is not followed — they are missed, at the
+   * spot they were last relevant.
+   */
+  _advance(dt, a) {
+    const b = a.brain;
+    const ctx = this.ctx;
+    const m = b.mark;
+    if (!m || ctx.intel?.heat(m, ctx.time) < 0.12) { b.mark = null; this._set(a, Tactic.PATROL); return; }
+
+    b.desiredSpeed = 4.3;
+    b.aimPoint.copy(m.pos).setY(m.pos.y + 0.7);
+    this._lookAlongMotion(a, 0.65);
+
+    // `pathDone`, not `!path`: requestPath clears pathDone the moment the leg is
+    // asked for, and a failed A* sets it again — so this one flag covers
+    // arrival, an unreachable mark, and a search that never got served.
+    const near = a.position.distanceTo(m.pos) < 6;
+    if (near || a.pathDone || b.since > 22) {
+      if (near) ctx.intel.clear(m, ctx.time);
+      b.mark = null;
+      b.markTimer = 3.5 + Math.random() * 3;   // do not immediately re-latch
+      this._set(a, Tactic.PATROL);
+    }
+  }
+
+  /**
+   * Where to look next. Coverage first — SquadIntel hands back the position of
+   * a real navmesh node in the main region, so "worth visiting" and "reachable"
+   * are the same structure and a patrol leg cannot be issued to a ledge no bot
+   * can path onto. The authored waypoint list is the fallback for a level that
+   * publishes no navmesh coverage, and random sampling behind that.
+   */
   _patrolPoint(a) {
     const ctx = this.ctx;
-    // Authored waypoints when the level offers them — they follow the lanes and
-    // read as patrolling; navmesh sampling as the fallback so this still works
-    // on a level that publishes none.
+    const sweep = ctx.intel?.stalest(a.position, ctx.time, a.id);
+    if (sweep) return sweep;
+
     const wps = ctx.level?.navPoints;
     if (wps && wps.length) {
       let best = null, bestScore = -Infinity;
@@ -188,6 +288,38 @@ export class Brain {
 
     const known = p.lastKnown;
     const dist = a.position.distanceTo(known);
+
+    // A bot on sweep duty that has not actually SEEN anything does not go
+    // hunting a bearing: it turns, looks, and gets back to walking the map.
+    // Measured, the five-leg room-clear was consuming most of the squad's time
+    // on contacts that could never resolve — the shooter was a friendly
+    // operator sim with no body in the world — and while it ran, nobody was
+    // covering ground. Seeing something still triggers the full search.
+    const blind = this.ctx.time - p.lastSeen > 12;
+    if (a.role === 'sweep' && blind) {
+      // Already looked recently: keep sweeping. Without this cooldown a sweeper
+      // under sustained fire from an unseen shooter oscillates between patrol
+      // and a standing stare forever — measured, one sat 28.9 m from the player
+      // for thirty seconds doing exactly that, which is also why it never got
+      // inside the 25 m the acceptance probe counts.
+      if (this.ctx.time < (b.blindUntil || 0)) {
+        p.alert = 0; p.lastHeard = -999;
+        this._relaxed(dt, a);
+        return;
+      }
+      if (b.tactic !== Tactic.SUSPICIOUS) { this._set(a, Tactic.SUSPICIOUS); b.timer = 1.3 + Math.random(); }
+      // Looking, not stopping: a bot that plants itself is a bot that is not
+      // covering ground.
+      b.desiredSpeed = 1.8;
+      b.aimPoint.copy(known).setY(known.y + 0.6);
+      b.timer -= dt;
+      if (b.timer <= 0) {
+        p.alert = 0; p.lastHeard = -999;
+        b.blindUntil = this.ctx.time + 13 + Math.random() * 6;
+        this._set(a, Tactic.PATROL);
+      }
+      return;
+    }
 
     if (b.tactic !== Tactic.SUSPICIOUS && b.tactic !== Tactic.SEARCH) {
       // A contact that never resolved: face it first, then go and look.
@@ -224,11 +356,20 @@ export class Brain {
       b.searchStep++;
       const snapped = this.ctx.nav.randomPoint(Math.random, dest, 6) || dest;
       this.ctx.requestPath(a, snapped, 'search');
-      if (b.searchStep > 5) {
+      // A bot that actually saw something clears the room properly. One that
+      // only took a round from an unseen bearing gives it two looks and gets
+      // back to work — measured, the five-step sweep was eating most of the
+      // squad's time on contacts that were never resolvable.
+      if (b.searchStep > (blind ? 2 : 5)) {
         // Given up: drop back to patrol from wherever the search ended.
         a.percept.alert = 0;
         a.percept.lastSeen = -999;
         a.percept.lastHeard = -999;
+        // Searched and found nothing: cool whatever report sent the squad here,
+        // so the rest of them stop converging on an empty room.
+        const stale = this.ctx.intel?.best(b.searchOrigin, this.ctx.time, { minHeat: 0.05, maxDist: 14, maxClaims: 99 });
+        if (stale) this.ctx.intel.clear(stale, this.ctx.time);
+        b.markTimer = 4;
         this._set(a, Tactic.PATROL);
       }
     }
@@ -294,7 +435,7 @@ export class Brain {
     b.crouch = false;
     // Suppressive fire while moving, at a heavy accuracy penalty (the combat
     // system's aim error is already wide because contact keeps breaking).
-    b.wantFire = a.percept.spotted && Math.random() < 0.35;
+    b.wantFire = a.percept.spotted && a.mayFire !== false && Math.random() < 0.35;
 
     if (a.cover && a.position.distanceTo(a.cover.pos) < 1.1) {
       this._set(a, Tactic.ENGAGE);
@@ -320,7 +461,7 @@ export class Brain {
       b.desiredSpeed = 1.6;
       b.strafe = Math.sin(ctx.time * 1.3 + a.id) * 0.8;
       b.crouch = dist > 24;
-      b.wantFire = a.percept.spotted;
+      b.wantFire = a.percept.spotted && a.mayFire !== false;
       if (b.coverTime > 3.5) this._set(a, Tactic.TAKE_COVER);
       return;
     }
@@ -354,11 +495,19 @@ export class Brain {
     b.desiredSpeed = 2.6;
     // Behind cover the bot crouches when the cover is low; peeking stands it up.
     b.crouch = a.cover.crouch && !b.peekOut;
-    b.wantFire = b.peekOut && a.percept.spotted;
+    b.wantFire = b.peekOut && a.percept.spotted && a.mayFire !== false;
 
     if (!a.percept.spotted && ctx.time - a.percept.lastSeen > 1.4) {
       // Lost them from cover: pin the position rather than charging it.
       this._set(a, Math.random() < 0.55 ? Tactic.SUPPRESS : Tactic.FLANK);
+      return;
+    }
+
+    // No permission to shoot: do something useful with the time rather than
+    // stand in cover miming a firefight. This is what turns a capped squad into
+    // an encircling one instead of a queue.
+    if (a.mayFire === false && a.percept.spotted && b.coverTime > 1.3) {
+      this._set(a, Math.random() < 0.65 ? Tactic.FLANK : Tactic.REPOSITION);
       return;
     }
 
@@ -382,7 +531,7 @@ export class Brain {
     const ctx = this.ctx;
     b.desiredSpeed = 0;
     b.crouch = !!(a.cover && a.cover.crouch) && Math.random() < 0.5;
-    b.wantFire = true;
+    b.wantFire = a.mayFire !== false;
     b.aimPoint.copy(a.percept.lastKnown);
     b.aimPoint.y += 0.55 + Math.sin(ctx.time * 3 + a.id) * 0.25;
     if (a.cover) { b.goal.copy(a.cover.pos); b.hasGoal = true; }
@@ -419,7 +568,7 @@ export class Brain {
     b.desiredSpeed = 5.4;
     b.crouch = false;
     // Flanking bots hold fire — the whole point is not to announce the move.
-    b.wantFire = a.percept.spotted && dist < 9;
+    b.wantFire = a.percept.spotted && a.mayFire !== false && dist < 9;
     if (b.since > 9) this._set(a, Tactic.TAKE_COVER);
   }
 
@@ -453,7 +602,7 @@ export class Brain {
   _retreat(dt, a, dist) {
     const b = a.brain;
     const ctx = this.ctx;
-    b.wantFire = a.percept.spotted && dist < 12 && Math.random() < 0.25;
+    b.wantFire = a.percept.spotted && a.mayFire !== false && dist < 12 && Math.random() < 0.25;
     b.desiredSpeed = 5.6;
     b.crouch = false;
 

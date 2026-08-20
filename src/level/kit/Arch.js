@@ -418,19 +418,55 @@ export function roof(kit, o) {
   // resolving. Top-face-only turns 640 triangles a roof into 330.
   b.at(cx, y - th / 2, cz).box(w + 0.34, th, d + 0.34, 0.05, 3.2, FACE_TOP);
 
-  if (o.parapet !== 0) {
+  /**
+   * KERB SIDES — a roofline that is still a roofline, and still walkable.
+   *
+   * `sides` used to be the only control: a run was either a 1.05 m parapet
+   * (which stops the agent dead — it is well over the 0.46 m the navmesh will
+   * step and the 0.42 m the player will) or nothing at all. Every roof-to-roof
+   * link on this map therefore cost a whole elevation's worth of skyline, and
+   * this compound is mostly abutting blocks: two roofs of equal height sharing
+   * a boundary are joined by simply not building a wall on it.
+   *
+   * `kerbSides` is the middle term. A 340 mm upstand with its own coping reads
+   * as a roof edge from the street — the value step is still there and so is
+   * the shadow line — but at 340 mm over the deck it is UNDER both step heights, so the surface either
+   * side of it is one connected walkable region. Anywhere this level joins two
+   * roofs, or lands a bridge on one, it uses a kerb rather than a gap.
+   */
+  const kerbSides = o.kerbSides ?? '';
+  const kerbH = o.kerbHeight ?? 0.28;
+
+  if (o.parapet !== 0 || kerbSides) {
     const ph = o.parapet ?? SCALE.parapet;
     const pt = 0.26;
     const tb = batch.at(trim, cx, cz);
     // `sides` omits a run where a stair landing or a plank bridge arrives —
     // a roof you can reach but not step onto is worse than no roof at all.
     const cb = batch.at(cap, cx, cz);
-    const sides = o.sides ?? 'nsew';
+    let sides = o.parapet === 0 ? '' : (o.sides ?? 'nsew');
+    for (const k of kerbSides) sides = sides.split(k).join('');
+    const runOf = { s: [x0, z0, x1, z0], n: [x0, z1, x1, z1], w: [x0, z0, x0, z1], e: [x1, z0, x1, z1] };
+    for (const k of kerbSides) {
+      const r = runOf[k];
+      if (!r) continue;
+      const f = wallFrame(r[0], r[1], r[2], r[3], y);
+      tb.frame(f.m);
+      cb.frame(f.m);
+      tb.at(0, kerbH / 2, 0).box(f.len, kerbH, pt, 0, 0, FACE_ALL, FACE_NY);
+      cb.at(0, kerbH + 0.03, 0).box(f.len, 0.06, pt + 0.10, 0.02, 0);
+      tb.clearFrame();
+      cb.clearFrame();
+      if (o.collide !== false) {
+        localToWorld(f.m, 0, (kerbH + 0.06) / 2, 0, _v);
+        proxy.box(_v.x, _v.y, _v.z, f.len, kerbH + 0.06, pt, f.yaw);
+      }
+    }
     const rails = [];
-    if (sides.includes('s')) rails.push([x0, z0, x1, z0]);
-    if (sides.includes('n')) rails.push([x0, z1, x1, z1]);
-    if (sides.includes('w')) rails.push([x0, z0, x0, z1]);
-    if (sides.includes('e')) rails.push([x1, z0, x1, z1]);
+    if (sides.includes('s')) rails.push(runOf.s);
+    if (sides.includes('n')) rails.push(runOf.n);
+    if (sides.includes('w')) rails.push(runOf.w);
+    if (sides.includes('e')) rails.push(runOf.e);
     // Bay rhythm. A parapet run at one height is the reason a modular kit has a
     // skyline that changes value exactly twice across a frame: two roofs, two
     // steps. Breaking each run into ~3.4 m bays at three different heights, with
@@ -924,7 +960,7 @@ export function building(kit, o) {
     x0: x0 + 0.04, z0: z0 + 0.04, x1: x1 - 0.04, z1: z1 - 0.04,
     y: H, bucket: o.roofBucket || 'concrete', trim,
     capBucket: o.capBucket || 'rooflinePale',
-    parapet: o.parapet, sides: o.parapetSides, thickness: 0.28,
+    parapet: o.parapet, sides: o.parapetSides, kerbSides: o.kerbSides, thickness: 0.28,
     parapetVary: o.parapetVary ?? 1, seed: o.seed,
     collide: true,
   });

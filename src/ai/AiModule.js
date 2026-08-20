@@ -7,7 +7,11 @@ import { CombatSystem, createCombat, DIFFICULTY, rayCapsule } from './Combat.js'
 import { Brain, createBrain, Tactic } from './Brain.js';
 import { soldierAsset, createSoldierInstance, disposeSoldierAsset, HITBOXES, MUZZLE_LOCAL } from './Soldier.js';
 import { Locomotion } from './Locomotion.js';
+import { SquadIntel } from './Intel.js';
 import { Ragdoll } from './Ragdoll.js';
+
+/** The only AI team that exists today. See _spawnBot. */
+const TEAM_HOSTILE = 1;
 
 /**
  * OWNER: AI agent.
@@ -16,6 +20,7 @@ import { Ragdoll } from './Ragdoll.js';
  *
  *   NavMesh.js     voxelised navmesh from the collider + A* + funnel
  *   Cover.js       cover points harvested from the navmesh
+ *   Intel.js       shared squad coverage map + decaying contact reports
  *   Perception.js  FOV cone, hearing, visibility accumulator, memory
  *   Brain.js       posture/tactic HFSM
  *   Combat.js      reaction time, convergent aim, bursts, suppression, grenades
@@ -37,6 +42,9 @@ const AI_TIERS = {
   [QualityTier.HIGH]: { navCell: 0.38, footIK: true, ragdolls: 4, tracers: 32, detail: 2, perceptionHz: 10 },
   [QualityTier.ULTRA]: { navCell: 0.34, footIK: true, ragdolls: 6, tracers: 32, detail: 2, perceptionHz: 12 },
 };
+
+/** Closest a hostile may reappear to the player, in metres. Fairness floor. */
+const MIN_SPAWN_DIST = 26;
 
 const CAPSULE_HALF = 0.87;
 const CAPSULE_RADIUS = 0.34;
@@ -75,10 +83,15 @@ export class AiModule {
       this.nav.build(collider.geometry, bounds);
     }
     this.cover = new CoverMap().build(this.nav);
+    // The squad's shared head: where nobody has looked lately, and where
+    // something recently happened. See Intel.js for why this exists.
+    this.intel = new SquadIntel().build(this.nav);
     const ns = this.nav.stats();
+    const is = this.intel.stats(0);
     console.info('[AI] navmesh', `${ns.usable}/${ns.surfaces} surfaces,`,
       `${ns.regions} regions, cell ${ns.cell.toFixed(2)}m,`,
-      `${ns.buildMs.toFixed(0)}ms · cover ${this.cover.points.length} points`);
+      `${ns.buildMs.toFixed(0)}ms · cover ${this.cover.points.length} points`,
+      `· intel ${is.cells} sweep cells / ${is.areaM2}m2`);
 
     /* --- systems ----------------------------------------------------------- */
     this.perception = new Perception();
@@ -87,6 +100,7 @@ export class AiModule {
       nav: this.nav, cover: this.cover, perception: this.perception,
       combat: this.combat, collision: this.collision, level: this.level,
       player: engine.get('player'), engine, time: 0, actors: this.actors,
+      intel: this.intel,
       requestPath: (a, dest, reason) => this._requestPath(a, dest, reason),
     });
 
@@ -103,13 +117,38 @@ export class AiModule {
     engine.bus.on('fx:explosion', (e) => this._noise(e.position, 90));
     engine.bus.on('player:died', () => { for (const a of this.actors) a.percept.alert *= 0.4; });
 
+    /* --- what the squad gets to know -------------------------------------- *
+     * Every one of these is an event that really happened in the world, and
+     * every one of them decays (Intel.js, ~6 s half-life, dropped near 25 s).
+     * None of them is the player's live position: a mark is a place that was
+     * interesting a moment ago, which is exactly what a player can walk away
+     * from. Breaking line of sight and leaving still works.                   */
+    engine.bus.on('weapon:fire', (e) => {
+      // The player's own rifle. It is the loudest thing on the map and the AI
+      // already hears it at 62 m; this is the same information, shared.
+      this.intel.report(e.eyeOrigin || e.origin, 1.0, 'gunfire', this._time);
+    });
+    engine.bus.on('fx:explosion', (e) => this.intel.report(e.position, 1.25, 'blast', this._time));
+    engine.bus.on('ai:spotted', (e) => this.intel.report(e.position, 1.3, 'sight', this._time));
+
     engine.ai = this;
   }
 
   /* ------------------------------------------------------------------ spawn */
 
   _spawnBot(engine, i) {
-    const inst = createSoldierInstance(this.asset);
+    // Pass the team through rather than taking the default. Soldier.js supports
+    // per-team tinting (ALPHA light sand + cyan, BRAVO dark olive + red) and
+    // asks for this explicitly in its header.
+    //
+    // NOTE, so this is not mistaken for a fix it is not: every actor is still
+    // created with `team: 1` below, so today this changes nothing on screen.
+    // There is no second AI team, and adding one is NOT a matter of assigning
+    // team 0 to half the roster: `team` appears nowhere in Combat.js, Brain.js,
+    // Perception.js or Intel.js, and bots only ever perceive and target
+    // `player.state`. There is no bot-vs-bot targeting to switch on. Friendly AI
+    // is a feature, and it needs written, not toggled.
+    const inst = createSoldierInstance(this.asset, TEAM_HOSTILE);
     this.root.add(inst.rig);
     this.root.add(inst.mesh);
 
@@ -145,6 +184,13 @@ export class AiModule {
       fireTimer: 0,
       respawnTimer: 0,
       lastDamaged: -99,
+      mayFire: true,                 // fire-director permission; see _director()
+      pathCooldown: 0,
+      pathRejects: 0,
+      pathFails: 0,
+      _stuckFor: 0,
+      _stuckStrikes: 0,
+      role: 'sweep',                 // 'sweep' | 'react'; see _assignRoles()
 
       percept: Perception.create(),
       combat: createCombat(skill),
@@ -177,6 +223,15 @@ export class AiModule {
 
     const perceptStep = 1 / this.tier.perceptionHz;
 
+    // Squad bookkeeping: cold marks are dropped, and the fire director decides
+    // how many rifles are allowed on the player right now.
+    this._intelTimer = (this._intelTimer || 0) - dt;
+    if (this._intelTimer <= 0) {
+      this._intelTimer = 0.25;
+      this.intel.decay(this._time);
+      this._director(player);
+    }
+
     for (const a of this.actors) {
       if (!a.alive) {
         a.respawnTimer -= dt;
@@ -194,8 +249,21 @@ export class AiModule {
           collision: this.collision, time: this._time, eye: a._eye,
         });
         a.alert = a.percept.alert;
+        // A bot standing somewhere with its eyes open is the squad having
+        // looked there. This is the only writer of coverage freshness, so
+        // "where nobody has been" is measured, not guessed.
+        this.intel.visit(a.position, this._time);
         if (a.percept.justSpotted) {
           engine.bus.emit('ai:spotted', { actor: a, position: player.state.position.clone() });
+        }
+        // Sustained contact is called in, not just the first glimpse. One bot
+        // with eyes on is what turns a sighting into a fight the rest of the
+        // squad can join — and the instant it loses sight the reports stop and
+        // the mark starts cooling, which is the whole point: this follows the
+        // bot's line of sight, never the player.
+        if (a.percept.spotted && this._time - (a._reportedSight || -99) > 1.4) {
+          a._reportedSight = this._time;
+          this.intel.report(a.percept.losPoint, 1.1, 'contact', this._time);
         }
       }
 
@@ -217,14 +285,20 @@ export class AiModule {
       // rather than stopping dead the instant your head clears a doorway.
       const visible = a.percept.spotted || b.tactic === Tactic.SUPPRESS
         || this._time - a.percept.lastSeen < 0.6;
-      this.combat.update(dt, a, {
+      const fired = this.combat.update(dt, a, {
         time: this._time,
         target: player.state,
         targetVisible: visible,
-        allowFire: b.wantFire && a.alive,
+        allowFire: b.wantFire && a.alive && a.mayFire !== false,
         muzzle: a._muzzle,
         aimPoint: b.aimPoint,
       });
+      // A bot shooting at something is the loudest signal the squad has that
+      // there is a fight here. Rate-limited, because a burst is one contact.
+      if (fired && this._time - (a._reportedFire || -99) > 1.5) {
+        a._reportedFire = this._time;
+        this.intel.report(b.aimPoint, 0.85, 'contact', this._time);
+      }
     }
 
     this.combat.stepGrenades(dt);
@@ -239,6 +313,40 @@ export class AiModule {
   _steer(dt, a) {
     const b = a.brain;
     const desiredSpeed = b.desiredSpeed;
+
+    /* --- stuck watchdog ----------------------------------------------------- *
+     * Measured: a bot that respawned 26.5 m from the player stood in PATROL for
+     * forty seconds. Its sweep goal was reachable by the region gate but its A*
+     * failed on service, and because the goal is sticky it re-asked for the
+     * same impossible leg forever. Anything that wants to move and is not
+     * moving gets its errand torn up — this is a floor under every future
+     * pathing bug, not a fix for one of them.                                  */
+    const wantsToTravel = b.tactic === 'patrol' || b.tactic === 'advance' || b.tactic === 'search'
+      || b.tactic === 'flank' || b.tactic === 'reposition' || b.tactic === 'retreat';
+    if (wantsToTravel && desiredSpeed > 0.4 && Math.hypot(a.velocity.x, a.velocity.z) < 0.35) {
+      a._stuckFor = (a._stuckFor || 0) + dt;
+      if (a._stuckFor > 2.2) {
+        a._stuckFor = 0;
+        a.path = null;
+        a.pathDone = true;
+        a.pathFails = 0;
+        b.sweepGoal = null;
+        b.mark = null;
+        if (b.hasGoal) b.hasGoal = false;
+        this.intel.release(a.id);
+        // Two strikes and the bot is somewhere the navmesh disagrees with:
+        // put it back on a surface it can actually leave.
+        a._stuckStrikes = (a._stuckStrikes || 0) + 1;
+        if (a._stuckStrikes >= 2) {
+          a._stuckStrikes = 0;
+          const rescue = this.nav.randomPoint(Math.random, a.position, 16);
+          if (rescue) { a.position.copy(rescue).setY(rescue.y + CAPSULE_HALF); a._groundY = rescue.y; }
+        }
+      }
+    } else {
+      a._stuckFor = 0;
+      if (Math.hypot(a.velocity.x, a.velocity.z) > 1.5) a._stuckStrikes = 0;
+    }
 
     /* --- pick a steering target ------------------------------------------- */
     let tx = 0, tz = 0, has = false;
@@ -346,11 +454,46 @@ export class AiModule {
 
   /* ------------------------------------------------------------ pathfinding */
 
+  /**
+   * ONE MAP, NOT TWO. Measured before this gate existed: 417 of 459 patrol legs
+   * in a 90 s sample were unroutable, and one bot on its own produced 452 of the
+   * 459 — a failed A* leaves `pathDone` set, the brain asks again on its next
+   * 8 Hz tick, and a bot that cannot reach anything spams the queue forever.
+   * Every failing destination resolved, via `nav.nearest`, onto a node outside
+   * the main region: the level's authored waypoint list includes five elevated
+   * positions on ledge islands no bot can walk to.
+   *
+   * So a destination is accepted only if it passes the *same* lookup findPath
+   * will perform on it. Rejecting here is cheap; discovering it inside A* is
+   * not, and neither is a bot standing still because its errand was impossible.
+   *
+   * @returns {boolean} whether the leg was actually queued.
+   */
   _requestPath(a, dest, reason) {
-    if (!this.nav.ready || !dest) return;
+    if (!this.nav.ready || !dest) return false;
+    if (this._time < (a.pathCooldown || 0)) return false;
+
+    const gn = this.nav.nearest(dest, 8);
+    if (gn < 0 || this.nav.nodeRegion[gn] !== this.nav.mainRegion) {
+      a.pathRejects = (a.pathRejects || 0) + 1;
+      if (a.pathRejects > 3) { a.pathCooldown = this._time + 0.45; a.pathRejects = 0; }
+      return false;
+    }
+    // A bot that has been shoved onto a ledge island can route nowhere at all;
+    // step it back onto the main surface rather than letting it stand there.
+    const sn = this.nav.nearest(a.position, 8);
+    if (sn < 0 || this.nav.nodeRegion[sn] !== this.nav.mainRegion) {
+      const rescue = this.nav.randomPoint(Math.random, a.position, 14);
+      if (rescue) { a.position.copy(rescue).setY(rescue.y + CAPSULE_HALF); a._groundY = rescue.y; }
+      a.pathCooldown = this._time + 0.3;
+      return false;
+    }
+
+    a.pathRejects = 0;
     a.pathDone = false;
     this._pathQueue.push({ a, dest: dest.clone(), reason });
     if (this._pathQueue.length > 24) this._pathQueue.shift();
+    return true;
   }
 
   /** Two searches per frame at most, oldest first. */
@@ -366,14 +509,84 @@ export class AiModule {
         a.pathIndex = pts.length > 1 ? 1 : 0;
         a.pathDone = false;
         a.pathAge = 0;
+        a.pathFails = 0;
       } else {
+        a.pathFails = (a.pathFails || 0) + 1;
+        // Passed the region gate and still no route: A* ran out of expansions.
+        // Back off rather than re-asking eight times a second.
         a.path = null;
         a.pathDone = true;
+        a.pathCooldown = this._time + 0.35 + Math.random() * 0.3;
       }
     }
   }
 
   /* ------------------------------------------------------------- perception */
+
+  /**
+   * THE FIRE DIRECTOR — the price of being found more often.
+   *
+   * Everything else in this change makes the squad converge on the player. Left
+   * alone that is not "more fights", it is "seven rifles at once", and the
+   * difficulty knob is the wrong lever to fix it with: turning bots down makes
+   * every individual duel worse in order to survive the crowd.
+   *
+   * So permission to shoot the player is rationed. The nearest few bots that
+   * can actually see the player get it; the rest keep manoeuvring (Brain's
+   * ENGAGE pushes them into FLANK/REPOSITION rather than miming a firefight),
+   * which reads as a squad working an angle instead of a queue at a doorway.
+   * Incoming damage per second therefore stays bounded no matter how many
+   * bodies the sweep delivers.
+   */
+  _director(player) {
+    this._assignRoles();
+    const cap = THREE.MathUtils.clamp(Math.round(Config.match.botCount / 2.5), 2, 4);
+    const seeing = [];
+    for (const a of this.actors) {
+      if (!a.alive) { a.mayFire = true; continue; }
+      if (a.percept.spotted || this._time - a.percept.lastSeen < 1.2) seeing.push(a);
+      else a.mayFire = true;      // nobody in contact is constrained by this
+    }
+    if (seeing.length <= cap) { for (const a of seeing) a.mayFire = true; return; }
+    const px = player.state.position;
+    seeing.sort((x, y) => x.position.distanceToSquared(px) - y.position.distanceToSquared(px));
+    for (let i = 0; i < seeing.length; i++) seeing[i].mayFire = i < cap;
+  }
+
+  /**
+   * SWEEP DUTY.
+   *
+   * Measured: over a 120 s sample the squad started only 31 patrol legs between
+   * seven bots — about a fifth of their time — because friendly fire from the
+   * match's own operator sims kept flipping them into `alerted`, and every
+   * contact report pulled the rest onto it. The southern third of the map went
+   * 139 s without a single bot standing in it while the north was 11 s fresh.
+   *
+   * A squad that is entirely reactive has no eyes anywhere else. So a share of
+   * the living hold sweep duty: they still fight, still react to being shot at,
+   * still take cover — their perception is untouched — but they do not chase
+   * other people's contact reports. They keep walking the map. That is what
+   * makes a player who is standing still and silent get found at all.
+   */
+  _assignRoles() {
+    const alive = [];
+    for (const a of this.actors) if (a.alive) alive.push(a);
+    if (!alive.length) return;
+    const want = THREE.MathUtils.clamp(Math.ceil(alive.length * 0.45), 2, alive.length);
+
+    // Sweepers are chosen furthest-first from whatever is currently hot, so the
+    // bots already in a fight stay in it and the ones with nothing to do leave.
+    const hot = this.intel.best(alive[0].position, this._time, { minHeat: 0.15, maxDist: 999, maxClaims: 99 });
+    const ref = hot ? hot.pos : null;
+    alive.sort((x, y) => {
+      const bx = x.brain.posture === 'combat' ? 1e6 : 0;
+      const by = y.brain.posture === 'combat' ? 1e6 : 0;
+      const dx = ref ? -x.position.distanceTo(ref) : x.id;
+      const dy = ref ? -y.position.distanceTo(ref) : y.id;
+      return (bx + dx) - (by + dy);
+    });
+    for (let i = 0; i < alive.length; i++) alive[i].role = i < want ? 'sweep' : 'react';
+  }
 
   _noise(position, loudness) {
     if (!position) return;
@@ -466,6 +679,9 @@ export class AiModule {
     a.health -= damage;
     a.lastDamaged = this._time;
     a.percept.alert = 1;
+    // Taking rounds here is a report the whole squad can act on, whoever fired:
+    // MatchModule routes its friendly operators' fire through this same method.
+    this.intel.report(a.position, 0.8, 'takingFire', this._time);
     // Being shot at from an unseen direction is information: bots turn and
     // treat the shooter's bearing as a contact.
     const player = engine.get('player');
@@ -473,6 +689,7 @@ export class AiModule {
       a.percept.lastKnown.copy(player.state.position);
       a.percept.lastHeard = this._time;
       a.percept.visibility = Math.max(a.percept.visibility, 0.75);
+      if (info.by === 'player') this.intel.report(player.state.position, 1.15, 'shooter', this._time);
       if (a.brain.tactic === Tactic.PATROL || a.brain.tactic === Tactic.IDLE) {
         a.brain.tactic = Tactic.TAKE_COVER;
         a.brain.since = 99;
@@ -491,12 +708,16 @@ export class AiModule {
   }
 
   _kill(a, info, engine) {
+    // A man going down is the strongest thing the squad can know without
+    // seeing anyone: somebody with a clear line was standing near here.
+    this.intel.report(a.position, 1.15, 'down', this._time);
     a.alive = false;
     a.health = 0;
     a.respawnTimer = 6 + Math.random() * 4;
     a.brain.tactic = Tactic.DEAD;
     a.velocity.set(0, 0, 0);
     if (a.cover) { this.cover.release(a.cover, a.id); a.cover = null; }
+    this.intel.release(a.id);
     a.path = null;
 
     // Budgeted ragdolls: over the limit, the oldest corpse is frozen so the
@@ -514,10 +735,21 @@ export class AiModule {
     engine.bus.emit('actor:killed', { actor: a, by: info.by || 'player', headshot: !!info.headshot });
   }
 
+  /**
+   * Where a dead bot comes back.
+   *
+   * Measured: with respawns pinned to the hostile team's own line, the median
+   * nearest enemy at the player's spawn was 66 m — every death started a
+   * seventy-metre walk, and a minute-long sample at that end of the map
+   * contained no enemy at all. So the pool is the whole spawn set, ranked by
+   * how close it is to what the squad currently believes is happening, with two
+   * hard fairness gates that come first: never inside `MIN_SPAWN_DIST` of the
+   * player, and never anywhere the player can already see. A bot may appear
+   * across the yard from you; it may not appear behind you.
+   */
   _respawn(a, engine) {
     const player = engine.get('player');
-    const avoid = player ? [player.state.position] : [];
-    const spawn = this.level?.pickSpawn(1, avoid);
+    const spawn = this._pickRespawn(player) || this.level?.pickSpawn(1, player ? [player.state.position] : []);
     if (spawn) {
       a.position.copy(spawn.position).setY(spawn.position.y + CAPSULE_HALF);
       a._groundY = spawn.position.y;
@@ -548,6 +780,51 @@ export class AiModule {
     a.combat.aimError = a.combat.skill.errStart;
     a.pathDone = true;
     a.alert = 0;
+    a.mayFire = true;
+    a.pathCooldown = 0;
+    a.pathRejects = 0;
+    a.pathFails = 0;
+    a._stuckFor = 0;
+    a._stuckStrikes = 0;
+  }
+
+  _pickRespawn(player) {
+    const pool = this.level?.spawnPoints;
+    if (!pool || !pool.length) return null;
+    const px = player?.state?.position || null;
+    // A fifth of the squad still comes back on its own line, so there is a rear
+    // to fall back through and the map keeps a shape.
+    const homeOnly = Math.random() < 0.2;
+    // A strong contact pulls reinforcements toward it; with nothing hot, the
+    // squad reinforces where it has no eyes. That second half matters more than
+    // the first: measured from a cold start the whole squad spends a minute in
+    // its own half, because the only thing making noise is its own firefight,
+    // and biasing respawns toward noise just deepens that. Coverage staleness
+    // is the counterweight, and it is the same map the sweep reads.
+    const mark = this.intel.best(px || _v.set(0, 0, 0), this._time, { minHeat: 0.5, maxDist: 999, maxClaims: 99 });
+    const focus = mark ? mark.pos : null;
+
+    let best = null, bestScore = -Infinity;
+    for (const s of pool) {
+      if (homeOnly && s.team !== 1) continue;
+      if (px) {
+        const d = s.position.distanceTo(px);
+        if (d < MIN_SPAWN_DIST) continue;
+        // No spawning in the player's line of sight, at any range.
+        _v.subVectors(px, s.position);
+        const len = _v.length();
+        _v.divideScalar(Math.max(len, 1e-4));
+        _pt.copy(s.position).setY(s.position.y + 1.5);
+        if (len < 70 && this.collision && !this.collision.raycast(_pt, _v, len - 1.2)) continue;
+      }
+      // Weighted, not decided: the pull toward contact must not collapse every
+      // respawn onto one end of the map, or the other end goes empty again.
+      let score = Math.random() * 14;
+      score += Math.min(45, this.intel.ageAt(s.position, this._time) * 0.45);
+      if (focus) score += 26 - Math.min(26, s.position.distanceTo(focus) * 0.34);
+      if (score > bestScore) { bestScore = score; best = s; }
+    }
+    return best;
   }
 
   /* ------------------------------------------------------------------- FX */
@@ -648,7 +925,10 @@ export class AiModule {
   stats() {
     const byTactic = {};
     for (const a of this.actors) byTactic[a.brain.tactic] = (byTactic[a.brain.tactic] || 0) + 1;
-    return { nav: this.nav.stats(), cover: this.cover.stats(), tactics: byTactic };
+    return {
+      nav: this.nav.stats(), cover: this.cover.stats(), tactics: byTactic,
+      intel: this.intel.stats(this._time),
+    };
   }
 
   dispose() {

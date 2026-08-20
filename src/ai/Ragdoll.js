@@ -24,6 +24,23 @@ const JOINTS = [
 ];
 const J = new Map(JOINTS.map((n, i) => [n, i]));
 
+/**
+ * Collision radius per particle, metres.
+ *
+ * These were all 0.11 m, and a settled corpse measured *exactly* flat: hips,
+ * chest, head, hands and both feet all came to rest at y = 0.110 on a flat
+ * floor — twelve spheres of one size on a plane can only make a pancake, and a
+ * man lying on his back is not one. Real half-thicknesses: a plate carrier is
+ * ~0.17 from the spine to the front of the armour, a helmeted head ~0.13, a
+ * knee ~0.10, a boot ~0.08. The corpse now settles as a body with a raised
+ * torso and limbs that lie lower than it.
+ */
+const RADII = [
+  0.155, 0.160, 0.175, 0.130,
+  0.085, 0.070, 0.085, 0.070,
+  0.100, 0.080, 0.100, 0.080,
+];
+
 /** Which bone each particle is sampled from, and where along it. */
 const SAMPLE = [
   ['hips', 0], ['spine', 0], ['chest', 0], ['head', 1],
@@ -159,7 +176,7 @@ export class Ragdoll {
       for (let i = 0; i < this.pos.length; i++) {
         const p = this.pos[i];
         _before.copy(p);
-        this.collision.capsuleResolve(p, 0.11, 0.11, 2);
+        this.collision.capsuleResolve(p, RADII[i], RADII[i], 2);
         const push = _before.distanceTo(p);
         if (push > 1e-5) {
           // Contact friction: kill most of the tangential motion so limbs stop

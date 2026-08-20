@@ -38,7 +38,23 @@ export class RenderModule {
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.0;
     renderer.shadowMap.enabled = true;
-    renderer.shadowMap.type = THREE.VSMShadowMap;
+    /**
+     * THE SHADOW FILTER IS CHOSEN BY LightingModule, NOT HERE.
+     *
+     * This line used to set VSMShadowMap, and it was dead: `lighting` is
+     * registered after `render`, so LightingModule.init overwrites it with
+     * PCFShadowMap — which is what the cascade sampler in CascadedShadows.js is
+     * actually written against, binding shadow maps as `sampler2DShadow` for
+     * hardware comparison filtering. Measured at runtime: shadowMap.type === 1
+     * (PCFShadowMap).
+     *
+     * The dead line was not harmless. A reviewer with measurement tools read it,
+     * concluded the renderer and the cascade sampler disagreed about what they
+     * were sampling, and reported that as the root cause of the map having no
+     * shadow story. Code that states a falsehood costs debugging time even when
+     * it costs no frames, so the choice now lives in exactly one place and says
+     * where that is.
+     */
     renderer.shadowMap.autoUpdate = true;
     renderer.autoClear = false;
     // We issue several render() calls per frame (world, post, viewmodel).

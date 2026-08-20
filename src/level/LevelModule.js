@@ -1011,6 +1011,10 @@ export class LevelModule {
       shutter: 'shutter',
       parapet: o.parapet ?? SCALE.parapet,
       parapetSides: o.parapetSides,
+      // Sides that carry a 0.34 m kerb instead of a parapet: a roofline you
+      // can still read from the street and still step over. Every roof-to-roof
+      // join on this map is a kerbed side — see `roof()` in kit/Arch.js.
+      kerbSides: o.kerbSides,
       // Roofline breakup and bolted-on facade kit. Both are cheap and both are
       // what stop a row of extruded rectangles reading as extruded rectangles.
       parapetVary: o.parapetVary ?? 1,
@@ -1040,17 +1044,65 @@ export class LevelModule {
       });
     });
 
-    // Exterior flight in the gap between W3 and W4, climbing west onto the
-    // roof of W4: the alley's only route to the rooftops.
+    /* ------------------------------------------------------------------
+     * THE WAY ONTO THE WEST ROOFS.
+     *
+     * The old flight ran west into the 4 m slot between W3 and W4, under its
+     * own landing: tools/stair-profile.mjs measured headroom falling to 0.18 m
+     * and a hand-stepped walk stalled the player at ramp y 4.64 with the
+     * capsule wedged between the slab and the ramp. Fixing the landing made it
+     * climbable — and it still did not make the roofs REACHABLE, because a
+     * flight steep enough to gain 6.4 m in the 11 m that slot allows cannot be
+     * navigated by anything but the player.
+     *
+     * WHY SLOPE IS A CONNECTIVITY PROBLEM AND NOT A COMFORT ONE. The navmesh
+     * voxelises at 0.52 m (low tier) and samples a surface at each column's
+     * CENTRE, and it links two columns only when their surfaces are within one
+     * step, 0.42 m. Where a ramp meets the flat landing at its head, the
+     * landing clamps its column to the top height while the last ramp-only
+     * column is sampled up to 1.5 cells back down the slope. So the step the
+     * navmesh sees at the head of any flight is
+     *
+     *     1.5 * cell * slope
+     *
+     * which at the kit's 0.175/0.29 going (slope 0.60) is 0.47 m — over the
+     * limit, by phase-dependent luck. That single number is why this level
+     * measured 1922 m2 of walkable elevated surface with 16 m2 reachable and
+     * 211 disconnected navmesh regions: NOT ONE of its six staircases linked,
+     * including the four the player can walk up. Interrogating the shipped
+     * navmesh directly showed the hall flight walkable and in the ground region
+     * from z 2.5 to 5.5 and eroded from 6.5 up, severed 1.3 m short of its own
+     * landing.
+     *
+     * The fix is arithmetic: keep slope * 1.5 * 0.52 under 0.42, i.e. under
+     * 0.54, with margin. A 0.175 rise on a 0.36 going is 0.48 — a generous
+     * public stair, which is what a market compound's roof stairs are.
+     *
+     * At that slope 6.4 m needs 13.3 m of run, which the slot cannot give, so
+     * the flight moved out of the slot and into the alley: it runs NORTH up the
+     * alley's west side against W4's flank, and its head landing abuts W4's
+     * east elevation, whose parapet was already open for the plank bridge. It
+     * takes 3 m of the alley's 7 m and leaves the lane at x -30..-26 clear, so
+     * the alley's own north sightline is untouched.
+     * ------------------------------------------------------------------ */
+    const WF = { foot: 12.0, len: 13.32 };             // head at z 25.32, 0.48 slope
     stairs(this.kit, {
-      x: -32.4, y: 0, z: 14.0, yaw: -Math.PI / 2,
-      width: 2.4, height: 6.4, bucket: 'concrete',
+      x: -31.5, y: 0, z: WF.foot + WF.len / 2, yaw: 0,
+      width: 2.8, height: 6.4, going: 0.36, bucket: 'concrete',
     });
-    const land = this.batch.at('concrete', -36, 15);
-    land.at(-36.4, 6.25, 15.0).box(7.4, 0.30, 4.2, 0.05, 1.5);
-    this.proxy.extent(-40.1, 5.95, 12.9, -32.7, 6.4, 17.1);
-    railing(this.kit, { x0: -32.8, z0: 12.9, x1: -32.8, z1: 17.1, y: 6.4, height: 1.05, bucket: 'ironThin' });
-    railing(this.kit, { x0: -40, z0: 17.1, x1: -32.8, z1: 17.1, y: 6.4, height: 1.05, bucket: 'ironThin' });
+    // THE LANDING BEGINS AT THE RAMP'S HEAD, NOT BEFORE IT. Overlapping the
+    // flight by even 0.3 m costs that much again in the step the navmesh sees,
+    // because the landing clamps its column to the top height while the last
+    // ramp-only column is still sampled a cell and a half back down the slope.
+    // Abutting exactly keeps the worst case at 1.5 * cell * slope.
+    const land = this.batch.at('concrete', -31.4, 26.5);
+    land.at(-31.4, 6.25, 26.5).box(3.6, 0.30, 2.3, 0.05, 1.5);
+    this.proxy.extent(-33.2, 6.10, 25.34, -29.6, 6.4, 27.66);
+    for (const [px, pz] of [[-29.9, 25.7], [-29.9, 27.3]]) {
+      pillar(this.kit, { x: px, z: pz, height: 6.10, size: 0.40, bucket: 'concrete' });
+    }
+    railing(this.kit, { x0: -29.6, z0: 25.34, x1: -29.6, z1: 27.66, y: 6.4, height: 1.05, bucket: 'ironThin' });
+    railing(this.kit, { x0: -29.6, z0: 27.66, x1: -33.2, z1: 27.66, y: 6.4, height: 1.05, bucket: 'ironThin' });
 
     // Plank bridge, roof of W4 across the alley to the V row. Roof-to-roof
     // movement is what makes the alley worth holding from above.
@@ -1067,11 +1119,29 @@ export class LevelModule {
 
   _buildVRow() {
     this._block({ x0: -26, z0: -42, x1: -16, z1: -30, H: 6.0, look: 'ens', skin: 'plaster', seed: 210 });
-    this._block({ x0: -26, z0: 2, x1: -16, z1: 20, H: 6.0, look: 'ew', skin: 'plasterPale', seed: 220 });
+    // V2 and V3 are the spine of the west roof route, so their parapets are
+    // rationed: V2 keeps its alley elevation, V3 keeps the one the north spawn
+    // looks at, the abutments with the centre blocks get 0.34 m kerbs, and the
+    // runs a bridge lands on are left open. See `roof()` for what a kerb is.
+    this._block({
+      x0: -26, z0: 2, x1: -16, z1: 20, H: 6.0, look: 'ew', skin: 'plasterPale',
+      seed: 220, parapetSides: 'w', kerbSides: 'e',
+    });
     this._block({
       x0: -26, z0: 26, x1: -16, z1: 44, H: 6.4, look: 'ews', skin: 'plasterWarm',
-      seed: 230, parapetSides: 'nse',      // the plank bridge lands on its west edge
+      seed: 230, parapetSides: 'n', kerbSides: 'e',   // plank bridge west, span south
     });
+
+    // Steel walkway across the 6 m gap between the two roofs. Deck at 6.2 m,
+    // which is 0.2 m off each of them: one step at each end rather than a
+    // 0.4 m hop onto V3 or a 0.4 m drop onto V2.
+    const vw = this.batch.at('ironwork', -21, 23);
+    vw.at(-21, 6.13, 23).box(3.6, 0.14, 7.4, 0.03, 0);
+    for (let i = 0; i < 4; i++) vw.at(-21, 6.00, 20.2 + i * 1.9).box(3.6, 0.16, 0.16, 0.03, 0);
+    this.proxy.extent(-22.8, 6.05, 19.5, -19.2, 6.20, 26.5);
+    for (const vx of [-22.8, -19.2]) {
+      railing(this.kit, { x0: vx, z0: 20.0, x1: vx, z1: 26.0, y: 6.20, height: 1.0, bucket: 'ironThin' });
+    }
 
     // Covered passage: the first floor bridges the gap between the souk house
     // and V2, with a segmental arch at each mouth.
@@ -1149,9 +1219,12 @@ export class LevelModule {
       x0: x0 + 0.04, z0: z0 + 0.04, x1: x1 - 0.04, z1: z1 - 0.04,
       y: H, bucket: 'concrete', trim: 'plasterPale', capBucket: 'rooflinePale',
       parapet: SCALE.parapet,
+      // North opens onto the covered passage's roof, which is at 6.0 m and is
+      // already a bridge to V2 — it just had a parapet on each end of it.
+      sides: 'sew',
       parapetVary: 1, seed: 517,
     });
-    this._roofSlots.push({ x0, z0, x1, z1, y: H, sides: 'nsew' });
+    this._roofSlots.push({ x0, z0, x1, z1, y: H, sides: 'sew' });
     this._footprint(x0, z0, x1, z1);
     // The east elevation faces the plaza approach and is in shot from half the
     // map, so it gets the full fitting set.
@@ -1230,16 +1303,22 @@ export class LevelModule {
   _buildCentreBlocks() {
     // North of the plaza: the market street, nine metres wide, walled both
     // sides. Every one of the camera's forward shots looks up this street.
-    this._block({ x0: -16, z0: 14, x1: -5, z1: 28, H: 6.0, look: 'es', skin: 'plasterPale', seed: 310 });
-    this._block({ x0: -16, z0: 31, x1: -5, z1: 44, H: 6.4, look: 'es', skin: 'plasterWarm', seed: 320 });
-    this._block({ x0: 5, z0: 14, x1: 16, z1: 26, H: 6.0, look: 'wn', skin: 'plaster', seed: 330 });
+    // The blocks that ABUT a route roof are kerbed on that face rather than
+    // parapeted: C1/C2 share x = -16 with V2/V3 and C3 shares x = +16 with E3,
+    // at identical heights, so the only thing that ever separated those decks
+    // was a 1.05 m wall on a boundary nobody can see from the street.
+    this._block({ x0: -16, z0: 14, x1: -5, z1: 28, H: 6.0, look: 'es', skin: 'plasterPale', seed: 310, kerbSides: 'w' });
+    this._block({ x0: -16, z0: 31, x1: -5, z1: 44, H: 6.4, look: 'es', skin: 'plasterWarm', seed: 320, kerbSides: 'w' });
+    this._block({ x0: 5, z0: 14, x1: 16, z1: 26, H: 6.0, look: 'wn', skin: 'plaster', seed: 330, kerbSides: 'e' });
     this._block({ x0: 5, z0: 29, x1: 16, z1: 44, H: 6.0, look: 'ws', skin: 'plasterPale', seed: 340 });
 
     // South of the plaza.
     this._block({ x0: -16, z0: -44, x1: -5, z1: -32, H: 6.0, look: 'en', skin: 'plaster', seed: 350 });
     this._block({ x0: -16, z0: -21, x1: -5, z1: -15, H: 6.0, look: 'es', skin: 'plasterWarm', seed: 360 });
     this._block({ x0: 5, z0: -44, x1: 16, z1: -34, H: 6.4, look: 'wn', skin: 'plasterPale', seed: 370 });
-    this._block({ x0: 5, z0: -21, x1: 16, z1: -15, H: 6.0, look: 'ws', skin: 'plaster', seed: 380 });
+    // C7 meets E2 at x = 16 with 0.4 m between the decks, which is a step, not
+    // a climb — so that run carries no upstand at all in either direction.
+    this._block({ x0: 5, z0: -21, x1: 16, z1: -15, H: 6.0, look: 'ws', skin: 'plaster', seed: 380, parapetSides: 'nsw' });
 
     // Gate arch across the north end of the market street: the sightline stop
     // that keeps a spawn-to-spawn snipe off the table.
@@ -1264,7 +1343,12 @@ export class LevelModule {
     const boom = this.batch.at('ironwork', 0, -38);
     boom.at(-1.2, 1.15, -38, 0, 0, 0.28).box(6.2, 0.14, 0.14, 0.03, 0);
     boom.at(-4.3, 0.6, -38).box(0.22, 1.2, 0.22, 0.04, 0);
-    this.proxy.box(-1.2, 1.1, -38, 6.2, 0.3, 0.3, 0);
+    // NO COLLIDER ON THE BAR. It is 140 mm of pipe at chest height across the
+    // south spawn's only straight exit: a hand-stepped walk north from (0, -40)
+    // travelled 1.5 m and stopped on it. Nothing in this game vaults on
+    // contact, so a bar you would step over in life is a wall here, and it is
+    // far too thin to be cover. The post still collides; the gate still reads.
+    this.proxy.box(-4.3, 0.6, -38, 0.3, 1.2, 0.3, 0);
   }
 
   /* ------------------------------------------------- the market hall ---- */
@@ -1274,7 +1358,17 @@ export class LevelModule {
    * 5.5 m. Three ways up (two stairs, one ramp) and a single stair to the roof.
    */
   _buildMarketHall() {
-    const X = 9, Z = 9, PY = 1.6;
+    // PODIUM HEIGHT IS A SIGHTLINE, NOT A DETAIL. At 1.6 m this slab stood
+    // 20 mm below a standing eye (Config.player.eyeHeight 1.62) across the
+    // whole 18 x 18 m centre of the map: every crossing line through the plaza
+    // was decided by two centimetres, which in practice means it was blocked —
+    // by view bob, by a metre of pitch, by crouching. Measured through the
+    // collision BVH at eye height, west inner street -> east inner street was
+    // BLOCKED at 5.2 m of a 25.0 m line and market street north -> south was
+    // BLOCKED at 12.1 m of 40.0 m. At 1.35 m the deck is 270 mm clear of a
+    // standing eye and still 330 mm above a crouching one, so it is the same
+    // piece of cover and no longer the same wall.
+    const X = 9, Z = 9, PY = 1.35;
 
     // Podium: a battered plinth with a moulded top edge.
     const p = this.batch.at('concrete', 0, 0);
@@ -1290,22 +1384,47 @@ export class LevelModule {
     deck.quad([-X + 0.1, PY + 0.02, -Z + 0.1], [X - 0.1, PY + 0.02, -Z + 0.1],
       [X - 0.1, PY + 0.02, Z - 0.1], [-X + 0.1, PY + 0.02, Z - 0.1], 2.0);
 
-    // Stairs south and north on the centre line, and a ramp on the west.
-    stairs(this.kit, { x: 0, y: 0, z: -10.35, yaw: Math.PI, width: 4.2, height: PY, bucket: 'concrete' });
-    stairs(this.kit, { x: 0, y: 0, z: 10.35, yaw: 0, width: 4.2, height: PY, bucket: 'concrete' });
+    /* Stairs south and north on the centre line, and a ramp on the west.
+     *
+     * ALL THREE USED TO CLIMB AWAY FROM THE PODIUM. `stairs()` and `ramp()`
+     * rise along their frame's local +Z, which under yaw = PI is world -Z: the
+     * south flight therefore had its head 11.5 m out in the plaza and its foot
+     * against the podium's own 1.35 m face, and the west ramp had its head out
+     * at x -12.9. Walking north up the market street stopped dead 0.2 m in, at
+     * the back of the south flight. The climb probe scored both flights as
+     * working because the player can mantle a 1.35 m ledge, which is what they
+     * were actually doing — the stair was a wall they vaulted.
+     *
+     * Yaws swapped, and the going opened from 0.29 to 0.36 so the head of each
+     * flight overlaps the podium edge by 90 mm instead of stopping 190 mm short
+     * of it, and so the slope (0.47) is inside the navmesh's link budget.
+     */
+    stairs(this.kit, { x: 0, y: 0, z: -10.35, yaw: 0, width: 4.2, height: PY, going: 0.36, bucket: 'concrete' });
+    stairs(this.kit, { x: 0, y: 0, z: 10.35, yaw: Math.PI, width: 4.2, height: PY, going: 0.36, bucket: 'concrete' });
     const ramp = this.batch.at('concrete', -11, 3);
-    ramp.at(-10.9, 0, 3.0, -Math.PI / 2).ramp(3.0, PY, 4.0, 0.03);
-    this.proxy.ramp(-10.9, 0, 3.0, 3.0, PY, 4.0, -Math.PI / 2);
+    ramp.at(-10.9, 0, 3.0, Math.PI / 2).ramp(3.0, PY, 4.0, 0.03);
+    this.proxy.ramp(-10.9, 0, 3.0, 3.0, PY, 4.0, Math.PI / 2);
     railing(this.kit, { x0: -12.9, z0: 4.6, x1: -8.9, z1: 4.6, y: 0, height: 1.0, collide: false });
 
     // Colonnade: twelve columns on a 3.6 m module, carrying an architrave.
     const H = 3.6;
+    // COLUMN POSITIONS ARE THE OTHER HALF OF THAT SIGHTLINE. The old rhythm was
+    // five columns per row on a 3.8 m module, which puts one at t = 0 — dead on
+    // the market street's centre line — and two more at (+/-7.6, 0), dead on the
+    // plaza's east-west centre line. The two blocked lines above terminated on
+    // exactly those columns: the ray from the west inner street stopped at
+    // 5.2 m, which is x = -7.3, the east face of the column at (-7.6, 0); the
+    // ray up the market street stopped at 12.1 m, which is z = 7.9, the north
+    // face of the column at (0, 7.6). Six columns on a 3.04 m module leaves a
+    // 2.5 m clear bay astride x = 0, and the flank columns move off z = 0, so
+    // both centre lines run through the hall instead of into it. The colonnade
+    // reads as MORE of a colonnade for it: sixteen columns, four elevations.
     const cols = [];
-    for (let i = 0; i < 5; i++) {
-      const t = -X + 1.4 + (2 * X - 2.8) * (i / 4);
+    for (let i = 0; i < 6; i++) {
+      const t = -X + 1.4 + (2 * X - 2.8) * (i / 5);
       cols.push([t, -Z + 1.4], [t, Z - 1.4]);
     }
-    cols.push([-X + 1.4, 0], [X - 1.4, 0]);
+    for (const s2 of [-1, 1]) for (const t of [-3.8, 3.8]) cols.push([s2 * (X - 1.4), t]);
     for (const [cx, cz] of cols) {
       column(this.kit, { x: cx, z: cz, y: PY, height: H, radius: 0.27, bucket: 'plasterPale' });
     }
@@ -1324,7 +1443,9 @@ export class LevelModule {
       x0: -X + 0.6, z0: -Z + 0.6, x1: X - 0.6, z1: Z - 0.6,
       y: roofY, bucket: 'concrete', trim: 'plasterPale', capBucket: 'rooflinePale',
       parapet: 0.95,
-      thickness: 0.30, sides: 'nsw',      // east side opens onto the roof stair
+      // East opens onto the roof stair's gallery, north onto the gallery that
+      // carries you from the stair head back over the deck.
+      thickness: 0.30, sides: 'sw',
     });
     // Ceiling underside is timber joists — the player spends real time under it.
     const jo = this.batch.at('timber', 0, 0);
@@ -1333,17 +1454,72 @@ export class LevelModule {
       jo.at(0, roofY - 0.42, z).box(2 * X - 1.6, 0.20, 0.24, 0.03, 0);
     }
 
-    // Roof stair. Deliberately *outside* the colonnade and on the yard side:
-    // it is a nine-metre climb in the open, so the hall roof costs exposure.
+    /* --- the way up, and the way from the top of it onto the deck --------
+     *
+     * The old flight was centred on z = 0 and ran z -4.8..+4.8, which put three
+     * separate faults in one object. Its head ran under its own landing (the
+     * slab soffit at 5.54 over a ramp still climbing to 5.82, so the last
+     * 0.4 m of the climb had 0.28 m of headroom); its 9.6 m body lay across the
+     * east inner street at eye height, which is why a fan of rays cast from
+     * (13, 0) found a median open distance of 4.9 m, the most closed spot
+     * measured anywhere on the map; and it crossed the plaza's east-west centre
+     * line at 2.9 m, blocking it outright.
+     *
+     * It now starts at z = -2.0 and climbs north, so it crosses z = 0 at 1.20 m
+     * — 0.42 m under a standing eye — and its head lands at z = 7.28, clear of
+     * the deck. Nothing overhangs the ramp: the head landing begins at z = 7.2
+     * where the ramp is already at 5.52, above the 5.27 soffit, so the two
+     * solids interpenetrate and their union has ONE continuous top surface.
+     * That is the same rule the west flight now obeys.
+     */
+    // 0.175 on a 0.36 going: slope 0.483, so the step the navmesh sees at the
+    // head of the flight is 1.5 * 0.52 * 0.483 = 0.38 m, inside its 0.42 m
+    // limit with 10% to spare. See _buildWestRow for the derivation — it is the
+    // single number that decides whether a staircase is a route or scenery.
+    const RS = { foot: -2.0, len: 11.52 };            // head at z 9.52
     stairs(this.kit, {
-      x: 10.7, y: 0, z: 0, yaw: 0, width: 1.5,
-      height: roofY, bucket: 'concrete',
+      x: 10.7, y: 0, z: RS.foot + RS.len / 2, yaw: 0, width: 2.2,
+      height: roofY, going: 0.36, bucket: 'concrete',
     });
-    const land = this.batch.at('concrete', 10, 5.4);
-    land.at(9.9, roofY - 0.14, 5.4).box(3.4, 0.28, 2.0, 0.05, 1.2);
-    this.proxy.extent(8.2, roofY - 0.28, 4.4, 11.6, roofY, 6.4);
-    railing(this.kit, { x0: 11.6, z0: 6.4, x1: 8.2, z1: 6.4, y: roofY, height: 1.05, bucket: 'ironThin' });
-    pillar(this.kit, { x: 11.2, z: 6.0, height: roofY - 0.28, size: 0.4, bucket: 'concrete' });
+    // Abuts the ramp head at z 9.52 rather than overlapping it — see the note
+    // on the west landing for why 0.3 m of overlap is 0.15 m of extra step.
+    const land = this.batch.at('concrete', 10.7, 10.5);
+    land.at(10.7, roofY - 0.15, 10.5).box(2.8, 0.30, 1.9, 0.05, 1.2);
+    this.proxy.extent(9.3, roofY - 0.30, 9.54, 12.1, roofY, 11.4);
+
+    // North portico: the piece that makes the stair head part of the roof
+    // rather than a 2.8 x 2.2 m island beside it, and the hall's own balcony
+    // over the mouth of the market street. It is CONTIGUOUS with the deck —
+    // same height, overlapping footprint — so the navmesh sees one surface and
+    // erodes only its outside edge, instead of two slabs that merely touch.
+    const gal = this.batch.at('concrete', 1.5, 9.5);
+    gal.at(1.5, roofY - 0.15, 9.5).box(15.0, 0.30, 3.8, 0.05, 1.6);
+    this.proxy.extent(-6.0, roofY - 0.30, 7.6, 9.0, roofY, 11.4);
+    // Piers clear of the market street's 10.4 m width, so the portico frames
+    // the street mouth instead of standing in it.
+    for (const gx of [-5.6, 6.0, 8.4, 11.1]) {
+      pillar(this.kit, { x: gx, z: 10.9, height: roofY - 0.30, size: 0.38, bucket: 'concrete' });
+    }
+    railing(this.kit, { x0: 11.6, z0: 11.4, x1: -6.0, z1: 11.4, y: roofY, height: 1.05, bucket: 'ironThin' });
+    railing(this.kit, { x0: 11.6, z0: 9.54, x1: 11.6, z1: 11.4, y: roofY, height: 1.05, bucket: 'ironThin' });
+
+    // Service catwalk east onto the garage roof. The hall deck was a dead end
+    // even for whoever reached it; this is the crossing that makes the roofs a
+    // lane instead of a set of islands, and it puts a hard horizontal across
+    // the east inner street at 5.7 m — a sightline stop for anyone below and a
+    // firing position for anyone on it.
+    const cw = this.batch.at('ironwork', 12, 0);
+    cw.at(12.1, 5.63, 0).box(8.2, 0.14, 3.6, 0.03, 0);
+    for (let i = 0; i < 5; i++) {
+      cw.at(8.4 + i * 1.85, 5.50, 0).box(0.16, 0.30, 3.6, 0.03, 0);
+    }
+    this.proxy.extent(8.0, 5.55, -1.8, 16.2, 5.70, 1.8);
+    for (const cz of [-1.8, 1.8]) {
+      railing(this.kit, { x0: 8.4, z0: cz, x1: 16.1, z1: cz, y: 5.70, height: 1.0, bucket: 'ironThin' });
+    }
+    // Off the centre line: a pier at (14.2, 0) stood square in the east inner
+    // street's east-west sightline and blocked it 2 m out.
+    pillar(this.kit, { x: 14.2, z: 1.45, height: 5.55, size: 0.45, bucket: 'concrete' });
 
     // Hanging lamps between the columns.
     for (const [lx, lz] of [[-4.5, 0], [4.5, 0]]) {
@@ -1374,8 +1550,11 @@ export class LevelModule {
 
   _buildEastRow() {
     this._block({ x0: 16, z0: -44, x1: 28, z1: -31, H: 6.0, look: 'wn', skin: 'plasterPale', seed: 410 });
-    this._block({ x0: 16, z0: -21, x1: 28, z1: -10, H: 5.6, look: 'wn', skin: 'brick', seed: 420 });
-    this._block({ x0: 16, z0: 10, x1: 28, z1: 20, H: 6.0, look: 'ws', skin: 'plaster', seed: 430 });
+    // E2 and E3 are the ends of the east roof route: E2's north run and E3's
+    // south run take the walkways off the garage roof, and both west runs are
+    // left open where they abut C7 and C3.
+    this._block({ x0: 16, z0: -21, x1: 28, z1: -10, H: 5.6, look: 'wn', skin: 'brick', seed: 420, parapetSides: 'se' });
+    this._block({ x0: 16, z0: 10, x1: 28, z1: 20, H: 6.0, look: 'ws', skin: 'plaster', seed: 430, parapetSides: 'ne' });
     this._block({ x0: 16, z0: 23, x1: 28, z1: 36, H: 6.5, look: 'ws', skin: 'plasterWarm', seed: 440 });
 
     // Walled garden in the north-east corner: the only soft, quiet pocket on
@@ -1445,23 +1624,78 @@ export class LevelModule {
     }
     pur.at(22, H - 0.42, 0).box(0.3, 0.5, 16.0, 0.04, 0);
     this.proxy.extent(x0, H - 0.1, z0, x1, H + 0.2, z1);
-    // A low upstand so the roof is a usable position with a lip of cover.
-    for (const [ax, az, bx, bz] of [[x0, z0, x1, z0], [x0, z1, x1, z1], [x0, z0, x0, z1], [x1, z0, x1, z1]]) {
-      const f = wallFrame(ax, az, bx, bz, H + 0.18);
-      const tb = this.batch.at('ironwork', (ax + bx) / 2, (az + bz) / 2);
-      tb.frame(f.m);
-      tb.at(0, 0.3, 0).box(f.len, 0.6, 0.14, 0.02, 0);
-      tb.clearFrame();
-      this.proxy.box(...[(ax + bx) / 2, H + 0.48, (az + bz) / 2], f.len, 0.6, 0.16, f.yaw);
+    // A low upstand so the roof is a usable position with a lip of cover — but
+    // BROKEN where the three walkways land. At 0.6 m it is over both step
+    // heights (0.42 m for the player, 0.46 m for the navmesh agent), so a
+    // continuous ring of it made this roof unreachable from any bridge no
+    // matter how carefully the bridge was levelled. Gaps, not a lower lip: the
+    // author's 0.6 m of cover is the point of the thing.
+    const GATE = [18.8, 22.2];                      // walkway landings, north and south
+    const runs = [
+      [x0, z0, x1, z0, [[16, GATE[0]], [GATE[1], 28]]],
+      [x0, z1, x1, z1, [[16, GATE[0]], [GATE[1], 28]]],
+      [x0, z0, x0, z1, [[-8, -2.0], [2.0, 8]]],     // west: the hall catwalk lands here
+      [x1, z0, x1, z1, [[-8, 8]]],
+    ];
+    for (const [ax, az, bx, bz, segs] of runs) {
+      const along = Math.abs(bx - ax) > Math.abs(bz - az) ? 'x' : 'z';
+      for (const [s0, s1] of segs) {
+        const c0 = along === 'x' ? [s0, az] : [ax, s0];
+        const c1 = along === 'x' ? [s1, az] : [ax, s1];
+        const f = wallFrame(c0[0], c0[1], c1[0], c1[1], H + 0.18);
+        const tb = this.batch.at('ironwork', (c0[0] + c1[0]) / 2, (c0[1] + c1[1]) / 2);
+        tb.frame(f.m);
+        tb.at(0, 0.3, 0).box(f.len, 0.6, 0.14, 0.02, 0);
+        tb.clearFrame();
+        this.proxy.box((c0[0] + c1[0]) / 2, H + 0.48, (c0[1] + c1[1]) / 2, f.len, 0.6, 0.16, f.yaw);
+      }
+    }
+
+    // Walkways off the garage roof to the two east-row roofs either side of it.
+    // Both decks are set between the two heights they join, so each end is a
+    // 0.1 m step. This plus the hall catwalk is what turns the garage from a
+    // roof you could theoretically stand on into the junction of the east
+    // rooftop lane.
+    for (const [zc, deck] of [[9.0, 5.90], [-9.0, 5.70]]) {
+      const b = this.batch.at('ironwork', 20.5, zc);
+      b.at(20.5, deck - 0.07, zc).box(3.0, 0.14, 3.4, 0.03, 0);
+      for (let i = 0; i < 3; i++) b.at(20.5, deck - 0.20, zc - 1.3 + i * 1.3).box(3.0, 0.16, 0.16, 0.03, 0);
+      this.proxy.extent(19.0, deck - 0.15, zc - 1.6, 22.0, deck, zc + 1.6);
+      for (const bx of [19.0, 22.0]) {
+        railing(this.kit, { x0: bx, z0: zc - 1.5, x1: bx, z1: zc + 1.5, y: deck, height: 1.0, bucket: 'ironThin' });
+      }
     }
 
     // Mezzanine over the east third with an open steel stair.
+    //
+    // THE STAIR USED TO CLIMB AWAY FROM IT. Built at yaw -PI/2, its ramp rose
+    // along world -X and topped out at x 19.94 — three and a half metres short
+    // of the mezzanine's west edge, in mid-air over the garage floor. The
+    // climb probe scored it as working because it only asks whether the player
+    // GAINS HEIGHT, and they do: they walk up a flight that arrives nowhere.
+    // Reversing it is not enough either, because the mezzanine slab would then
+    // overhang the top of the flight with 0.62 m of headroom.
+    //
+    // So it runs north up the mezzanine's west flank instead, at 0.175/0.36
+    // (slope 0.47, inside the navmesh's link budget — see _buildWestRow), and
+    // its head landing abuts the deck edge rather than passing under it. The
+    // handrail is split so the landing arrives through the gap.
     const mY = 2.9;
     const mz = this.batch.at('concrete', 26, 0);
     mz.at(25.6, mY - 0.12, 0).box(4.4, 0.24, 14.8, 0.04, 1.4);
     this.proxy.extent(23.4, mY - 0.24, -7.4, 27.8, mY, 7.4);
-    railing(this.kit, { x0: 23.4, z0: -7.4, x1: 23.4, z1: 7.4, y: mY, height: 1.05 });
-    stairs(this.kit, { x: 22.4, y: 0, z: -4.6, yaw: -Math.PI / 2, width: 1.3, height: mY, bucket: 'concrete' });
+    railing(this.kit, { x0: 23.4, z0: -7.4, x1: 23.4, z1: -1.4, y: mY, height: 1.05 });
+    railing(this.kit, { x0: 23.4, z0: 1.1, x1: 23.4, z1: 7.4, y: mY, height: 1.05 });
+    const GF = { foot: -7.4, len: 6.12 };              // head at z -1.28
+    stairs(this.kit, {
+      x: 22.4, y: 0, z: GF.foot + GF.len / 2, yaw: 0,
+      width: 1.3, height: mY, going: 0.36, bucket: 'concrete',
+    });
+    const gl = this.batch.at('concrete', 22.6, -0.1);
+    gl.at(22.6, mY - 0.12, -0.1).box(2.0, 0.24, 2.2, 0.04, 1.2);
+    this.proxy.extent(21.6, mY - 0.24, -1.28, 23.6, mY, 1.1);
+    railing(this.kit, { x0: 21.6, z0: -1.28, x1: 21.6, z1: 1.1, y: mY, height: 1.05 });
+    railing(this.kit, { x0: 21.6, z0: 1.1, x1: 23.6, z1: 1.1, y: mY, height: 1.05 });
 
     // Contents: a vehicle on stands, drums, tyres, a bench, pipe racks.
     placeVehicle(this.kit, { x: 20.0, z: -3.4, yaw: 0.06, kind: 'sedan', flat: true, bodyBucket: 'carpaintB' });
@@ -1693,7 +1927,11 @@ export class LevelModule {
       this._prop('bollard', -16.0 + i * 4.6, 0, -13.6, 0);
       this._prop('bollard', -16.0 + i * 4.6, 0, 13.6, 0);
     }
-    this._prop('jersey', -12.0, 0, 0.0, Math.PI / 2);
+    // Off z = 0: this barrier sat exactly on the plaza's east-west crossing,
+    // 0.86 m high — under a standing eye so it never showed up as a sightline
+    // problem, over the 0.42 m step so it stopped every walk along that line.
+    // Still cover, still at the plaza's west mouth, no longer in the doorway.
+    this._prop('jersey', -12.0, 0, -2.2, Math.PI / 2);
     this._prop('jersey', 12.0, 0, -2.0, Math.PI / 2);
     for (let i = 0; i < 6; i++) {
       this._prop(r() < 0.5 ? 'crateWood' : 'barrel', -15 + r() * 30, 0, -13 + r() * 26, r() * 3.14);
@@ -1716,9 +1954,43 @@ export class LevelModule {
    * Roof clutter. Every roof gets tanks, dishes, AC units and a parapet-height
    * scatter — the skyline is a third of every outdoor frame on this map.
    */
+  /**
+   * Rectangles [x0, z0, x1, z1] that roof clutter must stay out of.
+   *
+   * Every roof on the west and east lanes is now WALKED, and a 1.48 m water
+   * tank standing where a bridge lands is not cover, it is a closed door — the
+   * navmesh erodes a metre around anything solid, so a prop on a 3 m walkway
+   * mouth deletes the walkway. These are the landings and the abutment lines
+   * between roofs that share a boundary; everything else on the deck is fair
+   * game and still gets clutter.
+   */
+  static get ROOF_KEEPOUT() {
+    return [
+      [-34.8, 16, -32.4, 32],     // W4 east edge: stair landing and plank bridge
+      [-26.6, 26, -24.0, 31.5],   // V3 west edge: plank bridge
+      [-23.6, 18, -18.4, 28],     // V2 <-> V3 walkway
+      [-17.6, 2, -15.4, 20],      // V2 east abutment with C1
+      [-17.6, 26, -15.4, 44],     // V3 east abutment with C2
+      [-16.6, 14, -14.2, 28],     // C1 west abutment
+      [-16.6, 31, -14.2, 44],     // C2 west abutment
+      [-26, -6, -16, -1.5],       // souk roof north edge -> covered passage
+      [14.2, 14, 17.6, 26],       // C3 <-> E3 abutment
+      [14.2, -21, 17.6, -10],     // C7 <-> E2 abutment
+      [15.4, -2.4, 18.0, 2.4],    // garage west: the hall catwalk lands here
+      [18.4, -21, 22.6, -7],      // garage <-> E2 walkway
+      [18.4, 7, 22.6, 20],        // garage <-> E3 walkway
+      [-9.5, 6.5, 12.0, 12],      // hall deck north edge -> portico
+    ];
+  }
+
   _dressRoofs() {
     const r = this.rand;
     const slots = this._roofSlots || [];
+    const keep = LevelModule.ROOF_KEEPOUT;
+    const blocked = (x, z) => {
+      for (const [a, b, c, e] of keep) if (x > a && x < c && z > b && z < e) return true;
+      return false;
+    };
     for (const s of slots) {
       const cx = (s.x0 + s.x1) / 2, cz = (s.z0 + s.z1) / 2;
       const w = Math.abs(s.x1 - s.x0), d = Math.abs(s.z1 - s.z0);
@@ -1727,8 +1999,8 @@ export class LevelModule {
       // three objects — below the threshold where a roof reads as inhabited at
       // all. One per 8 m², clustered rather than scattered, is what a street of
       // flat roofs in this part of the world actually looks like from below.
-      const perM2 = { 0: 16, 1: 10, 2: 8, 3: 7 }[this.detail] ?? 8;
-      const n = Math.max(this.detail >= 1 ? 6 : 4, Math.round((w * d) / perM2));
+      const perM2 = { 0: 20, 1: 14, 2: 11, 3: 10 }[this.detail] ?? 11;
+      const n = Math.max(this.detail >= 1 ? 5 : 4, Math.round((w * d) / perM2));
 
       // Everything that has to break the skyline has to clear the parapet, and
       // the parapet is 1.05 m with piers to 1.5. A 0.74 m AC unit sitting flat
@@ -1752,6 +2024,7 @@ export class LevelModule {
           x = cx + (r() - 0.5) * (w - 2.6);
           z = cz + (r() - 0.5) * (d - 2.6);
         }
+        if (blocked(x, z)) continue;
         const pick = r();
         const yaw = r() * 3.14;
         if (pick < 0.30) {
@@ -2265,11 +2538,26 @@ export class LevelModule {
       [-29.5, -34], [-29.5, -14], [-29.5, 4], [-29.5, 24], [-29.5, 38],
       [0, -36], [0, -24], [0, -18], [0, 12], [0, 20], [0, 30], [0, 38],
       [-12.5, -34], [-12.5, -8], [12.5, -34], [12.5, -8],
-      [-13, 6], [13, 6], [-13, -8], [13, -8], [0, 0, 1.7],
+      [-13, 6], [13, 6], [-13, -8], [13, -8], [0, 0, 1.45],
       [34, -36], [34, -20], [34, -4], [34, 8], [34, 24], [34, 38],
       [-21, -17], [-21, -6], [-21, 0], [22, -3], [22, 4], [26, 0, 2.9],
-      [-15, -5, 3.2], [0, 6, 5.8], [-36, 24, 6.4], [-21, 30, 6.4],
+      [-15, -5, 3.2], [0, 6, 5.57], [-36, 24, 6.4], [-21, 30, 6.4],
       [21, 41], [-20, 23],
+      /* ROOF POSITIONS — NEW, AND THE AI MODULE SHOULD KNOW.
+       * Until this revision 1922 m2 of walkable elevated surface had 16 m2
+       * reachable on foot, so every point above carried a ground-level y and
+       * the roofs were scenery. Both roof stairs now work and the decks are
+       * joined into two lanes, west and east, which meet over the plaza. These
+       * are their holding positions; y is the deck the point stands on.
+       *   west lane: stair landing -> W4 -> plank bridge -> V3 -> walkway ->
+       *              V2 -> covered passage -> souk house, plus C1/C2 abutting
+       *   east lane: hall roof -> catwalk -> garage -> walkways -> E2/E3,
+       *              plus C3 abutting
+       */
+      [-31.4, 26.3, 6.4], [-36, 24, 6.4], [-21, 36, 6.4], [-21, 23, 6.2],
+      [-21, 11, 6.0], [-21, -12, 6.4], [-10.5, 20, 6.0], [-10.5, 37, 6.4],
+      [0, 0, 5.57], [1.5, 9.8, 5.57], [10.2, 10.4, 5.57], [12.1, 0, 5.7], [22, 0, 5.8],
+      [22, -15, 5.6], [22, 15, 6.0], [10.5, 20, 6.0],
     ];
     this.navPoints = P.map(([x, z, y]) => new THREE.Vector3(x, y ?? 0.1, z));
   }
@@ -2295,14 +2583,42 @@ export class LevelModule {
     const instMeshes = this.inst.flush(this.root, this.batch);
     const meshes = this.batch.flush(this.root);
 
-    // NOT WIRED UP. `sealDeadCracks` (src/level/SealCracks.js) is written and
-    // it runs, reporting "149 dead cracks, 135.2 m2, 314 boxes" — but it does
-    // not do the job: dropping the player into each of the five cracks the
-    // probe names shows all five still enterable. It is selecting a set of
-    // narrow cells that does not contain the reported ones, and until that is
-    // understood it would add 314 collision boxes to the bullet and capsule
-    // BVH in exchange for nothing. The analysis is kept, the cost is not paid.
-    // See the header of SealCracks.js for the diagnosis so far.
+    // NOT WIRED UP, AND NOW FOR A MEASURED REASON RATHER THAN A PENDING ONE.
+    //
+    // The set comparison the diagnosis asked for was run: SealCracks was wired
+    // in here, its candidate and fill cell sets stashed on `level.crackReport`,
+    // and both differenced against the cells the shipped navmesh still called
+    // narrow afterwards. Three numbers came out of it and they close the
+    // question.
+    //
+    //  1. IT DOES NOTHING TO THE MEASURE. It sealed 272 clusters, 153.7 m2,
+    //     643 boxes — and tools/level-probe.mjs went from 146 m2 of narrow
+    //     ground in 79 clusters to 145 m2 in 81. The named cracks were
+    //     untouched: the 8.3 m slot at x 39.5 was still 4.6 m2 at 0.52 m wide,
+    //     cluster for cluster identical.
+    //  2. THE TWO SETS BARELY OVERLAP, AND THE REASON IS EROSION RADIUS, NOT
+    //     CELL PHASE. Of the 537 cells the probe still called narrow, 397 —
+    //     74% — were never candidates. The probe reads the AI navmesh, which
+    //     erodes 0.52 m off every wall; the analysis erodes 0.34 m. The same
+    //     2 m physical gap is 0.96 m of walkable width on one grid and 1.32 m
+    //     on the other, so "at or under 1.5 m wide" is a different question in
+    //     each. Most of that 146 m2 is not a crack at all: it is the skirt the
+    //     navmesh erodes around props and doorway reveals, three to eight cells
+    //     at 0.27 m2 apiece, which is why 79 clusters average 1.8 m2 and the
+    //     largest in the level is 4.6 m2.
+    //  3. AND IT CAUSES THE WORSE BUG THE HEADER WARNS ABOUT. With it wired,
+    //     tools/climb-probe.mjs dropped from 6/6 to 4/6: rays cast at the foot
+    //     of the souk house and garage mezzanine flights hit fill boxes at
+    //     y 2.6 spaced 0.34 m apart, straight across both stairwells. A flight
+    //     between two walls IS a narrow cul-de-sac by these rules. The guards
+    //     (cul-de-sac, run length, area) do not distinguish a stairwell from a
+    //     seam, and no threshold on width and connectivity can.
+    //
+    // So the cost is not paid and the geometry answers instead: the flights and
+    // landings in this file were re-laid so the routes the player uses are
+    // wide, and the remaining sub-1.5 m ground is measurement skirt, not level.
+    // The analysis stays because the numbers above are worth being able to
+    // reproduce; call it from a probe, not from the build.
 
     const collider = this.proxy.toMesh();
     engine.get('collision').build(collider);

@@ -1,26 +1,47 @@
 import * as THREE from 'three';
 
 /**
- * OWNER: AI agent.
+ * OWNER: AI agent (NPC models).
  *
  * Procedural locomotion for the soldier rig — no clips, no baked animation.
- * Everything is solved from three inputs: how fast the body is moving, what
- * stance it is in, and where it is looking.
+ * Everything is solved from four inputs: where the body actually moved since
+ * last frame, what stance it is in, how fast it is turning, and where it is
+ * looking.
  *
- *   **Gait** is a phase, advanced by *distance travelled* rather than by time,
- *   so a bot decelerating into cover finishes its stride instead of moon-walking.
- *   Each foot spends half the cycle in stance (planted, sliding backward under
- *   the body) and half in swing (arcing forward). Stride length and cadence both
- *   scale with speed, sub-linearly, the way a real gait does.
+ *   **Steps are planted in the world, not swept under the body.** Each foot owns
+ *   a world-space plant point. While it is planted the IK target IS that point,
+ *   so the stance foot cannot slide: not while walking, not while strafing, not
+ *   while decelerating, not while the body pivots on the spot. A foot lifts only
+ *   when the pose it wants has drifted far enough from where it is standing, and
+ *   it lands where the body will be when it gets there.
  *
- *   **Foot IK** is a two-bone analytic solve. The foot target from the gait is
- *   projected onto the ground with a downward ray, so bots stand correctly on
- *   stairs and rubble instead of hovering or sinking. The hips drop when a leg
- *   cannot reach, which is what sells a step down.
+ *   That is a change of mechanism, and it was made against a measurement. The
+ *   previous gait swept both feet along the body's forward axis on a timer, and
+ *   the sweep did not agree with the body's real velocity: driving the rig with
+ *   a body that genuinely translated, the *planted* foot moved through the world
+ *   at 1.55 m/s while walking at 2.2 m/s — 70% slip — and at 173% of body speed
+ *   while strafing, because the feet were swinging fore-aft while the man went
+ *   sideways. Those numbers are why bots read as props on rails. With plants,
+ *   stance slip is 0.00 m/s by construction and the remainder is only what the
+ *   two-bone IK cannot reach.
+ *
+ *   **Turning on the spot now steps.** A pivot moves the ideal foot position
+ *   without moving the body, so the same trigger that produces a walk produces
+ *   a shuffle: the bot picks its feet up and puts them down around the turn
+ *   instead of rotating like a turret.
+ *
+ *   **Foot IK** is a two-bone analytic solve. Plant points are projected onto
+ *   the ground with a downward ray, so bots stand correctly on stairs and rubble
+ *   instead of hovering or sinking. The hips drop when a leg cannot reach, which
+ *   is what sells a step down.
  *
  *   **Aiming** is a distributed twist: the yaw and pitch to the target are split
  *   across hips, spine, chest, neck and head with different weights, so a bot
  *   tracking you turns its whole upper body and leads with its eyes.
+ *
+ *   **Standing still is a pose, not a freeze.** An idle bot shifts its weight
+ *   between its feet on a slow, per-instance cycle and breathes. At 10 m that is
+ *   the difference between a man waiting and a mannequin.
  *
  * Bone orientation trick used throughout: at bind time every bone's local
  * rotation is identity, so a bone's "down the limb" axis is simply the
@@ -29,12 +50,21 @@ import * as THREE from 'three';
  */
 
 const GAIT = {
-  strideBase: 0.62,
-  strideSpeed: 0.145,
-  cadenceBase: 1.55,
-  cadenceSpeed: 0.30,
+  /** Step length at a standstill and its growth with speed (metres). */
+  stepBase: 0.46,
+  stepSpeed: 0.145,
+  stepMax: 1.32,
+  /** Swing duration (seconds) — how long a foot is in the air, by speed. */
+  swingWalk: 0.30,
+  swingRun: 0.19,
+  /** A foot lifts when its plant is this fraction of a step out of place. */
+  trigger: 0.50,
+  /** …but never within this long of the last step, so it cannot buzz. */
+  minInterval: 0.09,
   liftWalk: 0.075,
-  liftRun: 0.155,
+  liftRun: 0.165,
+  /** Metres of "ideal foot" motion produced by a radian of body rotation. */
+  turnLever: 0.30,
 };
 
 export class Locomotion {
@@ -51,8 +81,26 @@ export class Locomotion {
 
     this._prevPos = new THREE.Vector3();
     this._hasPrev = false;
+    this._prevYaw = 0;
+    this._yawRate = 0;
+    this._travel = new THREE.Vector3();   // smoothed world travel direction
+    this._measuredSpeed = 0;
+
     this._footY = [0, 0];
     this._footN = [new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, 1, 0)];
+    // Per-foot plant state. `plant` is a world position; while a foot is not
+    // swinging, that position is the IK target and nothing else touches it.
+    this._feet = [0, 1].map(() => ({
+      plant: new THREE.Vector3(),
+      from: new THREE.Vector3(),
+      to: new THREE.Vector3(),
+      swing: false,
+      t: 0,
+      dur: GAIT.swingWalk,
+      since: 99,
+      plantYaw: 0,
+    }));
+    this._planted = false;
     this._hipDrop = 0;
     this._bodyYaw = 0;
     this._aimYaw = 0;
@@ -62,6 +110,8 @@ export class Locomotion {
     this._hit = { x: 0, xv: 0, y: 0, yv: 0, z: 0, zv: 0 };
     this._flinch = 0;
     this._breath = Math.random() * 10;
+    this._idle = Math.random() * 10;      // weight-shift clock, per instance
+    this._weight = 0;
 
     this.thighLen = [0, 0];
     this.shinLen = [0, 0];
@@ -93,31 +143,63 @@ export class Locomotion {
     if (!this._measured) this._measure();
     const rig = this.inst.rig;
     const B = this.byName;
+    dt = Math.min(0.1, Math.max(1e-4, dt));
+
+    /* --- what the body actually did --------------------------------------- */
+    // The caller's `speed` is the AI's own velocity magnitude; the travel
+    // DIRECTION has to come from the positions, because nothing upstream tells
+    // this rig whether the man is walking forward or sidestepping.
+    if (this._hasPrev) {
+      _delta.subVectors(ctx.position, this._prevPos);
+      _delta.y = 0;
+      const dist = _delta.length();
+      this._measuredSpeed = dist / dt;
+      if (dist > 1e-4) {
+        _delta.divideScalar(dist);
+        // A reversal is antipodal, and lerp-then-normalise cannot cross an
+        // antipode: it shortens the vector and the renormalise puts it straight
+        // back. That bug made a backpedalling bot believe it was walking
+        // forwards, so its feet planted a metre behind it and dragged — 94% of
+        // body speed, measured. Reversals snap; everything else damps.
+        const k = this._measuredSpeed > 40 ? 1 : Math.min(1, dt * 12);
+        if (this._travel.dot(_delta) < -0.8) this._travel.copy(_delta);
+        else this._travel.lerp(_delta, k).normalize();
+      }
+      const dy = wrapPi(ctx.yaw - this._prevYaw) / dt;
+      this._yawRate += (dy - this._yawRate) * Math.min(1, dt * 10);
+    } else {
+      this._travel.set(Math.sin(ctx.yaw), 0, Math.cos(ctx.yaw));
+    }
+    const teleported = this._hasPrev && this._prevPos.distanceToSquared(ctx.position) > 4;
+    this._prevPos.copy(ctx.position);
+    this._prevYaw = ctx.yaw;
+    this._hasPrev = true;
 
     /* --- rig transform ---------------------------------------------------- */
     rig.position.copy(ctx.position);
     this._bodyYaw = ctx.yaw;
     rig.rotation.set(0, ctx.yaw, 0);
 
-    /* --- gait phase ------------------------------------------------------- */
-    const speed = ctx.speed;
+    /* --- speed, stance, aim ----------------------------------------------- */
+    const speed = ctx.speed ?? this._measuredSpeed;
     this.speed += (speed - this.speed) * Math.min(1, dt * 9);
     this.stanceBlend += ((ctx.crouch ? 1 : 0) - this.stanceBlend) * Math.min(1, dt * 7);
     this.aimBlend += ((ctx.aimBlend ?? 0) - this.aimBlend) * Math.min(1, dt * 8);
 
-    const moving = this.speed > 0.22;
-    const cadence = GAIT.cadenceBase + Math.sqrt(Math.max(0, this.speed)) * GAIT.cadenceSpeed;
-    // Standing still freezes the phase rather than resetting it, so a bot that
-    // stops mid-stride keeps its feet where it left them.
-    if (moving) this.phase = (this.phase + dt * cadence) % 1;
-
     const run = THREE.MathUtils.clamp((this.speed - 2.4) / 3.2, 0, 1);
-    const stride = (GAIT.strideBase + this.speed * GAIT.strideSpeed)
-      * (1 - this.stanceBlend * 0.45) * Math.min(1, this.speed / 1.6);
-    const lift = THREE.MathUtils.lerp(GAIT.liftWalk, GAIT.liftRun, run)
-      * (1 - this.stanceBlend * 0.4) * Math.min(1, this.speed / 1.4);
+    const stepLen = Math.min(GAIT.stepMax,
+      (GAIT.stepBase + this.speed * GAIT.stepSpeed) * (1 - this.stanceBlend * 0.32));
+    const lift = THREE.MathUtils.lerp(GAIT.liftWalk, GAIT.liftRun, run) * (1 - this.stanceBlend * 0.4);
 
-    /* --- body: bob, sway, crouch, lean ------------------------------------ */
+    // Cosmetic phase: bob, sway and arm swing ride on it. Advanced by DISTANCE
+    // travelled (plus a little for turning), so a bot decelerating into cover
+    // finishes its stride instead of moon-walking, and a stopped bot's arms stop
+    // with it.
+    const travelled = this._measuredSpeed * dt + Math.abs(this._yawRate) * GAIT.turnLever * dt;
+    this.phase = (this.phase + travelled / Math.max(0.25, stepLen * 2)) % 1;
+    const moving = this.speed > 0.22 || Math.abs(this._yawRate) > 0.6;
+
+    /* --- body: bob, sway, crouch, weight shift ----------------------------- */
     const hips = B.get('hips');
     const bobAmp = (0.020 + run * 0.028) * Math.min(1, this.speed / 2.2);
     const bob = -Math.abs(Math.sin(this.phase * Math.PI * 2)) * bobAmp;
@@ -125,14 +207,28 @@ export class Locomotion {
     // The bind pose has the legs at full extension; a constant 35 mm of hip
     // drop puts a little bend in the knees so the IK has somewhere to go and
     // the stance stops looking like a mannequin.
-    const crouchDrop = 0.035 + this.stanceBlend * 0.30;
+    // …and the faster he goes the lower he carries the pelvis. This is not a
+    // flourish: the thigh root sits 0.90 m up and the leg is 0.815 m long, so a
+    // straight leg only just reaches the floor. Without the drop the leg has no
+    // horizontal reach to put a foot down with, and a long stride would go
+    // through full extension and drag. 95 mm buys a 0.40 m step radius.
+    const crouchDrop = 0.035 + 0.060 * Math.min(1, this.speed / 3.5)
+      + this.stanceBlend * 0.30;
 
     this._breath += dt * (0.9 + run * 1.4);
-    const breathe = Math.sin(this._breath) * 0.006 * (1 - Math.min(1, this.speed));
+    const still = 1 - Math.min(1, this.speed / 0.9);
+    const breathe = Math.sin(this._breath) * 0.008 * still;
+    // Idle weight shift: a slow lean onto one leg and back. 26 mm of lateral
+    // hip travel and a degree of pelvis roll, which is enough to read at 10 m
+    // and invisible past 25 — exactly the range where a frozen bot gives itself
+    // away.
+    this._idle += dt * 0.42;
+    const shiftTarget = Math.sin(this._idle) * 0.026 * still;
+    this._weight += (shiftTarget - this._weight) * Math.min(1, dt * 2.5);
 
     this._hipDrop += (0 - this._hipDrop) * Math.min(1, dt * 8);
     hips.position.set(
-      this.inst.rest[0].p.x + sway,
+      this.inst.rest[0].p.x + sway + this._weight,
       this.inst.rest[0].p.y + bob - crouchDrop - this._hipDrop + breathe,
       this.inst.rest[0].p.z,
     );
@@ -144,7 +240,10 @@ export class Locomotion {
     this._flinch = Math.max(0, this._flinch - dt * 2.4);
 
     const pelvisPitch = this.stanceBlend * 0.16 + run * 0.10;
-    hips.rotation.set(pelvisPitch + this._hit.x * 0.35, 0, this._hit.z * 0.35 - sway * 1.2);
+    hips.rotation.set(
+      pelvisPitch + this._hit.x * 0.35, 0,
+      this._hit.z * 0.35 - sway * 1.2 - this._weight * 0.9,
+    );
 
     /* --- aim distribution -------------------------------------------------- */
     // Difference between where the body faces and where the eyes want to look,
@@ -172,7 +271,7 @@ export class Locomotion {
 
     /* --- legs -------------------------------------------------------------- */
     rig.updateMatrixWorld(true);
-    this._solveLegs(dt, ctx, stride, lift, moving);
+    this._solveLegs(dt, ctx, stepLen, lift, moving, run, teleported);
     rig.updateMatrixWorld(true);
   }
 
@@ -231,56 +330,118 @@ export class Locomotion {
   }
 
   /**
-   * Foot targets from the gait, grounded by a downward ray, then a two-bone
-   * analytic IK per leg. The knee pole is the rig's forward axis, which is why
-   * knees never invert even when a bot is turning on the spot.
+   * Plant, trigger, swing, land — then two-bone analytic IK per leg.
+   *
+   * The "ideal" position of a foot is where it would stand if the man were
+   * balanced right now: hip, plus the stance width, plus half a step in the
+   * direction he is actually travelling. A planted foot is left exactly where
+   * it is until that ideal has drifted more than half a step away; then it
+   * swings to where the ideal will be when it lands. Nothing in the stance path
+   * moves the foot, which is what makes the slip zero rather than small.
    */
-  _solveLegs(dt, ctx, stride, lift, moving) {
+  _solveLegs(dt, ctx, stepLen, lift, moving, run, teleported) {
     const B = this.byName;
     const rig = this.inst.rig;
     const yaw = this._bodyYaw;
     const fx = Math.sin(yaw), fz = Math.cos(yaw);
     const rx = fz, rz = -fx;                       // right vector
+    const groundY = rig.position.y - 0.87;
+    const swingDur = THREE.MathUtils.lerp(GAIT.swingWalk, GAIT.swingRun, run);
+    const trigger = Math.max(0.16, stepLen * GAIT.trigger);
+    const lead = Math.min(1.1, this._measuredSpeed * swingDur);
+
+    if (!this._planted || teleported) this._resetPlants(fx, fz, rx, rz, groundY);
+
+    // Which foot is allowed to lift this frame: only one at a time, and only if
+    // the other one has been down long enough to carry the weight.
+    let wantIdx = -1, wantErr = 0;
+    for (let s = 0; s < 2; s++) {
+      const st = this._feet[s];
+      st.since += dt;
+      if (st.swing) { wantIdx = -2; continue; }     // -2: something is airborne
+    }
 
     let lowest = 0;
     for (let s = 0; s < 2; s++) {
-      const suffix = s === 0 ? 'L' : 'R';
-      const ph = (this.phase + (s === 0 ? 0 : 0.5)) % 1;
+      const st = this._feet[s];
+      const side = (s === 0 ? 1 : -1) * (0.106 - this.stanceBlend * 0.012);
+      // Where this foot wants to be standing right now: under the hip at the
+      // stance width, plus half a step in the direction of travel — and the
+      // half step fades out as he stops, so a standing man's feet are under him
+      // rather than parked half a stride away in the last direction he walked.
+      const gaitLead = stepLen * 0.5 * Math.min(1, this._measuredSpeed / 0.6);
+      const idealX = rig.position.x + rx * side + this._travel.x * gaitLead;
+      const idealZ = rig.position.z + rz * side + this._travel.z * gaitLead;
 
-      let along, height;
-      if (!moving) { along = 0; height = 0; }
-      else if (ph < 0.5) {
-        // Stance: the planted foot slides backward under the body.
-        along = stride * 0.5 - stride * (ph / 0.5);
-        height = 0;
-      } else {
-        const t = (ph - 0.5) / 0.5;
-        along = -stride * 0.5 + stride * t;
-        height = Math.sin(t * Math.PI) * lift;
+      if (!st.swing && wantIdx !== -2) {
+        const err = Math.hypot(idealX - st.plant.x, idealZ - st.plant.z);
+        // A pivot barely moves the foot's ideal position — 0.106 m of stance
+        // width is a 17 cm arc for a 90 degree turn — so distance alone would
+        // let a bot rotate 180 degrees on one spot with its boots welded down.
+        // Yaw since the foot was planted is the second trigger.
+        const spun = Math.abs(wrapPi(yaw - st.plantYaw));
+        if ((err > trigger || spun > 0.55) && st.since > GAIT.minInterval
+            && err + spun * 0.5 > wantErr) {
+          wantIdx = s; wantErr = err + spun * 0.5;
+        }
       }
 
-      const side = (s === 0 ? 1 : -1) * (0.106 - this.stanceBlend * 0.012);
-      const hipWorld = _v1.copy(rig.position);
-      const targetX = hipWorld.x + rx * side + fx * along;
-      const targetZ = hipWorld.z + rz * side + fz * along;
-
-      // Ground the target. Raycasting from above the hip keeps the probe from
-      // starting inside a step.
-      let groundY = hipWorld.y - 0.87;
+      // Ground the ideal/plant. Raycasting from above the hip keeps the probe
+      // from starting inside a step.
+      let gy = groundY;
       let normal = _up;
       if (ctx.footIK && ctx.collision) {
-        _v2.set(targetX, hipWorld.y + 0.55, targetZ);
+        const px = st.swing ? st.to.x : idealX;
+        const pz = st.swing ? st.to.z : idealZ;
+        _v2.set(px, rig.position.y + 0.55, pz);
         const hit = ctx.collision.raycast(_v2, _down, 2.2);
-        if (hit) { groundY = hit.point.y; normal = hit.normal; }
+        if (hit) { gy = hit.point.y; normal = hit.normal; }
       }
-      this._footY[s] += (groundY - this._footY[s]) * Math.min(1, dt * 18);
+      this._footY[s] += (gy - this._footY[s]) * Math.min(1, dt * 18);
       this._footN[s].lerp(normal, Math.min(1, dt * 12));
+      st.groundY = this._footY[s];
+      st.idealX = idealX; st.idealZ = idealZ; st.lead = lead;
+    }
+
+    if (wantIdx >= 0) {
+      const st = this._feet[wantIdx];
+      st.swing = true; st.t = 0; st.dur = swingDur; st.since = 0;
+      st.from.copy(st.plant);
+      st.to.set(
+        st.idealX + this._travel.x * st.lead,
+        st.groundY,
+        st.idealZ + this._travel.z * st.lead,
+      );
+    }
+
+    for (let s = 0; s < 2; s++) {
+      const st = this._feet[s];
+      let tx, tz, height = 0;
+      if (st.swing) {
+        st.t += dt / Math.max(0.06, st.dur);
+        if (st.t >= 1) {
+          st.swing = false; st.t = 1;
+          st.plant.copy(st.to); st.plant.y = st.groundY;
+          st.plantYaw = yaw;
+          tx = st.plant.x; tz = st.plant.z;
+        } else {
+          // Ease-in-out along the ground, sine arc through the air.
+          const e = st.t * st.t * (3 - 2 * st.t);
+          tx = st.from.x + (st.to.x - st.from.x) * e;
+          tz = st.from.z + (st.to.z - st.from.z) * e;
+          height = Math.sin(st.t * Math.PI) * lift;
+        }
+      } else {
+        // PLANTED. Nothing here may move the foot; this is the whole mechanism.
+        tx = st.plant.x; tz = st.plant.z;
+      }
 
       // 0.085 is the ankle's height above the sole in the bind pose, so the
       // boot lands on the ground rather than in it.
-      const footTarget = _v3.set(targetX, this._footY[s] + height + 0.085, targetZ);
-      lowest = Math.min(lowest, this._footY[s] - (hipWorld.y - 0.87));
+      const footTarget = _v3.set(tx, st.groundY + height + 0.085, tz);
+      lowest = Math.min(lowest, st.groundY - (rig.position.y - 0.87));
 
+      const suffix = s === 0 ? 'L' : 'R';
       this._ik(B.get(`thigh${suffix}`), B.get(`shin${suffix}`), footTarget,
         this.thighLen[s], this.shinLen[s], fx, fz, s);
 
@@ -288,12 +449,29 @@ export class Locomotion {
       const foot = B.get(`foot${suffix}`);
       const groundPitch = Math.asin(THREE.MathUtils.clamp(
         this._footN[s].x * fx + this._footN[s].z * fz, -0.7, 0.7));
-      foot.rotation.set(-groundPitch + (height > 0.001 ? -0.35 * (height / Math.max(lift, 1e-3)) : 0.10), 0, 0);
+      foot.rotation.set(-groundPitch + (st.swing ? -0.42 * Math.sin(st.t * Math.PI) : 0.10), 0, 0);
     }
 
     // If both feet ended up below the body, drop the hips to meet them — this
     // is what makes stepping down a kerb look like stepping rather than gliding.
     if (lowest < -0.02) this._hipDrop = Math.min(0.24, -lowest * 0.55);
+    void moving;
+  }
+
+  /** Put both feet under the body immediately (spawn, respawn, teleport). */
+  _resetPlants(fx, fz, rx, rz, groundY) {
+    const p = this.inst.rig.position;
+    for (let s = 0; s < 2; s++) {
+      const st = this._feet[s];
+      const side = (s === 0 ? 1 : -1) * 0.106;
+      st.plant.set(p.x + rx * side, groundY, p.z + rz * side);
+      st.groundY = groundY;
+      st.plantYaw = this._bodyYaw;
+      st.swing = false; st.t = 1; st.since = 99;
+      this._footY[s] = groundY;
+    }
+    void fx; void fz;
+    this._planted = true;
   }
 
   /**
@@ -382,10 +560,10 @@ function wrapPi(a) {
   return a - Math.PI;
 }
 
-const _v1 = new THREE.Vector3();
 const _v2 = new THREE.Vector3();
 const _v3 = new THREE.Vector3();
 const _v4 = new THREE.Vector3();
+const _delta = new THREE.Vector3();
 const _dir = new THREE.Vector3();
 const _pole = new THREE.Vector3();
 const _knee = new THREE.Vector3();

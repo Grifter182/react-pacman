@@ -76,9 +76,23 @@ export class CombatSystem {
       c.burstLeft = 0;
       return false;
     }
+    // Read before clearing: `lost` is the length of the gap that just ended,
+    // and it is the whole input to the cold-acquisition test below.
+    const gap = c.lost;
     c.lost = 0;
 
-    if (!c.engaged) { c.engaged = true; c.reactTimer = randRange(skill.reaction); }
+    if (!c.engaged) {
+      c.engaged = true;
+      // COLD ACQUISITION. A bot that has been out of contact for a while is
+      // walking a patrol with its rifle down, not holding an angle. It gets a
+      // slower first reaction and a wider first burst than one re-peeking from
+      // cover mid-fight. This is the other half of the difficulty answer: the
+      // squad now arrives far more often, so the moment of arrival has to be
+      // survivable without making a settled duel any easier.
+      const cold = gap > 4;
+      c.reactTimer = randRange(skill.reaction) * (cold ? 1.75 : 1);
+      if (cold) c.aimError = Math.max(c.aimError, skill.errStart * 1.4);
+    }
 
     // Aim converges exponentially toward the skill floor while contact holds.
     const k = Math.exp(-skill.converge * dt);

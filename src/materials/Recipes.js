@@ -63,6 +63,23 @@ import {
  *   polymer   0.03-0.05, v.low var   1.2 mm stipple, flat      edge burnish only
  *   gunmetal  0.04-0.06 + conductor  0.5 mm blast, flat        polish-through
  *
+ * and the three ACCENT recipes, which exist for a different reason. The seven
+ * above are a neutral field; measured on this tree every one of them, and every
+ * other level surface with any saturation at all, sat inside hue 14-54 degrees
+ * — a 40-degree warm window with nothing outside it but near-neutrals. A real
+ * street is a neutral field with a few saturated things standing in front of
+ * it, so these three exist to BE those things, and they take their colour as a
+ * bake parameter rather than as a multiply:
+ *
+ *   recipe       what it is                 chroma  where it belongs
+ *   car_paint    clearcoat over base coat   HIGH    vehicle panels
+ *   sign_enamel  fired glass on steel       HIGH    shopfronts, lane markers
+ *   tile(paint)  glazed field tile          MED     thresholds, counters, wet
+ *
+ * plus `paint` on metal / wood / corrugated / canvas / plaster, which turns the
+ * existing neutrals into painted shutters, joinery, awnings and washed facades
+ * without a second bake pipeline.
+ *
  * The five viewmodel surfaces at the bottom of the file play the same game
  * against each other, on a much tighter pitch — every one of them is a dark
  * near-neutral, so what has to separate them is process, not colour:
@@ -243,6 +260,92 @@ const C_OVERMOULD = srgb(0.200, 0.199, 0.200);   // 0.031 linear — grip elasto
  */
 const C_DIRT = srgb(0.215, 0.202, 0.192);
 
+/* ------------------------------------------------------------------ paint */
+
+/**
+ * COLOUR IS BAKED, NOT MULTIPLIED.
+ * =================================
+ * Measured on this tree (node, 128px bake, the world scales LevelModule asks
+ * for): every level material with any saturation at all sits between hue 14 deg
+ * and 54 deg —
+ *
+ *   brick 14  wood 27  gravel 35  sandbag 38  sand 39  plaster 41  metal 43
+ *   canvas 54
+ *
+ * and everything outside that 40-degree window (asphalt, rubber, gunmetal,
+ * polymer, corrugated) is a near-neutral at saturation 0.01-0.05, i.e. its
+ * "hue" is dither on a grey. Intra-material hue spread is 0-13 deg. The library
+ * was one colour in twenty hats, and the rendered frames agree: the captured
+ * market shots carry a circular hue standard deviation of 9-35 deg with one
+ * 30-degree bin holding 46-65% of every chromatic pixel, against 114-122 deg
+ * and 20-40% for the forest map shot on the same rig.
+ *
+ * The level DID try to place accents — `M.shutter` is documented as "faded teal
+ * joinery", `M.signage` as a blue sign, `M.rug` as a red rug — through
+ * `material.color`. That path cannot work here and the arithmetic says why:
+ * a THREE material colour MULTIPLIES the baked albedo. Teal 0x4d6f74 is linear
+ * (0.076, 0.164, 0.187); wood bakes to linear (0.152, 0.084, 0.040). The
+ * product is (0.012, 0.014, 0.007) — a near-black olive at 1.4% reflectance.
+ * The shutter is not a faded teal, it is a dark smudge, and that is exactly
+ * what the frames show. Multiplication can only ever darken and can only ever
+ * pull toward the intersection of two spectra; it cannot put a colour on a
+ * surface that did not already have it.
+ *
+ * So a painted surface takes its coat colour as a BAKE PARAMETER. The recipe
+ * substitutes the coat and keeps every mask it already had — the chipping still
+ * follows curvature, the rust still blooms out of the cavities, the grime still
+ * packs into the seam — because what changes when a shutter is painted teal is
+ * the coat, not the physics of how it fails.
+ *
+ * Recipes that accept one declare `paintable: true`; TextureFactory routes a
+ * caller's `material.color` into this parameter for those recipes and drops the
+ * multiply, so no call site has to change to get its colour back. Materials
+ * whose tint is *meant* to be a shallow multiply — the ground decals, which are
+ * documented as such — are deliberately NOT paintable and keep the old path.
+ */
+
+/** sRGB hex or [r,g,b] in 0..1 sRGB -> linear triple. Null when unpainted. */
+function paintOf(opts, key = 'paint') {
+  const p = opts?.[key];
+  if (p == null) return null;
+  if (typeof p === 'number') {
+    return srgb(((p >> 16) & 255) / 255, ((p >> 8) & 255) / 255, (p & 255) / 255);
+  }
+  if (Array.isArray(p) && p.length >= 3) return srgb(p[0], p[1], p[2]);
+  return null;
+}
+
+/**
+ * Coat weathering, applied to a paint colour before it is laid down.
+ *
+ * A painted surface outdoors is never the colour it left the tin. UV takes the
+ * chroma out of it first and the value second, so a sun-faded coat is *paler
+ * and less saturated*, not simply darker; and the fade is uneven, which is what
+ * makes a real shutter read as painted-then-weathered rather than as a flat
+ * swatch. `t` is 0 (sheltered, full strength) to 1 (fully bleached).
+ */
+function faded(c, t, toward = 0.42, keepChroma = 0.50) {
+  const l = Math.max(1e-4, c[0] * 0.2126 + c[1] * 0.7152 + c[2] * 0.0722);
+  // Where the value ends up. Dark paints lift, near-white ones settle.
+  const target = mix(l, toward, 0.5 * t);
+  // Rescale the colour to that value FIRST — a uniform scale is hue-preserving
+  // — then blend toward the neutral of the same value to take the chroma out.
+  //
+  // Doing it the other way round (blend straight toward a grey) is what the
+  // first cut of this did, and it was wrong in a way that only showed up on
+  // measurement: at full bleach it landed every colour on one common grey, so
+  // a teal roller shutter baked out at saturation 0.01 with 123 degrees of
+  // intra-material hue spread — i.e. dither. Fading is a loss of chroma at
+  // constant hue, not a walk to grey.
+  const s = target / l;
+  const keep = mix(1, keepChroma, t);
+  return [
+    mix(target, c[0] * s, keep),
+    mix(target, c[1] * s, keep),
+    mix(target, c[2] * s, keep),
+  ];
+}
+
 /* ---------------------------------------------------------------- recipes */
 
 export const RECIPES = {
@@ -255,7 +358,7 @@ export const RECIPES = {
     minSize: 512, reliefM: 0.020, masks: 6,
     aoStrength: 0.95, curvGain: 1.0,
     detail: 'grain', detailMetres: 0.13, detailStrength: 0.42,
-    macro: 0.14, triplanar: true, worldScale: 1.2,
+    macro: 0.16, macroHue: 0.58, triplanar: true, worldScale: 1.2,
     build(seed, opts = {}) {
       const M = metrics(opts, 1.2);
       const BOARDS = M.count(0.20, 2);            // 200 mm shutter boards
@@ -403,9 +506,20 @@ export const RECIPES = {
     minSize: 512, reliefM: 0.030, masks: 5,
     aoStrength: 1.05, curvGain: 1.0,
     detail: 'stipple', detailMetres: 0.11, detailStrength: 0.34,
-    macro: 0.15, triplanar: true, worldScale: 0.9,
+    // The largest surface in the level by area after the ground, so it is the
+    // one that decides whether the frame has any chroma range at all. macroHue
+    // is raised well above the 0.40 default because on a facade the warm/cool
+    // swing IS the read: a sunlit wall and a damp shaded one are two colours,
+    // not two brightnesses, and at 0.40 the difference was inside the dither.
+    macro: 0.18, macroHue: 0.66, triplanar: true, worldScale: 0.9,
+    paintable: true,
     build(seed, opts = {}) {
       const M = metrics(opts, 0.9);
+      // Limewash. Note this is the coat colour, not a multiplier — see the
+      // paint block at the top of the file for why a multiply cannot put a
+      // colour on a surface. `washStrength` is how much pigment is in it.
+      const WASH = paintOf(opts);
+      const WASH_W = clamp01(opts.washStrength ?? 0.42);
       // Metric brick: 215 x 65 mm unit on a 10 mm joint -> 225 x 75 mm course.
       const COLS = M.count(0.225, 2);
       const ROWS = M.count(0.075, 4);
@@ -502,9 +616,24 @@ export const RECIPES = {
           /* the coat itself — bright, warm, and very low variance. The only
              colour movement is the float sweep and the older coat showing
              through where the top skim is thin. */
-          const pr = mix(C_PLASTER_2[0], C_PLASTER[0], sweep);
-          const pg = mix(C_PLASTER_2[1], C_PLASTER[1], sweep);
-          const pb = mix(C_PLASTER_2[2], C_PLASTER[2], sweep);
+          let pr = mix(C_PLASTER_2[0], C_PLASTER[0], sweep);
+          let pg = mix(C_PLASTER_2[1], C_PLASTER[1], sweep);
+          let pb = mix(C_PLASTER_2[2], C_PLASTER[2], sweep);
+          if (WASH) {
+            // Limewash. It tints the COAT and nothing else: the blown patches
+            // stay fired clay and lime residue, because the wash went on after
+            // the render and came off with it. That asymmetry is why a washed
+            // facade with a patch missing reads as damaged rather than as two
+            // materials sharing a boundary.
+            //
+            // Applied at partial strength on purpose. Lime is a thin, chalky,
+            // translucent binder — it shifts a wall's hue, it does not repaint
+            // it — and a facade at the full chroma of the pigment is a
+            // cartoon. WASH_W stays under half by default for that reason.
+            pr = mix(pr, WASH[0] * (0.86 + sweep * 0.26), WASH_W);
+            pg = mix(pg, WASH[1] * (0.86 + sweep * 0.26), WASH_W);
+            pb = mix(pb, WASH[2] * (0.86 + sweep * 0.26), WASH_W);
+          }
           const pt = 0.90 + c.h * 0.18;
           r = mix(r, pr * pt, p); g = mix(g, pg * pt, p); b = mix(b, pb * pt, p);
           rough = mix(rough, 0.86, p);
@@ -551,7 +680,7 @@ export const RECIPES = {
     minSize: 512, reliefM: 0.020, masks: 5,
     aoStrength: 1.15, curvGain: 1.0,
     detail: 'grain', detailMetres: 0.09, detailStrength: 0.40,
-    macro: 0.15, triplanar: true, worldScale: 0.9,
+    macro: 0.17, macroHue: 0.60, triplanar: true, worldScale: 0.9,
     build(seed, opts = {}) {
       const M = metrics(opts, 0.9);
       const COLS = M.count(0.225, 2);
@@ -635,9 +764,15 @@ export const RECIPES = {
     minSize: 512, reliefM: 0.006, masks: 4,
     aoStrength: 0.9, curvGain: 1.15,
     detail: 'brushed', detailMetres: 0.16, detailStrength: 0.34,
-    macro: 0.12, triplanar: false, worldScale: 1.4,
+    macro: 0.12, macroHue: 0.52, triplanar: false, worldScale: 1.4,
+    paintable: true,
     build(seed, opts = {}) {
       const M = metrics(opts, 1.4);
+      // The coat. Olive drab is only the default; a caller that wants a blue
+      // sign, a green car panel or a red kiosk front asks for it here and gets
+      // the same chipping, rusting and seam grime laid over a different paint.
+      const COAT = paintOf(opts) || C_PAINT;
+      const COAT_SUN = faded(COAT, 1, 0.50);
       const PC = M.count(0.60, 1);                 // 600 mm panels
       const PR = M.count(0.70, 1);
       const L = { lx: 0, ly: 0, col: 0, row: 0, id: 0 };
@@ -647,6 +782,9 @@ export const RECIPES = {
       const runs = fbm01(seed + 45, M.per(0.22, 8), 3, 0.6);
       const chipN = fbm01(seed + 46, M.per(0.10, 7), 3, 0.6);
       const scab = fbm(seed + 47, M.per(0.012, 7), 2, 0.5);
+      // Half-metre UV fade field. Sun does not bleach a panel evenly and the
+      // unevenness is most of what separates a painted object from a swatch.
+      const sunF = fbm01(seed + 49, M.per(0.55, 8), 3, 0.62);
 
       const RIV = M.count(0.080, 4);               // 80 mm rivet pitch
       const seamW = 0.010 / M.ws;    // 10 mm lapped joint, not a 1-texel canyon
@@ -699,9 +837,16 @@ export const RECIPES = {
           const paint = clamp01(1 - Math.max(chipped, rusted));
 
           const pt = 0.82 + c.h * 0.30;
-          let r = mix(C_STEEL[0], C_PAINT[0] * pt, paint);
-          let g = mix(C_STEEL[1], C_PAINT[1] * pt, paint);
-          let b = mix(C_STEEL[2], C_PAINT[2] * pt, paint);
+          // Fade tracks exposure: the crowns catch the sun, the cavities do
+          // not, so the coat holds its chroma exactly where the geometry
+          // shelters it. One field, two registers of the same colour.
+          const sun = clamp01(smoothstep(0.30, 0.85, sunF(u, v)) * 0.75 + c.edge * 0.45);
+          const cr = mix(COAT[0], COAT_SUN[0], sun) * pt;
+          const cg = mix(COAT[1], COAT_SUN[1], sun) * pt;
+          const cb = mix(COAT[2], COAT_SUN[2], sun) * pt;
+          let r = mix(C_STEEL[0], cr, paint);
+          let g = mix(C_STEEL[1], cg, paint);
+          let b = mix(C_STEEL[2], cb, paint);
 
           const rt = 0.65 + chipNoise * 0.7;
           r = mix(r, mix(C_RUST_DARK[0], C_RUST[0], rt), rusted);
@@ -725,6 +870,211 @@ export const RECIPES = {
     },
   },
 
+  /* ============================================================== car paint */
+  /*
+   * A LEVEL ACCENT, NOT A SHOWROOM FINISH.
+   *
+   * `LevelModule` carried a TODO asking for this: its two vehicle bodies were
+   * `metal` tinted 0x6f7d74 and 0x9a8f7c, i.e. rusting riveted industrial plate
+   * multiplied by a grey — the frame shows a car body wearing a shipping
+   * container's panel seams and rivet lines, and the tint could only darken it.
+   * A car is one of about four objects in a market street that is allowed to be
+   * a strong flat colour, and vehicles sit in the middle of lanes where the
+   * player is looking; giving up that accent to a rivet field is a bad trade.
+   *
+   * The three things that make automotive paint read as automotive paint and
+   * are all cheap here:
+   *   - ORANGE PEEL. The reason a car highlight wobbles and a fridge highlight
+   *     does not. True peel is a ~3 mm undulation, which at a 1.6 m tile is
+   *     under two texels even at 1024 and would alias rather than shade, so the
+   *     bake carries the ~12 mm band it can actually resolve and the 'brushed'
+   *     detail normal at 110 mm/tile carries the rest. Claiming 3 mm in the
+   *     bake would have been a number the texture cannot hold.
+   *   - A SPECULAR/DIFFUSE SPLIT. Clearcoat is a smooth dielectric over a
+   *     coloured base, so the surface stays glossy where it is clean and goes
+   *     matte only where road film and oxidation have killed the clear.
+   *   - FAILURE AT THE BOTTOM. Stone chips, road film and sill rot all live in
+   *     the lower third of a panel and nowhere else. Wear that is uniform over
+   *     a body panel is the single clearest tell of a procedural surface.
+   */
+  car_paint: {
+    label: 'Automotive paint',
+    description: 'Colour base under clearcoat: orange peel, swage line, shut line, stone chipping and road film up the lower panel, clear gone chalky on the horizontal.',
+    tags: ['prop', 'vehicle'],
+    minSize: 512, reliefM: 0.004, masks: 4,
+    aoStrength: 0.85, curvGain: 1.0,
+    klass: 'physical',
+    props: { clearcoat: 1.0, clearcoatRoughness: 0.09 },
+    detail: 'brushed', detailMetres: 0.11, detailStrength: 0.16, detailAlbedo: 0.10,
+    macro: 0.10, macroHue: 0.44, triplanar: false, worldScale: 1.6,
+    paintable: true,
+    build(seed, opts = {}) {
+      const M = metrics(opts, 1.6);
+      const BODY = paintOf(opts) || srgb(0.66, 0.67, 0.68);
+      // Automotive pigment does not fade the way a limewash does: the clear
+      // goes first and takes the gloss, then the base chalks. So the faded
+      // register is the same hue at lower chroma, never a different hue.
+      const BODY_OX = faded(BODY, 1, 0.30, 0.62);   // the clear dies before the pigment does
+      const SWAGE = M.count(0.90, 1);              // one crease per body side
+      const peel = fbm(seed + 201, M.per(0.003, 4), 2, 0.5);
+      const panelF = fbm(seed + 202, M.per(0.50, 8), 3, 0.55);
+      const chipC = worley(seed + 203, M.per(0.010, 5), 1.0);
+      const filmF = fbm01(seed + 204, M.per(0.28, 8), 3, 0.6);
+      const oxF = fbm01(seed + 205, M.per(0.60, 8), 3, 0.58);
+      const cA = new Cell();
+      const shutW = 0.005 / M.ws;                  // 5 mm panel gap
+      return {
+        sample(u, v, out) {
+          // Swage: a shallow crease running the length of the panel, plus one
+          // vertical shut line where two panels meet.
+          const sy = v * SWAGE;
+          const crease = Math.pow(Math.abs(Math.sin(sy * Math.PI)), 3.0);
+          const shutU = Math.abs(((u * 2) % 1) - 0.5) * 2;
+          const shut = 1 - smoothstep(shutW * 0.5, shutW * 3.0, (1 - shutU) * 0.5);
+
+          chipC(u, v, cA);
+          // Stone chips: below the waistline only, and rarer the higher you go.
+          const low = smoothstep(0.75, 0.20, v);
+          const chip = smoothstep(0.20, 0.02, cA.f1) * (cA.rand(7) > 0.965 - low * 0.03 ? 1 : 0) * low;
+
+          out[0] = crease * 0.30 + peel(u, v) * 0.10 - shut * 1.0 - chip * 0.45
+            + panelF(u, v) * 0.05;
+          out[1] = chip; out[2] = shut; out[3] = low; out[4] = filmF(u, v);
+        },
+        shade(u, v, c, m, out) {
+          const chip = m[0], shut = m[1], low = m[2], film = m[3];
+          // Clear dies where the sun hits hardest, which on a parked car is the
+          // horizontal — approximated by the panel field, not by noise alone.
+          const ox = clamp01(smoothstep(0.42, 0.88, oxF(u, v)) * 0.8 + c.edge * 0.35);
+          let r = mix(BODY[0], BODY_OX[0], ox);
+          let g = mix(BODY[1], BODY_OX[1], ox);
+          let b = mix(BODY[2], BODY_OX[2], ox);
+
+          // Road film: a neutral grey-brown wash climbing the lower panel, with
+          // its own upper edge. This is the tide line every dirty car has.
+          const grime = clamp01(low * (0.30 + film * 0.9) - 0.18) * 0.9;
+          r = mix(r, C_DIRT[0] * 1.35, grime * 0.55);
+          g = mix(g, C_DIRT[1] * 1.33, grime * 0.56);
+          b = mix(b, C_DIRT[2] * 1.28, grime * 0.56);
+
+          // A chip goes clear -> colour -> primer -> steel, and the rust starts
+          // at its edge. Primer is the pale ring that makes a chip read as a
+          // chip rather than as a dark speck.
+          const prim = smoothstep(0.15, 0.55, chip);
+          const bare = smoothstep(0.62, 0.90, chip);
+          r = mix(r, 0.130, prim); g = mix(g, 0.126, prim); b = mix(b, 0.120, prim);
+          r = mix(r, C_RUST[0] * 0.8, bare); g = mix(g, C_RUST[1] * 0.8, bare); b = mix(b, C_RUST[2] * 0.8, bare);
+
+          const seam = clamp01(shut + c.cavity * 0.5);
+          r *= 1 - seam * 0.45; g *= 1 - seam * 0.47; b *= 1 - seam * 0.48;
+
+          out[0] = r; out[1] = g; out[2] = b;
+          // Clean clear is the glossiest surface in the level; oxidised clear
+          // and road film are not. This spread is the whole material.
+          out[3] = clamp(0.10 + ox * 0.46 + grime * 0.34 + prim * 0.35 + bare * 0.45, 0.06, 1.0);
+          // Base coat and clear are both dielectric. Only a chip through to the
+          // panel is a conductor, and only briefly before it rusts.
+          out[4] = clamp01(bare * (1 - smoothstep(0.75, 0.95, chip)));
+          out[5] = 1;
+        },
+      };
+    },
+  },
+
+  /* =========================================================== enamel sign */
+  /*
+   * The other half of the LevelModule TODO. A vitreous-enamel shopfront sign is
+   * the one surface in a street that is ALLOWED to be a pure saturated colour
+   * — it is fired glass on steel, it does not fade, and it is why photographs
+   * of markets have chroma in them that the surrounding masonry does not.
+   *
+   * It is a wayfinding tool as much as a material: a sign is small, bright and
+   * always at a doorway, so three lanes signed in three colours give a player
+   * something to navigate by in a level whose walls are necessarily all the
+   * same render. That is the intended use here; the recipe is cheap enough to
+   * carry three tints of the same bake.
+   */
+  sign_enamel: {
+    label: 'Vitreous enamel sign',
+    description: 'Fired enamel on pressed steel: rolled edge, screw fixings, star-chipped to bare metal with rust haloes, glass-smooth everywhere else.',
+    tags: ['prop', 'signage', 'accent'],
+    minSize: 256, reliefM: 0.003, masks: 3,
+    aoStrength: 0.9, curvGain: 1.2,
+    detail: 'brushed', detailMetres: 0.08, detailStrength: 0.12, detailAlbedo: 0.08,
+    macro: 0.08, macroHue: 0.35, triplanar: false, worldScale: 1.0,
+    paintable: true,
+    build(seed, opts = {}) {
+      const M = metrics(opts, 1.0);
+      const FACE = paintOf(opts) || srgb(0.13, 0.30, 0.44);   // enamel blue
+      const TRIM = paintOf(opts, 'trim') || srgb(0.88, 0.87, 0.83);
+      // Border inset in metres; enamel signs are always framed in the second
+      // colour and the frame is most of what identifies them at 20 m.
+      const borderF = M.f(opts.borderM ?? 0.035);
+      const chipC = worley(seed + 211, M.per(0.014, 5), 1.0);
+      const rustF = fbm01(seed + 212, M.per(0.10, 7), 3, 0.6);
+      const dustF = fbm01(seed + 213, M.per(0.22, 8), 3, 0.55);
+      // Four fixings, one per corner, set inside the rolled edge.
+      const scrR = 0.008 / M.ws;                    // 16 mm pan head
+      const scrInset = borderF * 1.6;
+      const cA = new Cell();
+      return {
+        sample(u, v, out) {
+          const dEdge = Math.min(Math.min(u, 1 - u), Math.min(v, 1 - v));
+          // Rolled edge: the sheet turns over, so the outer few millimetres are
+          // proud and the border line is a shallow score, not a colour change.
+          const roll = smoothstep(borderF * 1.4, borderF * 0.2, dEdge);
+          const score = 1 - smoothstep(borderF * 0.06, borderF * 0.30, Math.abs(dEdge - borderF));
+
+          // Distance to the nearest corner fixing: fold the tile into its own
+          // quadrant, then measure from the inset point in that quadrant.
+          const qu = Math.min(u, 1 - u) - scrInset;
+          const qv = Math.min(v, 1 - v) - scrInset;
+          const screw = smoothstep(scrR * 1.25, scrR * 0.35, Math.hypot(qu, qv));
+
+          chipC(u, v, cA);
+          // Enamel does not scratch, it SHATTERS — a star chip with a hard rim,
+          // clustered at the edges and the fixings where the sheet flexes.
+          const prone = clamp01(roll * 0.9 + screw * 0.8 + 0.06);
+          const chip = smoothstep(0.16, 0.02, cA.f1) * (cA.rand(9) < prone * 0.55 ? 1 : 0);
+
+          out[0] = roll * 0.30 - score * 0.35 - screw * 0.45 - chip * 0.55;
+          out[1] = chip; out[2] = roll; out[3] = screw;
+        },
+        shade(u, v, c, m, out) {
+          const chip = m[0], roll = m[1], screw = m[2];
+          const border = smoothstep(0.35, 0.65, roll);
+          let r = mix(FACE[0], TRIM[0], border);
+          let g = mix(FACE[1], TRIM[1], border);
+          let b = mix(FACE[2], TRIM[2], border);
+
+          // Under the enamel is the steel it was fired onto, and the rust
+          // spreads out of the chip rather than sitting inside it.
+          const bare = smoothstep(0.25, 0.60, chip);
+          const halo = smoothstep(0.05, 0.40, chip) * clamp01(0.4 + rustF(u, v));
+          r = mix(r, C_RUST[0], halo * 0.7); g = mix(g, C_RUST[1], halo * 0.7); b = mix(b, C_RUST[2], halo * 0.7);
+          r = mix(r, C_RUST_DARK[0], bare); g = mix(g, C_RUST_DARK[1], bare); b = mix(b, C_RUST_DARK[2], bare);
+          r = mix(r, C_STEEL[0] * 0.55, screw * 0.7);
+          g = mix(g, C_STEEL[1] * 0.55, screw * 0.7);
+          b = mix(b, C_STEEL[2] * 0.55, screw * 0.7);
+
+          // Street dust, and only in the cavities: an enamel face sheds it.
+          const dust = clamp01(c.cavity * 0.8 + dustF(u, v) * 0.25 - 0.15);
+          r = mix(r, C_DIRT[0] * 1.5, dust * 0.40);
+          g = mix(g, C_DIRT[1] * 1.5, dust * 0.41);
+          b = mix(b, C_DIRT[2] * 1.5, dust * 0.41);
+
+          out[0] = r; out[1] = g; out[2] = b;
+          // Fired glass. This is deliberately the smoothest dielectric in the
+          // library — the sign's job is to be the one hard highlight in a lane
+          // of matte render, and that contrast is what makes it findable.
+          out[3] = clamp(0.09 + bare * 0.75 + halo * 0.40 + dust * 0.30, 0.05, 1.0);
+          out[4] = clamp01(screw * 0.6 + bare * 0.25 * (1 - halo));
+          out[5] = 1;
+        },
+      };
+    },
+  },
+
   /* ===================================================== corrugated sheeting */
   corrugated: {
     label: 'Corrugated galvanised sheet',
@@ -733,9 +1083,15 @@ export const RECIPES = {
     minSize: 512, reliefM: 0.028, masks: 3,
     aoStrength: 1.0, curvGain: 0.7,
     detail: 'brushed', detailMetres: 0.20, detailStrength: 0.26,
-    macro: 0.12, triplanar: false, worldScale: 1.0,
+    macro: 0.12, macroHue: 0.52, triplanar: false, worldScale: 1.0,
+    paintable: true,
     build(seed, opts = {}) {
       const M = metrics(opts, 1.0);
+      // Optional coat over the galvanising. A painted roller shutter is the
+      // largest single flat colour on a market street and the one a player
+      // navigates by; unpainted, this recipe stays bare zinc.
+      const COAT = paintOf(opts);
+      const COAT_SUN = COAT ? faded(COAT, 1, 0.48) : null;
       const RIBS = M.count(0.125, 2);             // 125 mm rib pitch
       const spangle = worley(seed + 51, M.per(0.030, 6), 1.0);
       const dent = fbm(seed + 52, M.per(0.30, 8), 3, 0.5);
@@ -760,6 +1116,26 @@ export const RECIPES = {
           const rusted = smoothstep(0.520, 0.615, rust);
           const zt = 0.82 + facet * 0.36;
           let r = C_ZINC[0] * zt, g = C_ZINC[1] * zt, b = C_ZINC[2] * zt;
+          let coat = 0;
+          if (COAT) {
+            // Paint survives in the valleys and is scoured off the crowns —
+            // the opposite of where the rust starts, which is why a painted
+            // sheet reads as ribbed at a distance where the profile itself has
+            // gone below a pixel.
+            // Coverage is high by default and comes OFF at the crowns and the
+            // arrises — a shutter is painted all over and wears through where
+            // it is handled and where the roller drags it, not in half.
+            // Measured: at the first cut (a 0.25 floor rising to 1.0 in the
+            // valleys) the zinc phase is four times the paint's reflectance and
+            // won the mean outright, so the sheet baked out at saturation 0.04
+            // and read as galvanised with a blue cast. Bare metal on a painted
+            // object has to be a minority phase by AREA and by LUMINANCE both.
+            coat = clamp01(0.94 - crown * 0.22 - c.edge * 0.75);
+            const sun = clamp01(crown * 0.8 + facet * 0.25);
+            r = mix(r, mix(COAT[0], COAT_SUN[0], sun), coat);
+            g = mix(g, mix(COAT[1], COAT_SUN[1], sun), coat);
+            b = mix(b, mix(COAT[2], COAT_SUN[2], sun), coat);
+          }
           // Partial coverage, not a hard two-tone swap: weathered galvanising
           // goes through a long dull-grey stage before it goes orange, and a
           // binary zinc/oxide split reads as printed stripes.
@@ -771,9 +1147,11 @@ export const RECIPES = {
           g = mix(g * (1 - rusted * 0.32), rg, ox);
           b = mix(b * (1 - rusted * 0.33), rb, ox);
           out[0] = r; out[1] = g; out[2] = b;
-          out[3] = clamp(mix(0.42 + facet * 0.14, 0.93, rusted), 0.18, 1.0);
-          // Zinc is a conductor; the oxide that replaces it is not.
-          out[4] = clamp01(1 - ox);
+          out[3] = clamp(mix(mix(0.42 + facet * 0.14, 0.66 + facet * 0.10, coat), 0.93, rusted), 0.18, 1.0);
+          // Zinc is a conductor; the oxide that replaces it is not, and neither
+          // is paint. Coverage subtracts from the conductor phase exactly as
+          // the oxide does.
+          out[4] = clamp01((1 - ox) * (1 - coat));
           out[5] = 1;
         },
       };
@@ -944,7 +1322,7 @@ export const RECIPES = {
     minSize: 512, reliefM: 0.050, masks: 3,
     aoStrength: 1.25, curvGain: 0.9,
     detail: 'grain', detailMetres: 0.10, detailStrength: 0.55,
-    macro: 0.15, triplanar: true, worldScale: 1.0,
+    macro: 0.16, macroHue: 0.54, triplanar: true, worldScale: 1.0,
     build(seed, opts = {}) {
       const M = metrics(opts, 1.0);
       const big = worley(seed + 71, M.per(0.045, 7), 1.0);
@@ -1007,7 +1385,7 @@ export const RECIPES = {
     minSize: 512, reliefM: 0.014, masks: 3,
     aoStrength: 1.0, curvGain: 1.0,
     detail: 'grain', detailMetres: 0.06, detailStrength: 0.55,
-    macro: 0.13, triplanar: true, worldScale: 1.2,
+    macro: 0.15, macroHue: 0.50, triplanar: true, worldScale: 1.2,
     build(seed, opts = {}) {
       const M = metrics(opts, 1.2);
       const agg = worley(seed + 81, M.per(0.011, 5), 1.0);
@@ -1106,9 +1484,18 @@ export const RECIPES = {
     minSize: 512, reliefM: 0.008, masks: 4,
     aoStrength: 1.0, curvGain: 1.0,
     detail: 'brushed', detailMetres: 0.24, detailStrength: 0.45,
-    macro: 0.14, triplanar: false, worldScale: 1.1,
+    macro: 0.14, macroHue: 0.50, triplanar: false, worldScale: 1.1,
+    paintable: true,
     build(seed, opts = {}) {
       const M = metrics(opts, 1.1);
+      // Painted joinery. Paint on wood does NOT recolour the timber — it sits
+      // on it as a coat and fails off it, so the shutter that reads as painted
+      // is the one where the grain shows through at the arrises and along the
+      // splits. Board-to-board variation is deliberate: joinery is repainted a
+      // board at a time and never twice from the same tin.
+      const COAT = paintOf(opts);
+      const COAT_SUN = COAT ? faded(COAT, 1, 0.46) : null;
+      const peelN = COAT ? fbm01(seed + 107, M.per(0.22, 8), 3, 0.62) : null;
       const PLANKS = M.count(0.165, 2);            // 165 mm boards
       const grainW = fbm(seed + 101, M.per(0.20, 8), 4, 0.55);
       const ringN = fbm(seed + 102, M.per(0.40, 8), 3, 0.5);
@@ -1157,10 +1544,34 @@ export const RECIPES = {
           r = mix(r, grey * 1.02, bleach * 0.55);
           g = mix(g, grey, bleach * 0.55);
           b = mix(b, grey * 0.95, bleach * 0.55);
+          let rough = 0.78 + ring * 0.10 + bleach * 0.10 - knot * 0.30;
+          if (COAT) {
+            // Coverage: paint survives on the flats, lifts off the arrises and
+            // the raised grain, and is gone in the board gaps. `rnd` is the
+            // per-board hash, so one board in a run is always noticeably more
+            // worn than its neighbours.
+            const wear = clamp01(smoothstep(0.35, 0.90, c.edge) * (0.45 + peelN(u, v) * 1.1)
+              + smoothstep(0.86, 0.99, peelN(u, v)) * 0.7
+              + ring * 0.22 * (0.6 + rnd * 0.8));
+            const cover = clamp01(1 - smoothstep(0.34, 0.72, wear)) * (1 - gap);
+            // Fade is per board plus a slow field, so a repainted board next to
+            // a sun-killed one is normal rather than a bug.
+            const sun = clamp01(0.20 + rnd * 0.55 + peelN(u, v) * 0.35);
+            const cr = mix(COAT[0], COAT_SUN[0], sun);
+            const cg = mix(COAT[1], COAT_SUN[1], sun);
+            const cb = mix(COAT[2], COAT_SUN[2], sun);
+            // Primer ghost under a chip: the coat's own value, near-neutral.
+            const edgeChalk = smoothstep(0.55, 0.95, wear) * (1 - cover) * 0.35;
+            r = mix(r, cr, cover); g = mix(g, cg, cover); b = mix(b, cb, cover);
+            const chalk = 0.30;
+            r = mix(r, chalk, edgeChalk); g = mix(g, chalk * 0.98, edgeChalk); b = mix(b, chalk * 0.94, edgeChalk);
+            // Alkyd joinery paint is satin when new and chalks flat as it goes.
+            rough = mix(rough, 0.46 + sun * 0.34, cover);
+          }
           const shade = c.cavity * 0.55 + gap;
           r *= 1 - shade * 0.45; g *= 1 - shade * 0.46; b *= 1 - shade * 0.46;
           out[0] = r; out[1] = g; out[2] = b;
-          out[3] = clamp(0.78 + ring * 0.10 + bleach * 0.10 - knot * 0.30, 0.30, 1.0);
+          out[3] = clamp(rough, 0.30, 1.0);
           out[4] = 0;
           out[5] = 1 - gap * 0.4;
         },
@@ -1176,7 +1587,7 @@ export const RECIPES = {
     minSize: 512, reliefM: 0.100, masks: 3,
     aoStrength: 1.35, curvGain: 0.8,
     detail: 'weave', detailMetres: 0.05, detailStrength: 0.70,
-    macro: 0.12, triplanar: false, worldScale: 0.76,
+    macro: 0.13, macroHue: 0.50, triplanar: false, worldScale: 0.76,
     build(seed, opts = {}) {
       const M = metrics(opts, 0.76);
       const COLS = M.count(0.38, 1);               // 380 x 190 mm laid bags
@@ -1233,8 +1644,20 @@ export const RECIPES = {
     aoStrength: 1.2, curvGain: 1.1,
     detail: 'grain', detailMetres: 0.06, detailStrength: 0.18,
     macro: 0.10, triplanar: false, worldScale: 0.6,
+    paintable: true,
     build(seed, opts = {}) {
       const M = metrics(opts, 0.6);
+      // Glaze colour. A glazed threshold, stall counter or fountain surround is
+      // the one place in a street where a genuinely saturated colour is not a
+      // stylistic choice but a building material, and a tiled doorstep is worth
+      // more to wayfinding than any amount of noise: it is small, it is bright,
+      // and it marks the entrance the player is looking for.
+      //
+      // `accent` is a second glaze; tiles pick between the two on their own
+      // hash, which is how a real field of tile is laid.
+      const GLAZE = paintOf(opts) || C_TILE;
+      const ACCENT = paintOf(opts, 'accent');
+      const accentMix = opts.accentMix ?? 0.28;
       const COLS = M.count(0.15, 2);               // 150 mm tiles
       const ROWS = COLS;
       const L = { lx: 0, ly: 0, col: 0, row: 0, id: 0 };
@@ -1267,7 +1690,14 @@ export const RECIPES = {
         shade(u, v, c, m, out) {
           const face = m[0], rnd = m[1], crazing = m[2], chip = m[3];
           const t = 0.90 + rnd * 0.16;
-          let r = C_TILE[0] * t, g = C_TILE[1] * t, b = C_TILE[2] * t;
+          // Tile-to-tile firing variation is multiplicative on the glaze, so a
+          // strong colour varies in value without wandering in hue — which is
+          // how a fired batch actually varies.
+          const useAcc = ACCENT && rnd < accentMix;
+          const G = useAcc ? ACCENT : GLAZE;
+          let r = G[0] * t, g = G[1] * t, b = G[2] * t;
+          // A chip goes through the glaze to the biscuit, which is unfired clay
+          // — pale and warm whatever colour the glaze was.
           r = mix(r, 0.30, chip); g = mix(g, 0.27, chip); b = mix(b, 0.24, chip);
           r = mix(r, C_GROUT[0], 1 - face); g = mix(g, C_GROUT[1], 1 - face); b = mix(b, C_GROUT[2], 1 - face);
           const grime = c.cavity * (1 - face * 0.5);
@@ -1383,8 +1813,25 @@ export const RECIPES = {
     aoStrength: 1.1, curvGain: 1.0,
     detail: 'weave', detailMetres: 0.02, detailStrength: 0.65,
     macro: 0, triplanar: false, worldScale: 0.6,
+    paintable: true,
     build(seed, opts = {}) {
       const M = metrics(opts, 0.6);
+      // Dyed duck. `paint` is the dye; `stripe` (a second colour) turns it into
+      // the woven awning stripe that is the single most recognisable object in
+      // a market street, and the stripe is a WEAVE feature, so it runs along
+      // the warp and the dye sits in the thread rather than on top of it.
+      // `stripeM` is the band pitch in metres — awnings run 90-160 mm.
+      const DYE = paintOf(opts) || C_CANVAS;
+      const STRIPE = paintOf(opts, 'stripe');
+      const stripeM = opts.stripeM ?? 0.12;
+      const BANDS = STRIPE ? Math.max(2, Math.round(M.ws / Math.max(0.02, stripeM))) : 0;
+      // Cloth hung outdoors is the fastest-fading thing in the level: the top
+      // of an awning is close to white by its second summer while the shadowed
+      // underside keeps the dye. That difference is the reason cloth reads as
+      // cloth at 30 m and it is worth two colour constants.
+      const DYE_SUN = faded(DYE, 1, 0.55, 0.34);   // cloth is the fastest fader here
+      const STRIPE_SUN = STRIPE ? faded(STRIPE, 1, 0.55, 0.34) : null;
+      const sunF = fbm01(seed + 155, M.per(0.30, 8), 3, 0.6);
       // A real 1.2 mm thread pitch is ~1 texel at any bake size we can afford,
       // i.e. guaranteed moire. Cap it at ~5 texels and let the shared 'weave'
       // detail normal carry the true thread scale.
@@ -1408,7 +1855,27 @@ export const RECIPES = {
         shade(u, v, c, m, out) {
           const thread = m[0], wearN = m[1];
           const t = 0.78 + c.h * 0.40;
-          let r = C_CANVAS[0] * t, g = C_CANVAS[1] * t, b = C_CANVAS[2] * t;
+          // Which colour this thread carries. The band edge is deliberately
+          // soft over one thread pitch — a woven stripe has no hard edge, it
+          // has a transition thread, and a hard one is what makes a procedural
+          // stripe read as a decal.
+          let base = DYE, baseSun = DYE_SUN;
+          if (BANDS) {
+            // Thresholded sine rather than a test on the band index. The index
+            // form is the obvious way to write this and it is wrong at the
+            // seam: feathering "toward the edge" inside each band sends the two
+            // sides of a boundary toward OPPOSITE colours, so every band edge
+            // came out as a one-thread line of the wrong dye. A sine has no
+            // seam to get wrong — it wraps by construction — and the threshold
+            // width is the transition thread.
+            const which = smoothstep(-0.10, 0.10, Math.sin(u * BANDS * Math.PI * 2));
+            base = [mix(DYE[0], STRIPE[0], which), mix(DYE[1], STRIPE[1], which), mix(DYE[2], STRIPE[2], which)];
+            baseSun = [mix(DYE_SUN[0], STRIPE_SUN[0], which), mix(DYE_SUN[1], STRIPE_SUN[1], which), mix(DYE_SUN[2], STRIPE_SUN[2], which)];
+          }
+          const sun = clamp01(smoothstep(0.25, 0.85, sunF(u, v)) * 0.7 + c.edge * 0.4);
+          let r = mix(base[0], baseSun[0], sun) * t;
+          let g = mix(base[1], baseSun[1], sun) * t;
+          let b = mix(base[2], baseSun[2], sun) * t;
           const abraded = clamp01(smoothstep(0.35, 0.95, c.edge) * (0.3 + wearN * 1.0));
           r = mix(r, r * 1.45 + 0.02, abraded * 0.8);
           g = mix(g, g * 1.42 + 0.02, abraded * 0.8);
@@ -2286,7 +2753,79 @@ export const RECIPES = {
 /* --------------------------------------------------------------- aliases */
 
 /** Names other modules may reasonably reach for, mapped onto a real recipe. */
+/* --------------------------------------------------------------- palettes */
+
+/**
+ * COLOUR AS WAYFINDING.
+ *
+ * Suq al-Hadid has three lanes and, measured, they are the same colour: every
+ * saturated surface in the level sits in a 40-degree warm window, so a player
+ * standing in one lane has nothing in frame that says which lane it is. That is
+ * a navigation problem before it is an art problem — a map where every corridor
+ * looks identical is a map players get lost in, and the fix is not more detail,
+ * it is a different colour at the end of each one.
+ *
+ * These are coat colours for the `paintable` recipes, chosen against the map's
+ * constraints rather than off a wheel:
+ *
+ *  - They must survive a WARM KEY. This sun is low and orange, which multiplies
+ *    every surface toward red and kills weak greens and blues outright, so the
+ *    lane hues are picked far from the light's hue and carry enough chroma to
+ *    still be reading after it. A pastel would come back as sand.
+ *  - They must separate from EACH OTHER at low value. The captured frames sit
+ *    at a median value near 0.2, so the three are spread around the wheel
+ *    (~185, ~130, ~10 degrees) rather than being three blues.
+ *  - There are three of them and no more. The point of an accent is that the
+ *    field around it is neutral; a fourth and a fifth lane colour would put the
+ *    level back where it started with a wider gamut.
+ *
+ * Usage: pass as `paint` (or as `material.color`, which routes to the same
+ * place). `signage` is the loud one and belongs on the small enamel objects at
+ * doorways; `joinery` and `shutter` are the same family knocked back, for the
+ * large areas. Do NOT paint a whole facade in these — that is what
+ * `plaster`'s `washStrength` limewash is for.
+ */
+export const ACCENTS = {
+  /** North / alley: cold teal against the warmest light in the level. */
+  alley: {
+    signage: 0x1d7d8c,     // enamel, ~188 deg, the findable one
+    joinery: 0x2f6f78,     // doors and shutters
+    shutter: 0x24606b,     // roller shutters, corrugated
+    cloth: 0x35707a,       // awning stripe partner
+    vehicle: 0x2f5d7a,
+  },
+  /** East / motor yard: bottle green. Furthest from both the sun and the teal. */
+  yard: {
+    signage: 0x1f6b4a,     // ~150 deg
+    joinery: 0x3d6b3c,
+    shutter: 0x33583a,
+    cloth: 0x4a7048,
+    vehicle: 0x2e5c3f,
+  },
+  /** South / plaza: red oxide. Warm, but far enough round to read as a colour
+   *  rather than as more sand, and it is the traditional paint here. */
+  plaza: {
+    signage: 0xa8332a,     // ~5 deg
+    joinery: 0x8e3b30,
+    shutter: 0x7a352c,
+    cloth: 0xa8523c,
+    vehicle: 0x8c2f26,
+  },
+  /** Shared, lane-independent. Glazed thresholds and the cream that every
+   *  awning stripe and enamel border in this part of the world is paired with. */
+  common: {
+    tileGlaze: 0x2e6d84,
+    tileAccent: 0xd9c9a0,
+    trim: 0xe0d8c4,
+    biscuit: 0xc9a878,
+  },
+};
+
 export const ALIASES = {
+  car: 'car_paint',
+  vehicle: 'car_paint',
+  sign: 'sign_enamel',
+  enamel: 'sign_enamel',
   steel: 'metal',
   painted_metal: 'metal',
   crate: 'metal',
