@@ -8,7 +8,9 @@
     "dev": "vite --host 0.0.0.0 --port 5173",
     "build": "vite build",
     "preview": "vite preview --host 0.0.0.0 --port 4173",
-    "shot": "node tools/screenshot.mjs"
+    "shot": "node tools/screenshot.mjs",
+    "relay": "node server/relay.mjs",
+    "serve": "vite build && node server/relay.mjs"
   },
   "dependencies": {
     "three": "^0.185.1",

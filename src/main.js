@@ -18,6 +18,7 @@ import { AiModule } from './ai/AiModule.js';
 import { AudioModule } from './audio/AudioModule.js';
 import { HudModule } from './ui/HudModule.js';
 import { MatchModule } from './game/MatchModule.js';
+import { NetModule, netOptions } from './net/NetModule.js';
 
 /**
  * Registration order defines init order and per-frame update order.
@@ -50,6 +51,11 @@ async function boot() {
   const render = engine.register('render', new RenderModule());
   await render.init(engine);              // renderer must exist for capability probe
   Config.quality = autoDetectQuality(render.renderer);
+  // Online play is opt-in by URL. Bots are simulated per client, so in a
+  // shared room they would be different soldiers on every screen; the room is
+  // humans only unless `?bots=N` asks otherwise. Must precede AiModule.init.
+  const net = netOptions();
+  if (net.enabled && !net.botsExplicit) Config.match.botCount = 0;
   render._resizeTargets(engine.width, engine.height);
   render.init = async () => {};           // already initialised
 
@@ -79,6 +85,7 @@ async function boot() {
   engine.register('weapons', new WeaponModule());
   engine.register('ai', new AiModule());
   engine.register('match', new MatchModule());
+  engine.register('net', new NetModule(net));
   engine.register('hud', new HudModule());
 
   await engine.init();
